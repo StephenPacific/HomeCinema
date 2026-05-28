@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Home Cinema LAN Sync</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="stage" aria-label="Synchronized playback console">
+        <div class="topbar">
+          <div>
+            <p class="eyebrow">LAN SYNC</p>
+            <h1>Home Cinema</h1>
+          </div>
+          <div class="connection">
+            <span id="connectionDot" class="dot"></span>
+            <span id="connectionText">Connecting</span>
+          </div>
+        </div>
+
+        <div class="player">
+          <div class="disc" aria-hidden="true">
+            <div class="disc-core"></div>
+          </div>
+          <div class="track">
+            <p id="trackLabel" class="track-name">No track loaded</p>
+            <p id="syncLabel" class="track-meta">Waiting for players</p>
+            <div class="meter" aria-hidden="true">
+              <span style="--i: 0"></span>
+              <span style="--i: 1"></span>
+              <span style="--i: 2"></span>
+              <span style="--i: 3"></span>
+              <span style="--i: 4"></span>
+              <span style="--i: 5"></span>
+              <span style="--i: 6"></span>
+              <span style="--i: 7"></span>
+            </div>
+          </div>
+        </div>
+
+        <div id="countdown" class="countdown" aria-live="polite"></div>
+
+        <div class="transport">
+          <button id="stopBtn" class="icon-button" type="button" title="Stop" aria-label="Stop">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v10H7z" /></svg>
+          </button>
+          <button id="playBtn" class="primary-button" type="button" title="Play/Pause" aria-label="Play or pause">
+            <svg id="playIcon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
+          </button>
+          <button id="resyncBtn" class="icon-button" type="button" title="Resync" aria-label="Resync">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.8-4.3L13 11h8V3z" /></svg>
+          </button>
+        </div>
+
+        <div class="timeline">
+          <span id="currentTime">0:00</span>
+          <input id="seek" type="range" min="0" max="100" value="0" step="0.01" aria-label="Playback position" />
+          <span id="duration">0:00</span>
+        </div>
+      </section>
+
+      <aside class="side">
+        <section class="panel">
+          <div class="segmented" role="group" aria-label="Device role">
+            <button id="controllerMode" class="active" type="button">Host</button>
+            <button id="speakerMode" type="button">Player</button>
+          </div>
+
+          <label class="upload">
+            <input id="fileInput" type="file" accept="audio/*" multiple />
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l4 4h-3v8h-2V7H8zm-7 14h14v2H5z" /></svg>
+            <span id="uploadText">Choose stems</span>
+          </label>
+
+          <div class="segmented latency-modes" role="group" aria-label="Sync countdown">
+            <button id="leadFast" type="button" data-lead="3000">3 sec</button>
+            <button id="leadBalanced" type="button" data-lead="4000">4 sec</button>
+            <button id="leadSafe" type="button" data-lead="5000">5 sec</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Local Stem</h2>
+          <div id="layerChoices" class="layer-choices"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Sound Field</h2>
+          <div id="zoneChoices" class="zone-choices" role="group" aria-label="Sound field position">
+            <button type="button" data-zone="front-left">FL</button>
+            <button type="button" data-zone="front-right">FR</button>
+            <button type="button" data-zone="center">C</button>
+            <button type="button" data-zone="rear-left">RL</button>
+            <button type="button" data-zone="rear-right">RR</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Join URL</h2>
+          <div id="addresses" class="addresses"></div>
+        </section>
+
+        <section class="panel players-panel">
+          <div class="panel-heading">
+            <h2>Players</h2>
+            <button id="testAllBtn" class="text-button" type="button">Test</button>
+          </div>
+          <div id="peers" class="peers"></div>
+        </section>
+
+        <section class="panel compact">
+          <div class="stat">
+            <span>Clock offset</span>
+            <strong id="offsetStat">-- ms</strong>
+          </div>
+          <div class="stat">
+            <span>Round trip</span>
+            <strong id="latencyStat">-- ms</strong>
+          </div>
+          <div class="stat">
+            <span>Countdown</span>
+            <strong id="leadStat">-- ms</strong>
+          </div>
+          <div class="stat">
+            <span>Local offset</span>
+            <strong id="deviceOffsetStat">0 ms</strong>
+          </div>
+          <div class="calibration" aria-label="Local latency calibration">
+            <button id="offsetDown" type="button">-10</button>
+            <button id="offsetReset" type="button">0</button>
+            <button id="offsetUp" type="button">+10</button>
+          </div>
+          <div class="stat">
+            <span>Status</span>
+            <strong id="readyStat">Locked</strong>
+          </div>
+        </section>
+      </aside>
+    </main>
+
+    <div id="gesture" class="gesture">
+      <button id="unlockBtn" type="button">Enable speaker</button>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

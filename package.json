@@ -1,0 +1,14 @@
+{
+  "name": "home-cinema-lan-sync",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LAN music sync player for multiple home devices.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
