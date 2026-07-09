@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
+const distDir = path.join(__dirname, "dist");
 const mediaDir = path.join(__dirname, "media");
 const layersDir = path.join(mediaDir, "layers");
 const uploadPath = path.join(mediaDir, "current-audio");
@@ -102,6 +103,8 @@ server.on("upgrade", (req, socket) => {
   const client = {
     id: nextClientId++,
     socket,
+    remoteAddress: socket.remoteAddress,
+    userAgent: req.headers["user-agent"] || "",
     buffer: Buffer.alloc(0),
     role: "speaker",
     layerId: null,
@@ -110,6 +113,7 @@ server.on("upgrade", (req, socket) => {
     unlocked: false,
     latencyMs: null,
     deviceOffsetMs: 0,
+    deviceKey: null,
     lastSeen: Date.now(),
     name: `Device ${nextClientId - 1}`
   };
@@ -290,23 +294,25 @@ function serveAudio(req, res) {
 
 function serveStatic(requestPath, res) {
   const pathname = requestPath === "/" ? "/index.html" : decodeURIComponent(requestPath);
-  const filePath = path.normalize(path.join(publicDir, pathname));
-  if (!filePath.startsWith(publicDir)) {
-    sendText(res, 403, "Forbidden");
-    return;
-  }
-
-  fs.stat(filePath, (error, stats) => {
-    if (error || !stats.isFile()) {
-      sendText(res, 404, "Not Found");
+  for (const root of [distDir, publicDir]) {
+    const filePath = path.normalize(path.join(root, pathname));
+    if (!filePath.startsWith(root)) {
+      sendText(res, 403, "Forbidden");
       return;
     }
-    res.writeHead(200, {
-      "Content-Type": mimeType(filePath),
-      "Cache-Control": "no-store"
-    });
-    fs.createReadStream(filePath).pipe(res);
-  });
+    try {
+      const stats = fs.statSync(filePath);
+      if (!stats.isFile()) continue;
+      res.writeHead(200, {
+        "Content-Type": mimeType(filePath),
+        "Cache-Control": "no-store"
+      });
+      fs.createReadStream(filePath).pipe(res);
+      return;
+    } catch {}
+  }
+
+  sendText(res, 404, "Not Found");
 }
 
 function handleMessage(client, message) {
@@ -321,6 +327,7 @@ function handleMessage(client, message) {
 
   if (message.type === "identify") {
     client.name = String(message.name || client.name).slice(0, 40);
+    client.deviceKey = String(message.deviceKey || client.deviceKey || "").slice(0, 120) || null;
     client.role = message.role === "controller" ? "controller" : "speaker";
     client.layerId = message.layerId || client.layerId;
     client.zone = normalizeZone(message.zone || client.zone);
@@ -361,6 +368,15 @@ function handleMessage(client, message) {
     const position = clamp(Number(message.position ?? currentPosition()), 0, trackDurationFallback());
     state.playing = true;
     state.position = position;
+    state.startedAt = Date.now() + leadMs;
+    state.updatedAt = Date.now();
+    broadcast({ type: "play", state: publicState() });
+    return;
+  }
+
+  if (message.type === "resync") {
+    if (!state.layers.length || !state.playing) return;
+    state.position = currentPosition();
     state.startedAt = Date.now() + leadMs;
     state.updatedAt = Date.now();
     broadcast({ type: "play", state: publicState() });
@@ -508,7 +524,16 @@ function broadcastPeers() {
 }
 
 function peerList() {
-  return [...clients].map((client) => ({
+  const latestByDevice = new Map();
+  for (const client of clients) {
+    const key = client.deviceKey || `socket-${client.id}`;
+    const existing = latestByDevice.get(key);
+    if (!existing || client.lastSeen >= existing.lastSeen) {
+      latestByDevice.set(key, client);
+    }
+  }
+
+  return [...latestByDevice.values()].map((client) => ({
     id: client.id,
     name: client.name,
     role: client.role,

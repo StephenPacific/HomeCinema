@@ -2,6 +2,7 @@
 .env
 node_modules/
 npm-debug.log*
+dist/
 
 # Runtime media uploaded through the local app.
 media/

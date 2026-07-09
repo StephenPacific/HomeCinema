@@ -10,7 +10,7 @@ Synchronize music playback across phones, tablets, and computers on the same loc
    npm start
    ```
 
-2. Open the `Network` URL shown in the terminal from phones, tablets, and computers on the same Wi-Fi.
+2. Open the `Network` URL shown in the terminal from phones, tablets, and computers on the same Wi-Fi, or scan the QR code shown in the host UI.
 
 3. Tap `Enable speaker` once on every device. Browsers require a real user gesture before web audio can play.
 
@@ -21,6 +21,8 @@ Synchronize music playback across phones, tablets, and computers on the same loc
 6. Each device can choose a sound-field position: Front Left, Front Right, Center, Rear Left, or Rear Right.
 
 7. Use the `Players` panel on the host to check online status, stem assignment, position, latency, local offset, and test tones.
+
+The QR code opens `?mode=player`, which gives phones and tablets a lighter player view with playback controls, device name, local stem, sound-field position, latency, and offset controls.
 
 ## Stems
 
@@ -54,10 +56,12 @@ Avoid Bluetooth speakers, AirPlay, and TV casting when you need tight sync. Thos
 ## How It Works
 
 - The server uses only built-in Node.js modules.
+- The frontend is a React app built with Vite and served by the same LAN server.
 - Browsers receive playback commands over WebSocket.
 - Every device estimates its clock offset from the server with repeated time samples.
 - The host schedules playback at a future server timestamp; each device converts that into local time and starts Web Audio there.
 - Multi-stem playback uses one shared timeline; each device loads only its selected stem.
+- Resync re-queues all players from the server's current playback position so every device gets a fresh shared start timestamp.
 
 ## Notes
 

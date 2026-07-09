@@ -64,6 +64,7 @@ button {
   gap: 20px;
   height: calc(100vh - 28px);
   min-height: 0;
+  min-width: 0;
   overflow: hidden;
   padding: clamp(18px, 4vw, 42px);
   border-radius: 8px;
@@ -101,6 +102,7 @@ h1 {
   font-size: 6rem;
   line-height: 0.92;
   letter-spacing: 0;
+  overflow-wrap: anywhere;
 }
 
 h2 {
@@ -283,14 +285,39 @@ h2 {
   gap: 10px;
   height: calc(100vh - 28px);
   min-height: 0;
+  min-width: 0;
   overflow-y: auto;
   padding-right: 6px;
   scrollbar-gutter: stable;
 }
 
 .panel {
+  min-width: 0;
   padding: 12px;
   border-radius: 8px;
+}
+
+.field-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.device-name-input {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 10px;
+  background: #12160f;
+  color: var(--text);
+  outline: none;
+}
+
+.device-name-input:focus {
+  border-color: var(--green);
 }
 
 .players-panel {
@@ -398,6 +425,22 @@ h2 {
   display: none;
 }
 
+.join-qr {
+  display: grid;
+  place-items: center;
+  min-height: 176px;
+  margin-bottom: 10px;
+  padding: 10px;
+  border-radius: 8px;
+  background: #f8fbf4;
+}
+
+.join-qr svg {
+  display: block;
+  width: min(100%, 188px);
+  height: auto;
+}
+
 .addresses,
 .peers,
 .layer-choices {
@@ -434,6 +477,7 @@ h2 {
 .layer-button {
   justify-content: space-between;
   gap: 8px;
+  min-width: 0;
   min-height: 36px;
   padding: 8px 10px;
   border-radius: 8px;
@@ -460,6 +504,7 @@ h2 {
 }
 
 .address-row code {
+  min-width: 0;
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
@@ -468,10 +513,17 @@ h2 {
 
 .copy {
   flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   border: 0;
   background: transparent;
   color: var(--green);
   font-weight: 800;
+}
+
+.copy svg {
+  flex: 0 0 auto;
 }
 
 .peer strong {
@@ -529,6 +581,22 @@ h2 {
   min-height: 30px;
 }
 
+.speaker-test {
+  width: 100%;
+}
+
+.audio-issue {
+  margin: 0;
+  color: var(--gold);
+  font-size: 0.82rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.fallback-audio {
+  display: none;
+}
+
 .badge {
   padding: 3px 8px;
   border-radius: 999px;
@@ -582,7 +650,20 @@ h2 {
   display: none;
 }
 
+.gesture-card {
+  display: grid;
+  gap: 12px;
+  justify-items: center;
+  max-width: min(92vw, 420px);
+  color: var(--muted);
+  text-align: center;
+}
+
 .gesture button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
   min-height: 56px;
   padding: 0 22px;
   border: 0;
@@ -590,6 +671,81 @@ h2 {
   background: var(--green);
   color: #111;
   font-weight: 900;
+}
+
+.gesture-card strong {
+  color: var(--gold);
+  overflow-wrap: anywhere;
+}
+
+.gesture button svg {
+  width: 22px;
+  height: 22px;
+}
+
+.player-view {
+  overflow: auto;
+}
+
+.player-view .app {
+  grid-template-columns: minmax(0, 520px);
+  justify-content: center;
+  height: auto;
+  min-height: 100vh;
+  overflow: visible;
+}
+
+.player-view .stage,
+.player-view .side {
+  height: auto;
+  min-height: 0;
+  overflow: visible;
+}
+
+.player-view .stage {
+  gap: 16px;
+  padding: 22px;
+}
+
+.player-view h1 {
+  font-size: 3.2rem;
+}
+
+.player-view .player {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 18px;
+}
+
+.player-view .disc {
+  width: 240px;
+  align-self: center;
+}
+
+.player-view .track-name {
+  font-size: 1.7rem;
+}
+
+.player-view .track-meta {
+  margin-bottom: 12px;
+}
+
+.player-view .meter {
+  height: 46px;
+}
+
+.player-view .host-panel,
+.player-view .join-panel,
+.player-view .players-panel {
+  display: none;
+}
+
+.player-view .side {
+  padding-right: 0;
+}
+
+.player-view .compact {
+  order: 4;
 }
 
 @keyframes spin {
@@ -684,6 +840,10 @@ h2 {
     flex-direction: column;
   }
 
+  .stage {
+    padding: 16px;
+  }
+
   .transport {
     gap: 10px;
   }
@@ -699,7 +859,15 @@ h2 {
   }
 
   h1 {
-    font-size: 3.35rem;
+    font-size: 2.75rem;
+  }
+
+  .player-view h1 {
+    font-size: 2.55rem;
+  }
+
+  .player-view .disc {
+    width: 210px;
   }
 
   .track-name {
