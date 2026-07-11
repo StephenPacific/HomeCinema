@@ -38,7 +38,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -48,6 +49,7 @@ button {
 
 button:focus-visible,
 input:focus-visible,
+select:focus-visible,
 summary:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -125,6 +127,24 @@ summary:focus-visible {
 
 .header-actions {
   gap: 12px;
+}
+
+.role-mode {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.76rem;
+  font-weight: 760;
+}
+
+.role-mode svg {
+  color: var(--accent);
 }
 
 .connection {
@@ -897,6 +917,28 @@ h2 {
   line-height: 1.45;
 }
 
+.join-address-select,
+.join-address {
+  width: 100%;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.join-address-select {
+  min-height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+.join-address {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .copy-link,
 .text-button,
 .mini-button {
@@ -1562,10 +1604,6 @@ h2 {
   display: none;
 }
 
-.player-view .role-switch {
-  display: none;
-}
-
 .player-view .stage {
   min-height: 620px;
 }
@@ -1676,19 +1714,17 @@ h2 {
     gap: 7px;
   }
 
-  .role-switch {
-    order: 2;
-    min-width: 170px;
-  }
-
-  .role-switch button {
-    padding: 0 8px;
-    font-size: 0.7rem;
-  }
-
   .brand span:last-child,
-  .connection span:last-child {
+  .connection span:last-child,
+  .role-mode span {
     display: none;
+  }
+
+  .role-mode {
+    width: 36px;
+    min-width: 36px;
+    justify-content: center;
+    padding: 0;
   }
 
   .connection {

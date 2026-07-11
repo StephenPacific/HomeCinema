@@ -1,4 +1,4 @@
-import { normalizeServerUrl, resolveServerUrl, serverUrlFromHomeCinemaTab } from "./server-url.js";
+import { controllerPageUrl, normalizeServerUrl, resolveServerUrl, serverUrlFromHomeCinemaTab } from "./server-url.js";
 
 const serverUrlInput = document.querySelector("#serverUrl");
 const tabTitle = document.querySelector("#tabTitle");
@@ -46,7 +46,7 @@ openButton.addEventListener("click", async () => {
   try {
     const serverUrl = normalizeServerUrl(serverUrlInput.value);
     await chrome.storage.local.set({ homeCinemaUrl: serverUrl });
-    await chrome.tabs.create({ url: serverUrl });
+    await chrome.tabs.create({ url: controllerPageUrl(serverUrl) });
   } catch (error) {
     renderStatus({ phase: "error", detail: error.message || "Invalid Home Cinema address." });
   }

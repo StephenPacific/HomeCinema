@@ -10,11 +10,11 @@ Synchronize music playback across phones, tablets, and computers on the same loc
    npm start
    ```
 
-2. Open the `Network` URL shown in the terminal from phones, tablets, and computers on the same Wi-Fi, or scan the QR code shown in the host UI.
+2. Open the recommended `Network` URL shown in the terminal from phones, tablets, and computers on the same Wi-Fi, or scan the QR code shown in the Controller UI. Physical Wi-Fi and Ethernet adapters are listed ahead of VMware, Hyper-V, WSL, VPN, and bridge adapters.
 
 3. Tap `Enable speaker` once on every device. Browsers require a real user gesture before web audio can play.
 
-4. Keep one device in `Host` mode, choose one or more audio files, then press play. Other devices can stay in `Player` mode.
+4. Keep one device in `Controller` mode, choose one or more audio files, then press play. Other devices stay in `Speaker` mode.
 
 5. If you upload multiple stems, each device can choose its own `Local Stem`.
 
@@ -22,17 +22,17 @@ Synchronize music playback across phones, tablets, and computers on the same loc
 
 7. Use the `Players` panel on the host to check online status, stem assignment, position, latency, local offset, and test tones.
 
-The QR code opens `?mode=player`, which gives phones and tablets a lighter player view with playback controls, device name, local stem, sound-field position, latency, and offset controls.
+The QR code opens `?mode=player`, which gives phones and tablets a lighter Speaker view with device name, local stem, sound-field position, latency, and offset controls. A remote LAN URL without an explicit mode also defaults to Speaker. Controller mode is opened explicitly by the extension with `?mode=controller`, so a previously saved browser setting cannot make another computer take control.
 
 ## Chrome Tab Audio Extension
 
 The included Chrome extension can relay audio from the current desktop Chrome tab into the Home Cinema room. This is useful for browser music, video, and web players: the video stays on the host computer while the tab's audio is relayed to the joined speakers.
 
-1. Start Home Cinema with `npm start`.
+1. Start one Home Cinema coordination service with `npm start`. During development this can run on the same Windows computer as the extension or on a different computer in the room; only one service is needed.
 2. In Chrome, open `chrome://extensions`, turn on Developer mode, then choose **Load unpacked** and select the [`extension`](extension/) folder.
 3. Open Home Cinema, have speakers join from the QR code, and tap **Enable speaker** on each device before beginning the live capture.
-4. Open the Home Cinema Controller page once before using the extension. When the extension is opened from that tab it detects and saves the correct server origin. If a host starts locally with `127.0.0.1`, the connected server advertises its LAN address and the extension automatically migrates the displayed and saved address. You can also enter the server address manually.
-5. With the music or video tab active, press **Start audio**. The original tab audio remains audible on the host computer with the same short playout target used by the room. Press **Stop** in the extension to end the session.
+4. The extension's `Controller service` field is the address it uses for coordination. If the service runs on the same Windows computer, `http://127.0.0.1:4173` is correct. If the service runs on another computer, enter that computer's LAN address. This connection address is deliberately kept separate from the Wi-Fi Speaker link shown in the Controller page.
+5. Press **Open Controller** from the extension to open an explicit Controller page. With the music or video tab active, press **Start audio**. The original tab audio remains audible on the Controller computer with the same short playout target used by the room. Press **Stop** in the extension to end the session.
 
 Live tab audio uses WebRTC with Opus. WebSocket remains responsible for room state, device discovery, clock measurements, and WebRTC signaling. Current Chrome and Edge releases are the recommended speaker browsers for this mode. Uploaded tracks retain the wider browser support described below. Only one live tab capture can be active in a room at a time. Protected DRM playback may not permit capture; the extension does not bypass DRM.
 
@@ -84,5 +84,6 @@ Avoid Bluetooth speakers, AirPlay, and TV casting when you need tight sync. Thos
 ## Notes
 
 - All devices must be on the same local network, and the host firewall must allow the server port, default `4173`.
+- On Windows, allow Node.js on private networks when Windows Defender Firewall asks. If another device cannot open the recommended address, use the IPv4 address under `Wireless LAN adapter Wi-Fi` in `ipconfig`; do not use a VMware or `vEthernet` address.
 - Phone browsers may pause web audio when locked or backgrounded.
 - This is a home sync prototype, not Dolby/AVR multichannel decoding.

@@ -120,10 +120,7 @@ test("capture reconnect keeps the tab stream alive until the user stops it", asy
       state: { addresses: ["http://192.168.20.8:4173"] }
     })
   });
-  assert.equal(
-    runtimeMessages.at(-1)?.status?.serverUrl,
-    "http://192.168.20.8:4173"
-  );
+  assert.equal(runtimeMessages.at(-1)?.status?.serverUrl, "http://127.0.0.1:4173");
 
   sockets[0].readyState = 3;
   sockets[0].emit("close");

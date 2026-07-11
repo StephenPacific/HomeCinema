@@ -20,6 +20,14 @@ export function serverUrlFromHomeCinemaTab(tab) {
   }
 }
 
+export function controllerPageUrl(value) {
+  const url = new URL(normalizeServerUrl(value));
+  url.pathname = "/";
+  url.searchParams.set("mode", "controller");
+  url.hash = "";
+  return url.toString();
+}
+
 export function resolveServerUrl({ savedUrl, captureStatus, activeTab }) {
   const activeTabUrl = serverUrlFromHomeCinemaTab(activeTab);
   if (activeTabUrl) return activeTabUrl;

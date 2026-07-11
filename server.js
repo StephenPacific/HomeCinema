@@ -15,6 +15,7 @@ import {
   stableRoomTiming,
   supportsRoomSyncVersion
 } from "./src/roomSync.js";
+import { lanAddressCandidates } from "./src/networkAddresses.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
@@ -54,9 +55,11 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
     if (req.method === "GET" && url.pathname === "/config") {
+      const networkAddresses = getLanAddressCandidates(port);
       return sendJson(res, {
         port,
-        addresses: getLanAddresses(port),
+        addresses: networkAddresses.map((candidate) => candidate.url),
+        networkAddresses,
         serverTime: Date.now(),
         leadMs,
         liveStartLeadMs,
@@ -183,8 +186,9 @@ server.listen(port, "0.0.0.0", () => {
   console.log(`Home Cinema LAN Sync`);
   console.log(`Local:   http://localhost:${port}`);
   console.log(`Lead:    ${leadMs}ms`);
-  for (const address of getLanAddresses(port)) {
-    console.log(`Network: ${address}`);
+  for (const candidate of getLanAddressCandidates(port)) {
+    const label = candidate.recommended ? "Network (recommended)" : "Network (alternate)";
+    console.log(`${label}: ${candidate.url} [${candidate.interfaceName}]`);
   }
 });
 
@@ -1209,15 +1213,11 @@ function mimeType(filePath) {
 }
 
 function getLanAddresses(serverPort) {
-  const addresses = [];
-  for (const entries of Object.values(os.networkInterfaces())) {
-    for (const entry of entries || []) {
-      if (entry.family === "IPv4" && !entry.internal) {
-        addresses.push(`http://${entry.address}:${serverPort}`);
-      }
-    }
-  }
-  return addresses;
+  return getLanAddressCandidates(serverPort).map((candidate) => candidate.url);
+}
+
+function getLanAddressCandidates(serverPort) {
+  return lanAddressCandidates(os.networkInterfaces(), serverPort);
 }
 
 function clamp(value, min, max) {

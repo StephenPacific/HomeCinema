@@ -10,7 +10,6 @@ const state = {
   stopping: false,
   peers: new Map(),
   serverUrl: "",
-  advertisedServerUrl: "",
   lastStatus: null,
   tabTitle: "",
   tabId: null,
@@ -50,7 +49,6 @@ async function startCapture({ streamId, serverUrl, tabTitle, tabId }) {
   if (state.stream || state.socket) finishCapture({ phase: "idle", detail: "Restarting capture." });
   state.stopping = false;
   state.serverUrl = serverUrl;
-  state.advertisedServerUrl = "";
   state.tabTitle = tabTitle;
   state.tabId = tabId;
   setStatus({ phase: "connecting", detail: "Accessing current tab audio...", serverUrl, title: tabTitle });
@@ -119,8 +117,6 @@ function connectCaptureSocket() {
     } catch {
       return;
     }
-
-    updateAdvertisedServerUrl(message.state?.addresses);
 
     if (message.type === "error") {
       setStatus({
@@ -518,35 +514,10 @@ function toWebSocketUrl(value) {
   return url.toString();
 }
 
-function updateAdvertisedServerUrl(addresses) {
-  const preferredUrl = preferredServerUrl(state.serverUrl, addresses);
-  if (!preferredUrl || preferredUrl === state.advertisedServerUrl) return;
-  state.advertisedServerUrl = preferredUrl;
-  if (state.lastStatus) setStatus(state.lastStatus);
-}
-
-function preferredServerUrl(currentValue, addresses) {
-  let currentUrl;
-  try {
-    currentUrl = new URL(currentValue);
-  } catch {
-    return "";
-  }
-  const loopback = ["127.0.0.1", "localhost", "::1", "[::1]"].includes(currentUrl.hostname);
-  if (!loopback) return currentUrl.origin;
-  for (const value of addresses || []) {
-    try {
-      const candidate = new URL(value);
-      if (["http:", "https:"].includes(candidate.protocol)) return candidate.origin;
-    } catch {}
-  }
-  return currentUrl.origin;
-}
-
 function setStatus(status) {
   const next = {
     ...status,
-    serverUrl: state.advertisedServerUrl || status.serverUrl || state.serverUrl || "",
+    serverUrl: status.serverUrl || state.serverUrl || "",
     updatedAt: Date.now()
   };
   state.lastStatus = next;

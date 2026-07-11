@@ -18,6 +18,7 @@ import {
   ROOM_SYNC_ENGINE_VERSION,
   ROOM_SYNC_POLICY
 } from "./roomSync.js";
+import { isLoopbackHost, resolvePageRole } from "./pageRole.js";
 
 const EMPTY_STATE = {
   track: null,
@@ -47,14 +48,16 @@ const zoneNames = {
 };
 
 export default function App() {
-  const isPlayerView = useMemo(() => new URLSearchParams(location.search).get("mode") === "player", []);
+  const roleState = useMemo(
+    () => resolvePageRole({ search: location.search, hostname: location.hostname }),
+    []
+  );
+  const isPlayerView = roleState === "speaker";
   const [connected, setConnected] = useState(false);
   const [serverState, setServerState] = useState(EMPTY_STATE);
   const [peers, setPeers] = useState([]);
-  const [joinUrls, setJoinUrls] = useState([]);
-  const [roleState, setRoleState] = useState(() =>
-    isPlayerView ? "speaker" : localStorage.getItem("role") || "controller"
-  );
+  const [joinOptions, setJoinOptions] = useState([]);
+  const [selectedJoinUrl, setSelectedJoinUrl] = useState("");
   const [deviceNameState, setDeviceNameState] = useState(currentDeviceName);
   const [selectedLayerIdState, setSelectedLayerIdState] = useState(() => localStorage.getItem("selectedLayerId"));
   const [selectedZoneState, setSelectedZoneState] = useState(() => localStorage.getItem("selectedZone") || "front-left");
@@ -271,16 +274,6 @@ export default function App() {
     readyStatusRef.current = readyStatus;
     reportStatusSoon();
   }, [readyStatus, reportStatusSoon]);
-
-  const setRole = useCallback(
-    (nextRole) => {
-      roleRef.current = nextRole;
-      setRoleState(nextRole);
-      if (!isPlayerView) localStorage.setItem("role", nextRole);
-      reportStatusSoon();
-    },
-    [isPlayerView, reportStatusSoon]
-  );
 
   const setSelectedLayerId = useCallback(
     (layerId) => {
@@ -1996,8 +1989,28 @@ export default function App() {
   async function loadConfig() {
     const response = await fetch("/config", { cache: "no-store" });
     const config = await response.json();
-    const urls = (config.addresses.length ? config.addresses : [location.origin]).map(playerJoinUrl);
-    setJoinUrls(urls);
+    const advertised = Array.isArray(config.networkAddresses) && config.networkAddresses.length
+      ? config.networkAddresses
+      : (config.addresses || []).map((url, index) => ({
+          url,
+          interfaceName: `Network ${index + 1}`,
+          recommended: index === 0
+        }));
+    const currentOrigin = location.origin;
+    const candidates = isLoopbackHost(location.hostname)
+      ? advertised
+      : [
+          { url: currentOrigin, interfaceName: "Current connection", recommended: true },
+          ...advertised.filter((candidate) => candidate.url !== currentOrigin)
+        ];
+    const options = (candidates.length ? candidates : [{ url: currentOrigin, interfaceName: "Current connection", recommended: true }])
+      .map((candidate, index) => ({
+        url: playerJoinUrl(candidate.url),
+        label: candidate.interfaceName || `Network ${index + 1}`,
+        recommended: index === 0
+      }));
+    setJoinOptions(options);
+    setSelectedJoinUrl((current) => options.some((option) => option.url === current) ? current : options[0]?.url || "");
     return config;
   }
 
@@ -2472,13 +2485,9 @@ export default function App() {
             </div>
           </div>
           <div className="header-actions">
-            <div className="segmented role-switch" role="group" aria-label="Device role">
-              <button className={roleState === "controller" ? "active" : ""} type="button" onClick={() => setRole("controller")}>
-                Controller
-              </button>
-              <button className={roleState === "speaker" ? "active" : ""} type="button" onClick={() => setRole("speaker")}>
-                Speaker
-              </button>
+            <div className="role-mode" aria-label={`Device role: ${roleState}`}>
+              <Radio size={15} />
+              <span>{roleState === "controller" ? "Controller" : "Speaker"}</span>
             </div>
             <div className={`connection ${connected ? "is-connected" : ""}`}>
               <span className="dot" />
@@ -2694,13 +2703,29 @@ export default function App() {
               <div className="collapsible-content">
                 <div className="join-layout">
                   <div className="join-qr" aria-label="Player QR code">
-                    {joinUrls[0] ? <QrCode value={joinUrls[0]} /> : "QR unavailable"}
+                    {selectedJoinUrl ? <QrCode value={selectedJoinUrl} /> : "QR unavailable"}
                   </div>
                   <div className="join-instructions">
                     <strong>Scan on each device</strong>
                     <span>Open the link, then tap Enable speaker.</span>
-                    {joinUrls[0] && (
-                      <button className="copy-link" type="button" onClick={() => navigator.clipboard?.writeText(joinUrls[0])}>
+                    {joinOptions.length > 1 ? (
+                      <select
+                        className="join-address-select"
+                        aria-label="Speaker network address"
+                        value={selectedJoinUrl}
+                        onChange={(event) => setSelectedJoinUrl(event.target.value)}
+                      >
+                        {joinOptions.map((option) => (
+                          <option key={option.url} value={option.url}>
+                            {option.recommended ? "Recommended · " : ""}{option.label} · {formatJoinAddress(option.url)}
+                          </option>
+                        ))}
+                      </select>
+                    ) : selectedJoinUrl ? (
+                      <span className="join-address">{formatJoinAddress(selectedJoinUrl)}</span>
+                    ) : null}
+                    {selectedJoinUrl && (
+                      <button className="copy-link" type="button" onClick={() => navigator.clipboard?.writeText(selectedJoinUrl)}>
                         <Copy size={16} /> Copy join link
                       </button>
                     )}
@@ -2872,11 +2897,6 @@ export default function App() {
               <Volume2 />
               Enable speaker
             </button>
-            {!isPlayerView && (
-              <button className="gesture-controller-button" type="button" onClick={() => setRole("controller")}>
-                Use as controller instead
-              </button>
-            )}
             <span className="gesture-status">Audio engine: {audioContextState}</span>
             {audioIssueState && <strong>{audioIssueState}</strong>}
           </div>
@@ -3080,6 +3100,14 @@ function playerJoinUrl(url) {
   playerUrl.searchParams.set("mode", "player");
   playerUrl.hash = "";
   return playerUrl.toString();
+}
+
+function formatJoinAddress(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
 }
 
 function detectDeviceInfo() {

@@ -1,10 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  controllerPageUrl,
   normalizeServerUrl,
   resolveServerUrl,
   serverUrlFromHomeCinemaTab
 } from "../extension/server-url.js";
+
+test("extension opens an explicit Controller page", () => {
+  assert.equal(
+    controllerPageUrl("http://127.0.0.1:4173"),
+    "http://127.0.0.1:4173/?mode=controller"
+  );
+});
 
 test("extension server URL has no hard-coded loopback fallback", () => {
   assert.throws(() => normalizeServerUrl(""), /Enter the Home Cinema server address/);
