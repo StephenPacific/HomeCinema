@@ -1023,6 +1023,49 @@ h2 {
   white-space: nowrap;
 }
 
+.metric-health.ready {
+  color: var(--green);
+}
+
+.metric-health.waiting {
+  color: var(--accent);
+}
+
+.metric-health.attention {
+  color: var(--red);
+}
+
+.controller-monitor {
+  border-bottom: 1px solid var(--line);
+}
+
+.controller-monitor summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 40px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 720;
+  cursor: pointer;
+  list-style: none;
+}
+
+.controller-monitor summary::-webkit-details-marker {
+  display: none;
+}
+
+.controller-monitor summary span:last-child {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.controller-diagnostic-grid {
+  margin: 0 0 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .phase-progress {
   display: grid;
   gap: 8px;

@@ -1,10 +1,18 @@
 const WEBRTC_TARGET_BUFFER_MS = 120;
+const CONTROLLER_AUDIO_SAMPLE_INTERVAL_MS = 500;
+const CONTROLLER_AUDIO_REPORT_INTERVAL_MS = 2000;
+const CONTROLLER_AUDIO_WINDOW_MS = 30_000;
 
 const state = {
   audioContext: null,
   localDelay: null,
   localGain: null,
+  localDelayMs: 0,
   localOutputLatencySeconds: 0,
+  controllerAudioTimer: null,
+  controllerAudioSamples: [],
+  initialControllerOutputLatencyMs: null,
+  lastControllerMetricsSentAt: 0,
   socket: null,
   stream: null,
   stopping: false,
@@ -48,6 +56,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 async function startCapture({ streamId, serverUrl, tabTitle, tabId }) {
   if (state.stream || state.socket) finishCapture({ phase: "idle", detail: "Restarting capture." });
   state.stopping = false;
+  resetControllerAudioMonitor();
   state.serverUrl = serverUrl;
   state.tabTitle = tabTitle;
   state.tabId = tabId;
@@ -319,6 +328,7 @@ async function prepareLocalPlayback(stream, delayMs = WEBRTC_TARGET_BUFFER_MS) {
   if (state.audioContext) {
     setLocalDelay(delayMs);
     muteLocalPlayback();
+    startControllerAudioMonitor();
     return;
   }
   const AudioApi = window.AudioContext || window.webkitAudioContext;
@@ -345,6 +355,7 @@ async function prepareLocalPlayback(stream, delayMs = WEBRTC_TARGET_BUFFER_MS) {
   state.localOutputLatencySeconds = outputLatencySeconds;
   setLocalDelay(delayMs);
   if (audioContext.state === "suspended") await audioContext.resume();
+  startControllerAudioMonitor();
 }
 
 async function armLocalPlayback(stream, delayMs, startDelayMs) {
@@ -369,7 +380,113 @@ function setLocalDelay(delayMs) {
     0,
     Math.min(1, Number(delayMs || 0) / 1000 - Number(state.localOutputLatencySeconds || 0))
   );
+  state.localDelayMs = delaySeconds * 1000;
   state.localDelay.delayTime.setValueAtTime(delaySeconds, state.audioContext.currentTime);
+}
+
+function startControllerAudioMonitor() {
+  if (!state.audioContext || state.controllerAudioTimer) return;
+  sampleControllerAudioOutput(true);
+  state.controllerAudioTimer = setInterval(sampleControllerAudioOutput, CONTROLLER_AUDIO_SAMPLE_INTERVAL_MS);
+}
+
+function sampleControllerAudioOutput(forceReport = false) {
+  const audioContext = state.audioContext;
+  if (!audioContext) return;
+  const observedAt = Date.now();
+  const monotonicMs = globalThis.performance?.now?.() ?? observedAt;
+  const baseLatencyMs = Math.max(0, Number(audioContext.baseLatency || 0) * 1000);
+  const outputLatencyMs = Math.max(0, Number(audioContext.outputLatency || 0) * 1000);
+  const totalOutputLatencyMs = baseLatencyMs + outputLatencyMs;
+  if (!Number.isFinite(totalOutputLatencyMs)) return;
+
+  let outputContextTime = null;
+  let outputPerformanceTime = null;
+  try {
+    const timestamp = audioContext.getOutputTimestamp?.();
+    if (
+      Number.isFinite(timestamp?.contextTime) &&
+      Number.isFinite(timestamp?.performanceTime) &&
+      timestamp.performanceTime > 0
+    ) {
+      outputContextTime = Number(timestamp.contextTime);
+      outputPerformanceTime = Number(timestamp.performanceTime);
+    }
+  } catch {}
+
+  if (!Number.isFinite(state.initialControllerOutputLatencyMs)) {
+    state.initialControllerOutputLatencyMs = totalOutputLatencyMs;
+  }
+  state.controllerAudioSamples.push({
+    monotonicMs,
+    totalOutputLatencyMs,
+    outputContextTime,
+    outputPerformanceTime
+  });
+  state.controllerAudioSamples = state.controllerAudioSamples.filter(
+    (sample) => monotonicMs - sample.monotonicMs <= CONTROLLER_AUDIO_WINDOW_MS
+  );
+
+  const latencies = state.controllerAudioSamples.map((sample) => sample.totalOutputLatencyMs);
+  const firstSample = state.controllerAudioSamples[0];
+  const clockDriftPpm = estimateControllerClockDriftPpm(state.controllerAudioSamples);
+  const metrics = {
+    observedAt,
+    sampleCount: state.controllerAudioSamples.length,
+    observationWindowMs: Math.max(0, monotonicMs - Number(firstSample?.monotonicMs || monotonicMs)),
+    contextState: audioContext.state || "unknown",
+    sampleRate: Number(audioContext.sampleRate || 0) || null,
+    baseLatencyMs,
+    outputLatencyMs,
+    totalOutputLatencyMs,
+    initialOutputLatencyMs: state.initialControllerOutputLatencyMs,
+    latencyDeltaMs: totalOutputLatencyMs - state.initialControllerOutputLatencyMs,
+    latencySpreadMs: latencies.length ? Math.max(...latencies) - Math.min(...latencies) : 0,
+    clockDriftPpm,
+    timestampAvailable: outputContextTime !== null,
+    localDelayMs: state.localDelayMs,
+    roomTargetMs: state.roomTargetMs,
+    estimatedTimelineErrorMs: state.localDelayMs + totalOutputLatencyMs - state.roomTargetMs
+  };
+
+  if (
+    state.socket?.readyState === WebSocket.OPEN &&
+    (forceReport || observedAt - state.lastControllerMetricsSentAt >= CONTROLLER_AUDIO_REPORT_INTERVAL_MS)
+  ) {
+    state.lastControllerMetricsSentAt = observedAt;
+    state.socket.send(JSON.stringify({ type: "captureMetrics", metrics }));
+  }
+}
+
+function estimateControllerClockDriftPpm(samples) {
+  const usable = samples.filter(
+    (sample) => Number.isFinite(sample.outputContextTime) && Number.isFinite(sample.outputPerformanceTime)
+  );
+  if (usable.length < 6) return null;
+  const first = usable[0];
+  const last = usable.at(-1);
+  if (last.outputPerformanceTime - first.outputPerformanceTime < 5000) return null;
+
+  const meanPerformance = usable.reduce((sum, sample) => sum + sample.outputPerformanceTime, 0) / usable.length;
+  const meanContext = usable.reduce((sum, sample) => sum + sample.outputContextTime * 1000, 0) / usable.length;
+  let covariance = 0;
+  let variance = 0;
+  for (const sample of usable) {
+    const x = sample.outputPerformanceTime - meanPerformance;
+    covariance += x * (sample.outputContextTime * 1000 - meanContext);
+    variance += x * x;
+  }
+  if (variance <= 0) return null;
+  return (covariance / variance - 1) * 1_000_000;
+}
+
+function resetControllerAudioMonitor() {
+  clearInterval(state.controllerAudioTimer);
+  state.controllerAudioTimer = null;
+  state.controllerAudioSamples = [];
+  state.initialControllerOutputLatencyMs = null;
+  state.lastControllerMetricsSentAt = 0;
+  state.localDelayMs = 0;
 }
 
 function muteLocalPlayback() {
@@ -479,6 +596,7 @@ function finishCapture(status, notifyServer = true) {
   state.phaseElapsedMs = 0;
   state.phaseTimeoutMs = 0;
   state.phaseBlocked = false;
+  resetControllerAudioMonitor();
   for (const peerId of [...state.peers.keys()]) closeWebRtcPeer(peerId);
   if (socket && socket.readyState === WebSocket.OPEN && notifyServer) {
     try {

@@ -19,6 +19,7 @@ import {
   ROOM_SYNC_POLICY
 } from "./roomSync.js";
 import { isLoopbackHost, resolvePageRole } from "./pageRole.js";
+import { controllerAudioHealth } from "./controllerMetrics.js";
 
 const EMPTY_STATE = {
   track: null,
@@ -58,6 +59,7 @@ export default function App() {
   const [peers, setPeers] = useState([]);
   const [joinOptions, setJoinOptions] = useState([]);
   const [selectedJoinUrl, setSelectedJoinUrl] = useState("");
+  const [controllerMonitorOpen, setControllerMonitorOpen] = useState(true);
   const [deviceNameState, setDeviceNameState] = useState(currentDeviceName);
   const [selectedLayerIdState, setSelectedLayerIdState] = useState(() => localStorage.getItem("selectedLayerId"));
   const [selectedZoneState, setSelectedZoneState] = useState(() => localStorage.getItem("selectedZone") || "front-left");
@@ -151,6 +153,9 @@ export default function App() {
   const selectedLayer = layerById(layers, selectedLayerIdState) || layers[0] || null;
   const liveActive = Boolean(serverState.live?.id);
   const speakerPeers = peers.filter((peer) => peer.role === "speaker");
+  const capturePeer = peers.find((peer) => peer.role === "capture") || null;
+  const controllerMetrics = capturePeer?.controllerAudioMetrics || null;
+  const controllerOutputHealth = controllerAudioHealth(controllerMetrics);
   const speakerCount = speakerPeers.length;
   const activeSpeakerCount = speakerPeers.filter((peer) => peer.ready && !peer.muted).length;
   const stoppedSpeakerCount = speakerPeers.filter((peer) => peer.muted).length;
@@ -2640,7 +2645,36 @@ export default function App() {
                     <div><span>Transport</span><strong>WebRTC / Opus</strong></div>
                     <div><span>{livePlaying ? "Active outputs" : "Stable speakers"}</span><strong>{livePlaying ? activeSpeakerCount : stableSpeakerCount} / {requiredSpeakerCount || speakerCount}</strong></div>
                     <div><span>Room target</span><strong>{roomTargetMs ? `${roomTargetMs} ms` : "Measuring"}</strong></div>
+                    <div>
+                      <span>Controller output</span>
+                      <strong className={`metric-health ${controllerOutputHealth.tone}`}>{controllerOutputHealth.label}</strong>
+                    </div>
                   </div>
+                  <details
+                    className="controller-monitor"
+                    open={controllerMonitorOpen}
+                    onToggle={(event) => setControllerMonitorOpen(event.currentTarget.open)}
+                  >
+                    <summary>
+                      <span>Controller output telemetry</span>
+                      <span>{controllerMetrics?.sampleRate ? `${Math.round(controllerMetrics.sampleRate)} Hz` : "Waiting"}</span>
+                    </summary>
+                    <div className="diagnostic-grid controller-diagnostic-grid">
+                      <Stat label="AudioContext" value={controllerMetrics?.contextState || "--"} />
+                      <Stat label="Total output" value={formatMetric(controllerMetrics?.totalOutputLatencyMs, "ms")} />
+                      <Stat label="Base buffer" value={formatMetric(controllerMetrics?.baseLatencyMs, "ms")} />
+                      <Stat label="Device output" value={formatMetric(controllerMetrics?.outputLatencyMs, "ms")} />
+                      <Stat label="Change from start" value={formatSignedMetric(controllerMetrics?.latencyDeltaMs, "ms")} />
+                      <Stat label="Window spread" value={formatMetric(controllerMetrics?.latencySpreadMs, "ms")} />
+                      <Stat label="Estimated offset" value={formatSignedMetric(controllerMetrics?.estimatedTimelineErrorMs, "ms")} />
+                      <Stat label="Audio clock skew" value={formatSignedMetric(controllerMetrics?.clockDriftPpm, "ppm")} />
+                      <Stat label="Fixed local delay" value={formatMetric(controllerMetrics?.localDelayMs, "ms")} />
+                      <Stat
+                        label="Observation"
+                        value={controllerMetrics ? `${Math.round(controllerMetrics.observationWindowMs / 1000)}s / ${controllerMetrics.sampleCount}` : "--"}
+                      />
+                    </div>
+                  </details>
                   {!livePlaying && (
                     <div className={`phase-progress ${livePhaseBlocked ? "is-blocked" : ""}`}>
                       <div className="phase-progress-heading">
@@ -3108,6 +3142,16 @@ function formatJoinAddress(url) {
   } catch {
     return url;
   }
+}
+
+function formatMetric(value, unit) {
+  return Number.isFinite(value) ? `${Math.round(value * 10) / 10} ${unit}` : "--";
+}
+
+function formatSignedMetric(value, unit) {
+  return Number.isFinite(value)
+    ? `${value >= 0 ? "+" : ""}${Math.round(value * 10) / 10} ${unit}`
+    : "Collecting";
 }
 
 function detectDeviceInfo() {

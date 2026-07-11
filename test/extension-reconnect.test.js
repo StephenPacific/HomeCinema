@@ -139,6 +139,7 @@ test("capture output stays muted through measuring and locking, then arms once",
   const source = await readFile(new URL("../extension/offscreen.js", import.meta.url), "utf8");
   const sockets = [];
   const gainEvents = [];
+  const sentMessages = [];
   let runtimeListener = null;
 
   class FakeParam {
@@ -162,7 +163,8 @@ test("capture output stays muted through measuring and locking, then arms once",
       this.currentTime = 10;
       this.state = "running";
       this.baseLatency = 0;
-      this.outputLatency = 0;
+      this.outputLatency = 0.04;
+      this.sampleRate = 48_000;
       this.destination = new FakeNode();
     }
     createMediaStreamSource() {
@@ -178,6 +180,9 @@ test("capture output stays muted through measuring and locking, then arms once",
       node.gain = new FakeParam();
       return node;
     }
+    getOutputTimestamp() {
+      return { contextTime: this.currentTime, performanceTime: 10_000 };
+    }
     async resume() {}
     async close() {}
   }
@@ -192,7 +197,9 @@ test("capture output stays muted through measuring and locking, then arms once",
     addEventListener(type, listener) {
       this.listeners.set(type, [...(this.listeners.get(type) || []), listener]);
     }
-    send() {}
+    send(payload) {
+      sentMessages.push(JSON.parse(payload));
+    }
     close() {}
     emit(type, event = {}) {
       for (const listener of this.listeners.get(type) || []) listener(event);
@@ -243,6 +250,10 @@ test("capture output stays muted through measuring and locking, then arms once",
   emitState("liveStart", { id: "live-1", transport: "webrtc", phase: "measuring", bufferMs: 120 });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(gainEvents.some((event) => event.type === "ramp" && event.value === 1), false);
+  const metricsMessage = sentMessages.find((message) => message.type === "captureMetrics");
+  assert.equal(metricsMessage?.metrics?.sampleRate, 48_000);
+  assert.equal(metricsMessage?.metrics?.totalOutputLatencyMs, 40);
+  assert.ok(Math.abs(metricsMessage?.metrics?.estimatedTimelineErrorMs || 0) < 0.000001);
 
   emitState("liveLock", { id: "live-1", transport: "webrtc", phase: "locking", roomTargetMs: 155 });
   await new Promise((resolve) => setImmediate(resolve));

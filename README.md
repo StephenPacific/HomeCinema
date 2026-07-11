@@ -42,6 +42,8 @@ Speaker pages report a room-sync engine version. Stale pages and superseded conn
 
 The room target stays frozen after playback starts. Speakers continue reporting clock, playout, packet-loss, and output diagnostics. Drift inside the correction range is removed by a bounded local-delay servo: at most 3 ms every two-second sample, applied as a 1.8-second Web Audio ramp so the output does not jump. A speaker with sustained hard drift is faded out, retuned faster while silent, and allowed back only after consecutive in-tolerance samples. If a late device has no delay headroom left, it remains muted until the room is restarted instead of disrupting the other speakers.
 
+Extension version `0.3.6` adds observation-only Controller output telemetry. While tab audio is active, the capture endpoint samples its AudioContext every 500 ms and reports a rolling 30-second window every two seconds: sample rate, base and device output latency, movement from the initial estimate, window spread, fixed local delay, estimated timeline error, and the audio-clock slope derived from `getOutputTimestamp()`. The server prints a compact Controller audio line every five seconds, and the Controller UI shows the same metrics. These measurements do not alter delay or playback in this version; they are intended to distinguish stable offsets, latency jumps, and clock drift before choosing a correction policy.
+
 ## Stems
 
 Stem mode works best when you prepare separate files from the same song, for example:

@@ -16,6 +16,7 @@ import {
   supportsRoomSyncVersion
 } from "./src/roomSync.js";
 import { lanAddressCandidates } from "./src/networkAddresses.js";
+import { sanitizeControllerAudioMetrics } from "./src/controllerMetrics.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
@@ -145,6 +146,8 @@ server.on("upgrade", (req, socket) => {
     deviceOffsetMs: 0,
     audioContextState: "none",
     outputPath: "none",
+    controllerAudioMetrics: null,
+    lastControllerMetricsLogAt: 0,
     livePaused: true,
     liveMuted: false,
     liveReadyState: 0,
@@ -450,6 +453,17 @@ function handleMessage(client, message) {
     }
     announceWebRtcPeer(client);
     evaluateLivePreflight();
+    broadcastPeers();
+    return;
+  }
+
+  if (message.type === "captureMetrics") {
+    if (client.role !== "capture") return;
+    const metrics = sanitizeControllerAudioMetrics(message.metrics);
+    if (!metrics) return;
+    client.controllerAudioMetrics = metrics;
+    client.lastSeen = Date.now();
+    logControllerAudioMetrics(client, metrics);
     broadcastPeers();
     return;
   }
@@ -1071,6 +1085,7 @@ function peerList() {
       deviceOffsetMs: client.deviceOffsetMs,
       audioContextState: client.audioContextState,
       outputPath: client.outputPath,
+      controllerAudioMetrics: client.controllerAudioMetrics,
       livePaused: client.livePaused,
       liveMuted: client.liveMuted,
       liveReadyState: client.liveReadyState,
@@ -1084,6 +1099,22 @@ function peerList() {
       online: true
     };
   });
+}
+
+function logControllerAudioMetrics(client, metrics) {
+  const now = Date.now();
+  if (now - client.lastControllerMetricsLogAt < 5000) return;
+  client.lastControllerMetricsLogAt = now;
+  const signed = (value, suffix) => Number.isFinite(value)
+    ? `${value >= 0 ? "+" : ""}${Math.round(value * 10) / 10}${suffix}`
+    : "collecting";
+  console.log(
+    `[Controller audio] ${client.name}: ${metrics.sampleRate || "--"} Hz | ` +
+    `output ${Math.round(metrics.totalOutputLatencyMs * 10) / 10} ms | ` +
+    `change ${signed(metrics.latencyDeltaMs, " ms")} | ` +
+    `spread ${Math.round((metrics.latencySpreadMs || 0) * 10) / 10} ms | ` +
+    `clock ${signed(metrics.clockDriftPpm, " ppm")} | ${metrics.contextState}`
+  );
 }
 
 function primaryTrack(layers = state.layers) {
