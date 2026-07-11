@@ -61,7 +61,12 @@ serverUrlInput.addEventListener("change", () => {
 serverUrlInput.addEventListener("input", updateActionState);
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName === "local" && changes.captureStatus) renderStatus(changes.captureStatus.newValue);
+  if (areaName !== "local") return;
+  if (changes.homeCinemaUrl && document.activeElement !== serverUrlInput) {
+    serverUrlInput.value = changes.homeCinemaUrl.newValue || "";
+    updateActionState();
+  }
+  if (changes.captureStatus) renderStatus(changes.captureStatus.newValue);
 });
 
 chrome.runtime.onMessage.addListener((message) => {

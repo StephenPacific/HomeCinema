@@ -10,6 +10,7 @@ test("capture reconnect keeps the tab stream alive until the user stops it", asy
   let nextTimerId = 1;
   let runtimeListener = null;
   let trackStopCount = 0;
+  const runtimeMessages = [];
 
   class FakeWebSocket {
     static OPEN = 1;
@@ -58,7 +59,9 @@ test("capture reconnect keeps the tab stream alive until the user stops it", asy
             runtimeListener = listener;
           }
         },
-        sendMessage() {}
+        sendMessage(message) {
+          runtimeMessages.push(message);
+        }
       }
     },
     navigator: {
@@ -111,6 +114,16 @@ test("capture reconnect keeps the tab stream alive until the user stops it", asy
   sockets[0].readyState = FakeWebSocket.OPEN;
   sockets[0].emit("open");
   assert.equal(sockets[0].sent.some((message) => message.type === "liveStart"), true);
+  sockets[0].emit("message", {
+    data: JSON.stringify({
+      type: "hello",
+      state: { addresses: ["http://192.168.20.8:4173"] }
+    })
+  });
+  assert.equal(
+    runtimeMessages.at(-1)?.status?.serverUrl,
+    "http://192.168.20.8:4173"
+  );
 
   sockets[0].readyState = 3;
   sockets[0].emit("close");

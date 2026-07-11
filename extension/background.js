@@ -4,7 +4,11 @@ const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === "capture-status") {
-    chrome.storage.local.set({ captureStatus: message.status }).then(() => sendResponse({ ok: true }));
+    const updates = { captureStatus: message.status };
+    try {
+      if (message.status?.serverUrl) updates.homeCinemaUrl = normalizeServerUrl(message.status.serverUrl);
+    } catch {}
+    chrome.storage.local.set(updates).then(() => sendResponse({ ok: true }));
     return true;
   }
 

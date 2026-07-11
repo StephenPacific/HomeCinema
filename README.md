@@ -31,7 +31,7 @@ The included Chrome extension can relay audio from the current desktop Chrome ta
 1. Start Home Cinema with `npm start`.
 2. In Chrome, open `chrome://extensions`, turn on Developer mode, then choose **Load unpacked** and select the [`extension`](extension/) folder.
 3. Open Home Cinema, have speakers join from the QR code, and tap **Enable speaker** on each device before beginning the live capture.
-4. Open the Home Cinema Controller page once before using the extension. When the extension is opened from that tab it detects and saves the correct server origin. You can also enter the server address manually; remote computers must use the host's LAN address rather than `127.0.0.1`.
+4. Open the Home Cinema Controller page once before using the extension. When the extension is opened from that tab it detects and saves the correct server origin. If a host starts locally with `127.0.0.1`, the connected server advertises its LAN address and the extension automatically migrates the displayed and saved address. You can also enter the server address manually.
 5. With the music or video tab active, press **Start audio**. The original tab audio remains audible on the host computer with the same short playout target used by the room. Press **Stop** in the extension to end the session.
 
 Live tab audio uses WebRTC with Opus. WebSocket remains responsible for room state, device discovery, clock measurements, and WebRTC signaling. Current Chrome and Edge releases are the recommended speaker browsers for this mode. Uploaded tracks retain the wider browser support described below. Only one live tab capture can be active in a room at a time. Protected DRM playback may not permit capture; the extension does not bypass DRM.

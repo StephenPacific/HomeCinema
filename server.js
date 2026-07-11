@@ -904,7 +904,8 @@ function publicState() {
     position: state.position,
     currentPosition: currentPosition(now),
     leadMs,
-    requiredSyncEngineVersion: ROOM_SYNC_ENGINE_VERSION
+    requiredSyncEngineVersion: ROOM_SYNC_ENGINE_VERSION,
+    addresses: getLanAddresses(port)
   };
 }
 
