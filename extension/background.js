@@ -1,3 +1,5 @@
+import { normalizeServerUrl } from "./server-url.js";
+
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -100,17 +102,6 @@ function getMediaStreamId(tabId) {
       resolve(streamId);
     });
   });
-}
-
-function normalizeServerUrl(value) {
-  const url = new URL(String(value || "http://127.0.0.1:4173").trim());
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("Home Cinema URL must start with http:// or https://");
-  }
-  url.pathname = "/";
-  url.search = "";
-  url.hash = "";
-  return url.toString().replace(/\/$/, "");
 }
 
 function idleStatus() {

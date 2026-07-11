@@ -1,3 +1,5 @@
+import { normalizeServerUrl, resolveServerUrl, serverUrlFromHomeCinemaTab } from "./server-url.js";
+
 const serverUrlInput = document.querySelector("#serverUrl");
 const tabTitle = document.querySelector("#tabTitle");
 const statusText = document.querySelector("#statusText");
@@ -56,6 +58,8 @@ serverUrlInput.addEventListener("change", () => {
   } catch {}
 });
 
+serverUrlInput.addEventListener("input", updateActionState);
+
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === "local" && changes.captureStatus) renderStatus(changes.captureStatus.newValue);
 });
@@ -65,15 +69,25 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 async function initialize() {
-  const [{ homeCinemaUrl }, tab] = await Promise.all([
+  const [{ homeCinemaUrl }, tab, response] = await Promise.all([
     chrome.storage.local.get("homeCinemaUrl"),
-    activeTabQuery()
+    activeTabQuery(),
+    sendMessage({ type: "get-capture-status" })
   ]);
   activeTab = tab;
-  serverUrlInput.value = homeCinemaUrl || "http://127.0.0.1:4173";
+  const nextStatus = response?.status || captureStatus;
+  const detectedTabUrl = serverUrlFromHomeCinemaTab(tab);
+  const serverUrl = resolveServerUrl({ savedUrl: homeCinemaUrl, captureStatus: nextStatus, activeTab: tab });
+  serverUrlInput.value = serverUrl;
+  if (detectedTabUrl && detectedTabUrl !== homeCinemaUrl) {
+    await chrome.storage.local.set({ homeCinemaUrl: detectedTabUrl });
+  }
   tabTitle.textContent = tab?.title || "No active tab";
-  const response = await sendMessage({ type: "get-capture-status" });
-  renderStatus(response?.status || captureStatus);
+  renderStatus(
+    serverUrl || nextStatus.phase !== "idle"
+      ? nextStatus
+      : { ...nextStatus, detail: "Enter the Home Cinema address, or open its Controller page and reopen this extension." }
+  );
 }
 
 function activeTabQuery() {
@@ -104,19 +118,18 @@ function renderStatus(status) {
   progressDetail.textContent = requiredSpeakers
     ? `${sampleCount}/${sampleTarget} samples · ${stableSpeakers}/${requiredSpeakers} speakers ${speakerLabel}`
     : `${sampleCount}/${sampleTarget} samples · waiting for a speaker`;
-  startButton.disabled = active;
-  stopButton.disabled = !active;
+  updateActionState();
 }
 
-function normalizeServerUrl(value) {
-  const url = new URL(String(value || "").trim());
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("Use an http:// or https:// Home Cinema address.");
-  }
-  url.pathname = "/";
-  url.search = "";
-  url.hash = "";
-  return url.toString().replace(/\/$/, "");
+function updateActionState() {
+  const active = captureStatus.phase === "capturing" || captureStatus.phase === "connecting";
+  let configured = false;
+  try {
+    configured = Boolean(normalizeServerUrl(serverUrlInput.value));
+  } catch {}
+  startButton.disabled = active || !configured;
+  stopButton.disabled = !active;
+  openButton.disabled = !configured;
 }
 
 function sendMessage(message) {
