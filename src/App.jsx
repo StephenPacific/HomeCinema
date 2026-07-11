@@ -1,10 +1,28 @@
-import { Copy, Pause, Play, RotateCw, Square, Upload, Volume2 } from "lucide-react";
+import { Copy, Pause, Play, Radio, RefreshCw, RotateCw, Square, Upload, Volume2, VolumeX } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  expectedLivePositionSeconds,
+  LIVE_SYNC_POLICY,
+  liveDriftCorrection,
+  liveStartLocalMs,
+  shouldStartLiveBuffer,
+  WEBRTC_SYNC_POLICY,
+  webRtcPlayoutDelaySample
+} from "./liveSync.js";
 import { createQrMatrix } from "./qr.js";
+import {
+  fixedPostDelayMs,
+  fixedTimelineErrorMs,
+  nextFixedTimelineGuard,
+  nextPostDelayCorrection,
+  ROOM_SYNC_ENGINE_VERSION,
+  ROOM_SYNC_POLICY
+} from "./roomSync.js";
 
 const EMPTY_STATE = {
   track: null,
   layers: [],
+  live: null,
   playing: false,
   position: 0,
   startedAt: null,
@@ -48,6 +66,7 @@ export default function App() {
   const [audioReadyState, setAudioReadyState] = useState(false);
   const [audioLoading, setAudioLoading] = useState(false);
   const [unlockedState, setUnlockedState] = useState(false);
+  const [remoteMutedState, setRemoteMutedState] = useState(false);
   const [audioContextState, setAudioContextState] = useState("none");
   const [playbackEngineState, setPlaybackEngineState] = useState("Web Audio");
   const [audioIssueState, setAudioIssueState] = useState("");
@@ -56,6 +75,13 @@ export default function App() {
   const [correctionCountState, setCorrectionCountState] = useState(0);
   const [lastCorrectionState, setLastCorrectionState] = useState("--");
   const [lastStartDelayState, setLastStartDelayState] = useState(null);
+  const [outputLatencyState, setOutputLatencyState] = useState(null);
+  const [rtcJitterState, setRtcJitterState] = useState(null);
+  const [rtcPlayoutDelayState, setRtcPlayoutDelayState] = useState(null);
+  const [rtcPostDelayState, setRtcPostDelayState] = useState(null);
+  const [rtcPacketsLostState, setRtcPacketsLostState] = useState(0);
+  const [rtcConcealedState, setRtcConcealedState] = useState(0);
+  const [liveOutputPathState, setLiveOutputPathState] = useState("Idle");
   const [durationState, setDurationState] = useState(0);
   const [positionState, setPositionState] = useState(0);
   const [countdownState, setCountdownState] = useState(null);
@@ -74,14 +100,33 @@ export default function App() {
   const deviceOffsetRef = useRef(deviceOffsetState);
   const serverOffsetRef = useRef(serverOffsetState);
   const latencyRef = useRef(latencyState);
+  const outputLatencyRef = useRef(0);
+  const syncErrorRef = useRef(null);
+  const rtcPlayoutDelayRef = useRef(null);
+  const rtcPostDelayRef = useRef(0);
+  const clockSamplesRef = useRef([]);
   const unlockedRef = useRef(unlockedState);
+  const readyStatusRef = useRef(readyStatus);
+  const remoteMutedRef = useRef(false);
   const audioReadyRef = useRef(audioReadyState);
   const audioContextRef = useRef(null);
   const gainRef = useRef(null);
+  const liveMediaSourceNodeRef = useRef(null);
+  const liveStreamSourceNodeRef = useRef(null);
+  const liveDelayRef = useRef(null);
+  const liveGainRef = useRef(null);
+  const liveOutputModeRef = useRef("none");
+  const rtcBytesReceivedRef = useRef(0);
+  const rtcEmittedCountRef = useRef(0);
+  const rtcAudioLevelRef = useRef(null);
   const audioBufferRef = useRef(null);
   const sourceRef = useRef(null);
   const activeSourcesRef = useRef(new Set());
   const mediaAudioRef = useRef(null);
+  const liveAudioRef = useRef(null);
+  const liveSessionRef = useRef(null);
+  const flushLiveQueueRef = useRef(() => {});
+  const appendLiveChunkRef = useRef(() => {});
   const mediaPlaybackTimerRef = useRef(null);
   const playbackEngineRef = useRef("web-audio");
   const lastMediaCorrectionRef = useRef(0);
@@ -95,19 +140,58 @@ export default function App() {
   const unlockingRef = useRef(false);
   const shuttingDownRef = useRef(false);
   const seekingRef = useRef(false);
+  const pendingSeekRef = useRef(0);
   const handleMessageRef = useRef(null);
+  const deviceCommandRef = useRef(null);
 
   const layers = serverState.layers || [];
   const selectedLayer = layerById(layers, selectedLayerIdState) || layers[0] || null;
-  const trackLabel = layers.length > 1 ? `${layers.length} stems` : serverState.track?.name || "No track loaded";
-  const syncLabel = buildSyncLabel({
-    layers,
-    selectedLayer,
-    state: serverState,
-    audioReady: audioReadyState,
-    audioLoading,
-    countdown: countdownState
-  });
+  const liveActive = Boolean(serverState.live?.id);
+  const speakerPeers = peers.filter((peer) => peer.role === "speaker");
+  const speakerCount = speakerPeers.length;
+  const activeSpeakerCount = speakerPeers.filter((peer) => peer.ready && !peer.muted).length;
+  const stoppedSpeakerCount = speakerPeers.filter((peer) => peer.muted).length;
+  const issueSpeakerCount = speakerPeers.filter((peer) => ["failed", "needs-action"].includes(peer.health)).length;
+  const retryableSpeakerCount = speakerPeers.filter((peer) => peer.health === "failed").length;
+  const allSpeakersMuted = speakerCount > 0 && stoppedSpeakerCount === speakerCount;
+  const livePhase = serverState.live?.phase || (liveActive ? "playing" : "idle");
+  const livePlaying = livePhase === "playing";
+  const stableSpeakerCount = Number(serverState.live?.stableSpeakers || 0);
+  const requiredSpeakerCount = Number(serverState.live?.requiredSpeakers || 0);
+  const roomTargetMs = Number(serverState.live?.roomTargetMs || 0);
+  const livePhaseProgress = clamp(Number(serverState.live?.phaseProgress || 0), 0, 100);
+  const livePhaseSampleCount = Number(serverState.live?.phaseSampleCount || 0);
+  const livePhaseSampleTarget = Number(serverState.live?.phaseSampleTarget || ROOM_SYNC_POLICY.sampleWindow);
+  const livePhaseElapsedMs = Number(serverState.live?.phaseElapsedMs || 0);
+  const livePhaseTimeoutMs = Number(serverState.live?.phaseTimeoutMs || 0);
+  const livePhaseBlocked = Boolean(serverState.live?.phaseBlocked);
+  const livePhaseLabel = {
+    measuring: "Measuring",
+    locking: "Locking",
+    armed: "Armed",
+    playing: "Playing"
+  }[livePhase] || "Active";
+  const trackLabel = liveActive
+    ? serverState.live.name
+    : layers.length > 1
+      ? `${layers.length} stems`
+      : serverState.track?.name || "No track loaded";
+  const syncLabel = liveActive
+    ? serverState.live.transport === "webrtc"
+      ? livePhase === "measuring"
+        ? `WebRTC / Opus - measuring ${stableSpeakerCount}/${requiredSpeakerCount}`
+        : livePhase === "locking"
+          ? `Locking fixed timeline - ${roomTargetMs || "--"} ms`
+          : `Fixed room timeline - ${roomTargetMs || serverState.live.bufferMs || 120} ms`
+      : `Live tab audio - ${serverState.live.mimeType}`
+    : buildSyncLabel({
+        layers,
+        selectedLayer,
+        state: serverState,
+        audioReady: audioReadyState,
+        audioLoading,
+        countdown: countdownState
+      });
 
   useEffect(() => {
     document.body.classList.toggle("player-view", isPlayerView);
@@ -128,6 +212,25 @@ export default function App() {
     if (socketRef.current?.readyState !== WebSocket.OPEN) return;
     const state = stateRef.current;
     const layer = layerById(state.layers || [], selectedLayerIdRef.current) || state.layers?.[0] || null;
+    const health = deriveDeviceHealth({
+      role: roleRef.current,
+      status: readyStatusRef.current,
+      muted: remoteMutedRef.current,
+      unlocked: unlockedRef.current,
+      live: Boolean(state.live?.id),
+      hasLayer: Boolean(layer),
+      audioReady: audioReadyRef.current
+    });
+    outputLatencyRef.current = Math.round(estimateOutputLatencySeconds(audioContextRef.current) * 1000);
+    const liveAudio = liveAudioRef.current;
+    const liveSession = liveSessionRef.current;
+    const timelineState = !liveSession
+      ? "idle"
+      : liveSession.timelineGuard?.quarantined || liveSession.rejoining
+        ? "recovering"
+        : liveSession.audible
+          ? "locked"
+          : liveSession.phase || "measuring";
     send({
       type: "identify",
       role: roleRef.current,
@@ -135,10 +238,27 @@ export default function App() {
       deviceKey: currentDeviceKey(),
       layerId: selectedLayerIdRef.current,
       zone: selectedZoneRef.current,
-      ready: Boolean(unlockedRef.current && (!layer || audioReadyRef.current)),
-      unlocked: unlockedRef.current,
+      ready: roleRef.current === "controller" || health === "ready",
+      unlocked: roleRef.current === "controller" || unlockedRef.current,
+      muted: remoteMutedRef.current,
+      health,
+      status: readyStatusRef.current,
+      syncErrorMs: syncErrorRef.current,
+      playoutDelayMs: rtcPlayoutDelayRef.current,
+      postDelayMs: rtcPostDelayRef.current,
       latencyMs: Math.round(latencyRef.current || 0),
-      deviceOffsetMs: deviceOffsetRef.current
+      outputLatencyMs: outputLatencyRef.current,
+      deviceOffsetMs: deviceOffsetRef.current,
+      audioContextState: audioContextRef.current?.state || "none",
+      outputPath: liveOutputModeRef.current,
+      livePaused: Boolean(liveAudio?.paused),
+      liveMuted: Boolean(liveAudio?.muted),
+      liveReadyState: Number(liveAudio?.readyState || 0),
+      rtcBytesReceived: rtcBytesReceivedRef.current,
+      rtcEmittedCount: rtcEmittedCountRef.current,
+      rtcAudioLevel: rtcAudioLevelRef.current,
+      timelineState,
+      syncEngineVersion: ROOM_SYNC_ENGINE_VERSION
     });
   }, [send]);
 
@@ -146,6 +266,11 @@ export default function App() {
     clearTimeout(statusTimerRef.current);
     statusTimerRef.current = setTimeout(reportStatusNow, 120);
   }, [reportStatusNow]);
+
+  useEffect(() => {
+    readyStatusRef.current = readyStatus;
+    reportStatusSoon();
+  }, [readyStatus, reportStatusSoon]);
 
   const setRole = useCallback(
     (nextRole) => {
@@ -183,6 +308,331 @@ export default function App() {
     [setSelectedLayerId]
   );
 
+  const ensureLiveAudioOutput = useCallback((audioContext, liveAudio) => {
+    if (!audioContext || !liveAudio) return null;
+    if (liveGainRef.current && liveDelayRef.current) {
+      liveOutputModeRef.current = "media-element-source";
+      setLiveOutputPathState("Web Audio media output");
+      return liveGainRef.current;
+    }
+
+    try {
+      liveAudio.muted = false;
+      liveAudio.volume = 1;
+      const source = audioContext.createMediaElementSource(liveAudio);
+      const delay = audioContext.createDelay(1.1);
+      const gain = audioContext.createGain();
+      delay.delayTime.value = 0;
+      gain.gain.value = 0;
+      source.connect(delay).connect(gain).connect(audioContext.destination);
+      liveMediaSourceNodeRef.current = source;
+      liveDelayRef.current = delay;
+      liveGainRef.current = gain;
+      liveOutputModeRef.current = "media-element-source";
+      setLiveOutputPathState("Web Audio media output");
+      return gain;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const ensureLiveStreamOutput = useCallback((audioContext, stream) => {
+    if (!audioContext || !stream || typeof audioContext.createMediaStreamSource !== "function") return null;
+    if (liveStreamSourceNodeRef.current && liveDelayRef.current && liveGainRef.current) return liveGainRef.current;
+
+    try {
+      const source = audioContext.createMediaStreamSource(stream);
+      const delay = audioContext.createDelay(1.1);
+      const gain = audioContext.createGain();
+      delay.delayTime.value = 0;
+      gain.gain.value = 0;
+      source.connect(delay).connect(gain).connect(audioContext.destination);
+      liveStreamSourceNodeRef.current = source;
+      liveDelayRef.current = delay;
+      liveGainRef.current = gain;
+      liveOutputModeRef.current = "webrtc-stream-source";
+      setLiveOutputPathState("WebRTC through Web Audio");
+      return gain;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const setLivePostDelay = useCallback((delayMs, session = liveSessionRef.current) => {
+    const audioContext = audioContextRef.current;
+    const delay = liveDelayRef.current;
+    if (!audioContext || !delay) return null;
+    const nextDelayMs = clamp(Number(delayMs) || 0, 0, 1000);
+    const now = audioContext.currentTime;
+    delay.delayTime.cancelScheduledValues(now);
+    delay.delayTime.setValueAtTime(nextDelayMs / 1000, now);
+    rtcPostDelayRef.current = Math.round(nextDelayMs);
+    setRtcPostDelayState(rtcPostDelayRef.current);
+    if (session) session.postDelayMs = nextDelayMs;
+    return nextDelayMs;
+  }, []);
+
+  const rampLivePostDelay = useCallback((delayMs, durationSeconds, session = liveSessionRef.current) => {
+    const audioContext = audioContextRef.current;
+    const delay = liveDelayRef.current;
+    if (!audioContext || !delay) return null;
+    const nextDelayMs = clamp(Number(delayMs) || 0, 0, 1000);
+    const duration = clamp(Number(durationSeconds) || 0, 0, 4);
+    const now = audioContext.currentTime;
+    const parameter = delay.delayTime;
+    if (typeof parameter.cancelAndHoldAtTime === "function") {
+      parameter.cancelAndHoldAtTime(now);
+    } else {
+      const currentValue = parameter.value;
+      parameter.cancelScheduledValues(now);
+      parameter.setValueAtTime(currentValue, now);
+    }
+    if (duration <= 0) parameter.setValueAtTime(nextDelayMs / 1000, now);
+    else parameter.linearRampToValueAtTime(nextDelayMs / 1000, now + duration);
+    rtcPostDelayRef.current = Math.round(nextDelayMs);
+    setRtcPostDelayState(rtcPostDelayRef.current);
+    if (session) session.postDelayMs = nextDelayMs;
+    return nextDelayMs;
+  }, []);
+
+  const releaseLiveStreamOutput = useCallback(() => {
+    if (!liveStreamSourceNodeRef.current) return;
+    try {
+      liveStreamSourceNodeRef.current.disconnect();
+      liveDelayRef.current?.disconnect();
+      liveGainRef.current?.disconnect();
+    } catch {}
+    liveStreamSourceNodeRef.current = null;
+    liveDelayRef.current = null;
+    liveGainRef.current = null;
+  }, []);
+
+  const rampLiveOutput = useCallback((target, durationSeconds = 0.025) => {
+    const nextTarget = clamp(Number(target) || 0, 0, 1);
+    const audioContext = audioContextRef.current;
+    const gain = liveGainRef.current;
+    if (!audioContext || !gain) {
+      const liveAudio = liveAudioRef.current;
+      if (liveAudio) {
+        liveAudio.muted = nextTarget <= 0.001;
+        liveAudio.volume = nextTarget;
+      }
+      return;
+    }
+
+    const now = audioContext.currentTime;
+    const parameter = gain.gain;
+    if (typeof parameter.cancelAndHoldAtTime === "function") {
+      parameter.cancelAndHoldAtTime(now);
+    } else {
+      const currentValue = parameter.value;
+      parameter.cancelScheduledValues(now);
+      parameter.setValueAtTime(currentValue, now);
+    }
+    if (durationSeconds <= 0) parameter.setValueAtTime(nextTarget, now);
+    else parameter.linearRampToValueAtTime(nextTarget, now + durationSeconds);
+  }, []);
+
+  const restoreLiveOutput = useCallback(
+    (durationSeconds = 0.025) => {
+      rampLiveOutput(remoteMutedRef.current ? 0 : 1, durationSeconds);
+    },
+    [rampLiveOutput]
+  );
+
+  const scheduleLiveOutputAt = useCallback((targetEpochMs, fadeSeconds = 0.04) => {
+    const audioContext = audioContextRef.current;
+    const gain = liveGainRef.current;
+    const liveAudio = liveAudioRef.current;
+    if (!audioContext || !gain) {
+      if (!liveAudio) return null;
+      liveAudio.muted = true;
+      liveAudio.volume = 0;
+      return setTimeout(() => {
+        const muted = remoteMutedRef.current;
+        liveAudio.muted = muted;
+        liveAudio.volume = muted ? 0 : 1;
+        if (!muted && liveAudio.paused) {
+          const playPromise = liveAudio.play();
+          if (playPromise?.catch) playPromise.catch(() => {});
+        }
+      }, Math.max(0, targetEpochMs - Date.now()));
+    }
+
+    const now = audioContext.currentTime;
+    const startAt = Math.max(now, contextTimeForAudibleEpoch(audioContext, targetEpochMs));
+    const parameter = gain.gain;
+    parameter.cancelScheduledValues(now);
+    parameter.setValueAtTime(0, now);
+    parameter.setValueAtTime(0, startAt);
+    parameter.linearRampToValueAtTime(remoteMutedRef.current ? 0 : 1, startAt + fadeSeconds);
+    return null;
+  }, []);
+
+  const quarantineWebRtcOutput = useCallback(
+    (session, status = "Recovering synchronization") => {
+      if (!session || session.closed) return;
+      clearTimeout(session.volumeTimer);
+      clearTimeout(session.joinTimer);
+      clearInterval(session.countdownTimer);
+      session.volumeTimer = null;
+      session.joinTimer = null;
+      session.countdownTimer = null;
+      session.startScheduled = false;
+      session.audible = false;
+      session.rejoining = false;
+      session.timelineGuard = {
+        quarantined: true,
+        violationCount: session.timelineGuard?.violationCount || 0,
+        recoveryCount: 0
+      };
+      rampLiveOutput(0, 0.04);
+      setReadyStatus(status);
+      reportStatusSoon();
+    },
+    [rampLiveOutput, reportStatusSoon]
+  );
+
+  const scheduleWebRtcOutputAt = useCallback(
+    (session, targetLocalMs, label = "WebRTC starts") => {
+      if (!session || session.closed || !session.outputReady || session.startScheduled) return false;
+      if (!Number.isFinite(targetLocalMs) || targetLocalMs <= Date.now() + 80) return false;
+
+      clearTimeout(session.volumeTimer);
+      clearTimeout(session.joinTimer);
+      clearInterval(session.countdownTimer);
+      session.startScheduled = true;
+      session.unmuteAtLocalMs = targetLocalMs;
+      session.volumeTimer = scheduleLiveOutputAt(targetLocalMs);
+
+      const updateCountdown = () => {
+        if (liveSessionRef.current !== session || session.closed) return;
+        const remainingMs = targetLocalMs - Date.now();
+        if (remainingMs > 0) {
+          setReadyStatus(
+            remoteMutedRef.current
+              ? "Stopped by controller"
+              : `${label} in ${Math.max(1, Math.ceil(remainingMs / 1000))}`
+          );
+          return;
+        }
+
+        clearInterval(session.countdownTimer);
+        session.countdownTimer = null;
+        session.startScheduled = false;
+        session.rejoining = false;
+        restoreLiveOutput(0.04);
+        const usesContextOutput = liveOutputModeRef.current.endsWith("source");
+        const outputBlocked = usesContextOutput
+          ? audioContextRef.current?.state !== "running"
+          : Boolean(liveAudioRef.current?.paused);
+        if (!remoteMutedRef.current && outputBlocked) {
+          unlockedRef.current = false;
+          setUnlockedState(false);
+          setReadyStatus("Tap to resume audio");
+        } else {
+          session.audible = !remoteMutedRef.current;
+          setReadyStatus(remoteMutedRef.current ? "Stopped by controller" : "Receiving WebRTC audio");
+        }
+        reportStatusSoon();
+      };
+
+      updateCountdown();
+      session.countdownTimer = setInterval(updateCountdown, 200);
+      session.joinTimer = setTimeout(updateCountdown, Math.max(0, targetLocalMs - Date.now()) + 80);
+      return true;
+    },
+    [reportStatusSoon, restoreLiveOutput, scheduleLiveOutputAt]
+  );
+
+  const lockWebRtcPostDelay = useCallback(
+    (session) => {
+      if (
+        !session ||
+        session.closed ||
+        !["locking", "armed", "playing"].includes(session.phase) ||
+        session.postDelayLocked ||
+        !Number.isFinite(session.roomTargetMs) ||
+        !Number.isFinite(session.measuredJitterDelayMs)
+      ) return false;
+
+      const postDelayMs = fixedPostDelayMs({
+        roomTargetMs: session.roomTargetMs,
+        playoutDelayMs: session.measuredJitterDelayMs,
+        outputLatencyMs: outputLatencyRef.current,
+        deviceOffsetMs: deviceOffsetRef.current
+      });
+      if (!Number.isFinite(postDelayMs) || setLivePostDelay(postDelayMs, session) === null) return false;
+      session.postDelayLocked = true;
+      setLastCorrectionState(`Fixed compensation ${Math.round(postDelayMs)} ms`);
+      reportStatusSoon();
+      return true;
+    },
+    [reportStatusSoon, setLivePostDelay]
+  );
+
+  const updateWebRtcTimeline = useCallback(
+    (live) => {
+      const session = liveSessionRef.current;
+      if (!session || session.closed || session.transport !== "webrtc" || session.id !== live?.id) return;
+      const phase = live.phase || (Number.isFinite(Number(live.playAt)) ? "armed" : "measuring");
+      session.phase = phase;
+      const playAt = Number(live.playAt);
+      session.playAtServerMs = Number.isFinite(playAt) && playAt > 0 ? playAt : null;
+
+      const roomTarget = Number(live.roomTargetMs);
+      if (Number.isFinite(roomTarget) && roomTarget > 0) {
+        session.roomTargetMs = roomTarget;
+      }
+
+      if (phase === "measuring" && !session.postDelayLocked) setLivePostDelay(0, session);
+      if (phase === "locking") lockWebRtcPostDelay(session);
+
+      if (session.outputReady && liveOutputModeRef.current === "html-media-element") {
+        rampLiveOutput(0, 0);
+        setReadyStatus("Fixed timeline unavailable");
+        reportStatusSoon();
+        return;
+      }
+
+      if (phase === "measuring" || phase === "locking") {
+        rampLiveOutput(0, 0);
+        setReadyStatus(
+          session.outputReady
+            ? phase === "locking" ? "Locking fixed room timeline" : "Measuring room timing"
+            : "Connecting WebRTC audio"
+        );
+        reportStatusSoon();
+        return;
+      }
+
+      if (!session.timelineLocked) {
+        const participants = Array.isArray(live.participantIds) ? live.participantIds : [];
+        session.initialParticipant = participants.length ? participants.includes(clientIdRef.current) : true;
+        session.timelineLocked = true;
+        session.timelineGuard = {
+          quarantined: !session.initialParticipant,
+          violationCount: 0,
+          recoveryCount: 0
+        };
+        if (!session.initialParticipant) {
+          rampLiveOutput(0, 0);
+          setReadyStatus("Synchronizing before join");
+          reportStatusSoon();
+          return;
+        }
+      }
+
+      if (!session.initialParticipant || session.timelineGuard?.quarantined) return;
+      if (session.audible || session.startScheduled || !session.outputReady) return;
+      const targetLocalMs = session.playAtServerMs - serverOffsetRef.current;
+      if (!scheduleWebRtcOutputAt(session, targetLocalMs)) {
+        quarantineWebRtcOutput(session, "Missed start; synchronizing before join");
+      }
+    },
+    [lockWebRtcPostDelay, quarantineWebRtcOutput, rampLiveOutput, reportStatusSoon, scheduleWebRtcOutputAt, setLivePostDelay]
+  );
+
   const stopLocalSource = useCallback(() => {
     clearTimeout(mediaPlaybackTimerRef.current);
     mediaPlaybackTimerRef.current = null;
@@ -211,6 +661,714 @@ export default function App() {
     localPlaybackRef.current = null;
   }, []);
 
+  const stopLivePlayback = useCallback(() => {
+    const session = liveSessionRef.current;
+    if (session) {
+      session.closed = true;
+      clearTimeout(session.startTimer);
+      clearTimeout(session.bufferTimer);
+      clearTimeout(session.pauseTimer);
+      clearTimeout(session.seekTimer);
+      clearTimeout(session.joinTimer);
+      clearTimeout(session.volumeTimer);
+      clearInterval(session.countdownTimer);
+      clearInterval(session.statsTimer);
+      try {
+        session.peerConnection?.close();
+      } catch {}
+      try {
+        if (session.mediaSource?.readyState === "open") session.mediaSource.endOfStream();
+      } catch {}
+      if (session.url) URL.revokeObjectURL(session.url);
+    }
+    liveSessionRef.current = null;
+    syncErrorRef.current = null;
+    rtcPlayoutDelayRef.current = null;
+    setLivePostDelay(0, null);
+    rtcPostDelayRef.current = 0;
+    rtcBytesReceivedRef.current = 0;
+    rtcEmittedCountRef.current = 0;
+    rtcAudioLevelRef.current = null;
+    setDriftState(null);
+    setRtcJitterState(null);
+    setRtcPlayoutDelayState(null);
+    setRtcPostDelayState(null);
+    setRtcPacketsLostState(0);
+    setRtcConcealedState(0);
+
+    const liveAudio = liveAudioRef.current;
+    if (liveAudio) {
+      try {
+        rampLiveOutput(0, 0);
+        liveAudio.pause();
+        liveAudio.playbackRate = 1;
+        liveAudio.srcObject = null;
+        liveAudio.removeAttribute("src");
+        liveAudio.load();
+      } catch {}
+    }
+    releaseLiveStreamOutput();
+    liveOutputModeRef.current = "none";
+    setLiveOutputPathState("Idle");
+  }, [rampLiveOutput, releaseLiveStreamOutput, setLivePostDelay]);
+
+  const startWebRtcPlayback = useCallback(
+    (live) => {
+      if (!live?.id || !unlockedRef.current) return;
+      if (liveSessionRef.current?.id === live.id && liveSessionRef.current?.transport === "webrtc") return;
+      if (!globalThis.RTCPeerConnection) {
+        setReadyStatus("WebRTC unsupported");
+        setAudioIssueState("This browser cannot receive WebRTC audio. Use a current Chrome or Edge release.");
+        return;
+      }
+
+      stopLocalSource();
+      stopLivePlayback();
+      const liveAudio = liveAudioRef.current;
+      if (!liveAudio) return;
+      configureMediaElement(liveAudio);
+      rampLiveOutput(0, 0);
+      try {
+        liveAudio.pause();
+        liveAudio.srcObject = null;
+        liveAudio.removeAttribute("src");
+        liveAudio.load();
+      } catch {}
+
+      liveSessionRef.current = {
+        id: live.id,
+        transport: "webrtc",
+        phase: live.phase || "measuring",
+        bufferMs: clamp(Number(live.bufferMs || 120), 60, 1000),
+        roomTargetMs:
+          Number.isFinite(Number(live.roomTargetMs)) && Number(live.roomTargetMs) > 0
+            ? Number(live.roomTargetMs)
+            : null,
+        playAtServerMs: Number.isFinite(Number(live.playAt)) && Number(live.playAt) > 0 ? Number(live.playAt) : null,
+        joinDelayMs: clamp(Number(live.joinDelayMs || 3000), 550, 6000),
+        peerConnection: null,
+        remotePeerId: null,
+        pendingRemoteCandidates: [],
+        pendingLocalCandidates: [],
+        localDescriptionSent: false,
+        postDelayMs: 0,
+        postDelayLocked: false,
+        measuredJitterDelayMs: null,
+        lastInboundStats: null,
+        unmuteAtLocalMs: null,
+        joinTimer: null,
+        volumeTimer: null,
+        countdownTimer: null,
+        statsTimer: null,
+        outputReady: false,
+        timelineLocked: false,
+        initialParticipant: false,
+        timelineGuard: null,
+        startScheduled: false,
+        audible: false,
+        rejoining: false,
+        closed: false
+      };
+      audioReadyRef.current = false;
+      setAudioReadyState(false);
+      setPlaybackEngineState(deviceInfo.isIOS ? "WebRTC / HTML audio" : "WebRTC / Opus");
+      setReadyStatus("Connecting WebRTC audio");
+      setAudioIssueState("");
+    },
+    [deviceInfo.isIOS, rampLiveOutput, stopLivePlayback, stopLocalSource]
+  );
+
+  const flushLiveQueue = useCallback(() => {
+    const session = liveSessionRef.current;
+    if (!session || session.closed || !session.sourceBuffer || session.sourceBuffer.updating || !session.queue.length) return;
+    try {
+      session.sourceBuffer.appendBuffer(session.queue.shift());
+    } catch (error) {
+      setReadyStatus("Live stream error");
+      setAudioIssueState(error?.message || "The live audio stream could not be decoded.");
+    }
+  }, []);
+  flushLiveQueueRef.current = flushLiveQueue;
+
+  const startLivePlayback = useCallback(
+    (live) => {
+      if (!live?.id || !unlockedRef.current) return;
+      if (liveSessionRef.current?.id === live.id) return;
+      if (live.transport === "webrtc") {
+        startWebRtcPlayback(live);
+        return;
+      }
+      if (!liveAudioRef.current || !window.MediaSource || !MediaSource.isTypeSupported(live.mimeType)) {
+        setReadyStatus("Live stream unsupported");
+        setAudioIssueState("This browser cannot play the Chrome live audio format. Use Chrome or Edge for live tab audio.");
+        return;
+      }
+
+      stopLocalSource();
+      stopLivePlayback();
+
+      const liveAudio = liveAudioRef.current;
+      const mediaSource = new MediaSource();
+      const playAtServerMs = Number(live.playAt || Number(live.startedAt || Date.now()) + 1800);
+      const session = {
+        id: live.id,
+        playAtServerMs,
+        mediaSource,
+        sourceBuffer: null,
+        queue: [],
+        url: URL.createObjectURL(mediaSource),
+        closed: false,
+        timelineStarted: false,
+        rebuffering: false,
+        playRequested: false,
+        startTimer: null,
+        bufferTimer: null,
+        pauseTimer: null,
+        seekTimer: null,
+        bufferingStartedAt: null,
+        timelineOffsetSeconds: 0,
+        lateJoin: false
+      };
+      liveSessionRef.current = session;
+      configureMediaElement(liveAudio);
+      liveAudio.src = session.url;
+      liveAudio.load();
+
+      mediaSource.addEventListener(
+        "sourceopen",
+        () => {
+          if (liveSessionRef.current !== session || session.closed) return;
+          try {
+            const sourceBuffer = mediaSource.addSourceBuffer(live.mimeType);
+            sourceBuffer.mode = "sequence";
+            const requestPlayback = () => {
+              if (session.playRequested) return;
+              if (!liveAudio.paused) {
+                if (session.rebuffering || session.pauseTimer) {
+                  clearTimeout(session.pauseTimer);
+                  session.pauseTimer = null;
+                  session.rebuffering = false;
+                  restoreLiveOutput();
+                  setReadyStatus(remoteMutedRef.current ? "Stopped by controller" : session.lateJoin ? "Receiving live audio (late join)" : "Receiving live audio");
+                }
+                return;
+              }
+              session.playRequested = true;
+              rampLiveOutput(0, 0);
+              const playPromise = liveAudio.play();
+              if (!playPromise?.then) {
+                session.playRequested = false;
+                session.rebuffering = false;
+                restoreLiveOutput(0.04);
+                setReadyStatus(remoteMutedRef.current ? "Stopped by controller" : session.lateJoin ? "Receiving live audio (late join)" : "Receiving live audio");
+                return;
+              }
+              playPromise.then(
+                () => {
+                  if (liveSessionRef.current !== session || session.closed) return;
+                  session.playRequested = false;
+                  session.rebuffering = false;
+                  restoreLiveOutput(0.04);
+                  setReadyStatus(remoteMutedRef.current ? "Stopped by controller" : session.lateJoin ? "Receiving live audio (late join)" : "Receiving live audio");
+                },
+                (error) => {
+                  if (liveSessionRef.current !== session || session.closed) return;
+                  session.playRequested = false;
+                  rampLiveOutput(0, 0);
+                  setReadyStatus("Enable speaker again");
+                  setAudioIssueState(error?.message || "The browser blocked live audio playback.");
+                }
+              );
+            };
+
+            const pauseForBuffer = () => {
+              if (liveAudio.paused || session.pauseTimer) return;
+              rampLiveOutput(0, 0.025);
+              session.pauseTimer = setTimeout(() => {
+                session.pauseTimer = null;
+                if (liveSessionRef.current !== session || session.closed) return;
+                if (!session.rebuffering) {
+                  restoreLiveOutput();
+                  return;
+                }
+                liveAudio.pause();
+                liveAudio.playbackRate = 1;
+              }, 30);
+            };
+
+            const expectedPositionNow = () => {
+              const sharedPosition = expectedLivePositionSeconds({
+                nowLocalMs: Date.now(),
+                playAtServerMs: session.playAtServerMs,
+                serverOffsetMs: serverOffsetRef.current,
+                outputLatencyMs: outputLatencyRef.current,
+                manualOffsetMs: deviceOffsetRef.current
+              });
+              return Math.max(0, sharedPosition - session.timelineOffsetSeconds);
+            };
+
+            const beginOnSharedTimeline = () => {
+              session.startTimer = null;
+              if (liveSessionRef.current !== session || session.closed || !liveAudio.buffered.length) return;
+              const start = liveAudio.buffered.start(0);
+              const end = liveAudio.buffered.end(liveAudio.buffered.length - 1);
+              const expected = expectedPositionNow();
+              if (expected > end - 0.04) {
+                const localPosition = clamp(end - 0.65, start, Math.max(start, end - 0.04));
+                session.timelineOffsetSeconds = Math.max(0, expected - localPosition);
+                session.lateJoin = true;
+                liveAudio.currentTime = localPosition;
+                liveAudio.playbackRate = 1;
+                correctionCountRef.current += 1;
+                setCorrectionCountState(correctionCountRef.current);
+                setLastCorrectionState("Late join alignment");
+                requestPlayback();
+                return;
+              }
+              liveAudio.currentTime = clamp(expected, start, Math.max(start, end - 0.04));
+              liveAudio.playbackRate = 1;
+              requestPlayback();
+            };
+
+            const scheduleSharedStart = () => {
+              const targetLocalMs = liveStartLocalMs({
+                playAtServerMs: session.playAtServerMs,
+                serverOffsetMs: serverOffsetRef.current,
+                outputLatencyMs: outputLatencyRef.current,
+                manualOffsetMs: deviceOffsetRef.current
+              });
+              const waitMs = Math.max(0, targetLocalMs - Date.now());
+              setLastStartDelayState(Math.round(waitMs));
+              if (waitMs > 15) {
+                setReadyStatus(`Synchronized start in ${Math.max(1, Math.ceil(waitMs / 1000))}`);
+                session.startTimer = setTimeout(beginOnSharedTimeline, waitMs);
+                return;
+              }
+              beginOnSharedTimeline();
+            };
+
+            const startWhenBuffered = () => {
+              if (liveSessionRef.current !== session || session.closed || session.timelineStarted) return false;
+              const buffered = liveAudio.buffered;
+              if (!buffered.length) return false;
+              const start = buffered.start(0);
+              const end = buffered.end(buffered.length - 1);
+              const totalBuffered = Math.max(0, end - start);
+              if (!session.bufferingStartedAt) session.bufferingStartedAt = Date.now();
+              const waitedMs = Date.now() - session.bufferingStartedAt;
+
+              if (!shouldStartLiveBuffer(totalBuffered, waitedMs)) return false;
+              session.timelineStarted = true;
+              clearTimeout(session.bufferTimer);
+              session.bufferTimer = null;
+              if (totalBuffered < LIVE_SYNC_POLICY.startBufferSeconds) {
+                setLastCorrectionState("Adaptive buffer start");
+              }
+              scheduleSharedStart();
+              return true;
+            };
+
+            const seekSmoothlyToTimeline = () => {
+              if (session.seekTimer) return;
+              rampLiveOutput(0, 0.02);
+              session.seekTimer = setTimeout(() => {
+                session.seekTimer = null;
+                if (liveSessionRef.current !== session || session.closed || !liveAudio.buffered.length) return;
+                const start = liveAudio.buffered.start(0);
+                const end = liveAudio.buffered.end(liveAudio.buffered.length - 1);
+                liveAudio.currentTime = clamp(expectedPositionNow(), start, Math.max(start, end - 0.04));
+                liveAudio.playbackRate = 1;
+                correctionCountRef.current += 1;
+                setCorrectionCountState(correctionCountRef.current);
+                setLastCorrectionState("Live timeline seek");
+                restoreLiveOutput(0.035);
+              }, 24);
+            };
+
+            sourceBuffer.addEventListener("updateend", () => {
+              if (liveSessionRef.current !== session || session.closed) return;
+              const buffered = liveAudio.buffered;
+              if (buffered.length) {
+                const start = buffered.start(0);
+                const end = buffered.end(buffered.length - 1);
+                const totalBuffered = Math.max(0, end - start);
+
+                if (!session.timelineStarted) {
+                  if (!session.bufferingStartedAt) {
+                    session.bufferingStartedAt = Date.now();
+                    session.bufferTimer = setTimeout(
+                      startWhenBuffered,
+                      LIVE_SYNC_POLICY.maximumStartWaitMs + 20
+                    );
+                  }
+                  if (!startWhenBuffered()) {
+                    const progress = Math.min(
+                      99,
+                      Math.round((totalBuffered / LIVE_SYNC_POLICY.startBufferSeconds) * 100)
+                    );
+                    setReadyStatus(`Buffering live audio ${progress}%`);
+                  }
+                } else if (!session.startTimer && !session.playRequested) {
+                  const expected = expectedPositionNow();
+                  const expectedAvailable = expected >= start && expected <= end - 0.04;
+                  const availableAhead = end - expected;
+
+                  if (!expectedAvailable) {
+                    session.rebuffering = true;
+                    setReadyStatus("Waiting for shared timeline");
+                    pauseForBuffer();
+                  } else {
+                    if (!session.rebuffering && availableAhead < LIVE_SYNC_POLICY.lowBufferSeconds) {
+                      session.rebuffering = true;
+                      setReadyStatus("Refilling live buffer");
+                      pauseForBuffer();
+                    }
+
+                    if (session.rebuffering) {
+                      if (availableAhead >= LIVE_SYNC_POLICY.recoverBufferSeconds) {
+                        liveAudio.currentTime = expected;
+                        liveAudio.playbackRate = 1;
+                        requestPlayback();
+                      }
+                    } else {
+                      const correction = liveDriftCorrection(liveAudio.currentTime, expected);
+                      setDriftState(Math.round(correction.driftSeconds * 1000));
+                      if (correction.shouldSeek && availableAhead >= LIVE_SYNC_POLICY.lowBufferSeconds) {
+                        seekSmoothlyToTimeline();
+                      } else {
+                        liveAudio.playbackRate = correction.playbackRate;
+                        setLastCorrectionState(
+                          Math.abs(correction.driftSeconds) < 0.01
+                            ? "Live clock locked"
+                            : `Live rate ${correction.playbackRate.toFixed(3)}x`
+                        );
+                      }
+                      requestPlayback();
+                    }
+                  }
+                }
+              }
+              flushLiveQueueRef.current();
+            });
+            session.sourceBuffer = sourceBuffer;
+            audioReadyRef.current = true;
+            setAudioReadyState(true);
+            setReadyStatus("Buffering live audio 0%");
+            flushLiveQueueRef.current();
+          } catch (error) {
+            setReadyStatus("Live stream error");
+            setAudioIssueState(error?.message || "Unable to create the live audio buffer.");
+          }
+        },
+        { once: true }
+      );
+    },
+    [rampLiveOutput, restoreLiveOutput, startWebRtcPlayback, stopLivePlayback, stopLocalSource]
+  );
+
+  const appendLiveChunk = useCallback((chunk) => {
+    const session = liveSessionRef.current;
+    if (!session || session.closed || !chunk?.byteLength) return;
+    session.queue.push(chunk.slice(0));
+    if (session.queue.length > 48) session.queue.splice(0, session.queue.length - 48);
+    flushLiveQueueRef.current();
+  }, []);
+  appendLiveChunkRef.current = appendLiveChunk;
+
+  const createWebRtcReceiver = useCallback(
+    (session, remotePeerId) => {
+      if (session.peerConnection) return session.peerConnection;
+      const connection = new RTCPeerConnection({ iceServers: [] });
+      session.peerConnection = connection;
+      session.remotePeerId = remotePeerId;
+
+      connection.addEventListener("icecandidate", (event) => {
+        if (!event.candidate || session.closed) return;
+        const candidate = event.candidate.toJSON ? event.candidate.toJSON() : event.candidate;
+        if (!session.localDescriptionSent) {
+          session.pendingLocalCandidates.push(candidate);
+          return;
+        }
+        send({ type: "webrtcSignal", targetId: session.remotePeerId, signal: { candidate } });
+      });
+
+      connection.addEventListener("track", async (event) => {
+        if (liveSessionRef.current !== session || session.closed) return;
+        session.receiver = event.receiver;
+
+        const liveAudio = liveAudioRef.current;
+        if (!liveAudio) return;
+        const stream = event.streams[0] || new MediaStream([event.track]);
+        let streamOutput = false;
+        if (audioContextRef.current) {
+          try {
+            if (audioContextRef.current.state === "suspended") await audioContextRef.current.resume();
+          } catch {}
+          if (audioContextRef.current.state === "running") {
+            if (deviceInfo.isIOS) {
+              streamOutput = Boolean(ensureLiveStreamOutput(audioContextRef.current, stream));
+            } else {
+              ensureLiveAudioOutput(audioContextRef.current, liveAudio);
+            }
+          }
+        }
+        const directOutput = !liveGainRef.current;
+        if (directOutput) {
+          liveOutputModeRef.current = "html-media-element";
+          setLiveOutputPathState("HTML audio fallback");
+        }
+        rampLiveOutput(0, 0);
+        liveAudio.srcObject = stream;
+        liveAudio.muted = streamOutput || directOutput;
+        liveAudio.volume = streamOutput || directOutput ? 0 : 1;
+        audioReadyRef.current = true;
+        setAudioReadyState(true);
+        setReadyStatus(
+          directOutput
+            ? "Fixed timeline unavailable"
+            : session.phase === "measuring" ? "Measuring room timing" : "Preparing fixed timeline"
+        );
+        if (directOutput) {
+          setAudioIssueState("This browser could not create a clocked Web Audio output path.");
+        }
+        reportStatusSoon();
+        try {
+          if (streamOutput) {
+            const playPromise = liveAudio.play();
+            if (playPromise?.catch) playPromise.catch(() => {});
+          } else {
+            await liveAudio.play();
+          }
+          if (liveSessionRef.current !== session || session.closed) return;
+          session.outputReady = true;
+          updateWebRtcTimeline(stateRef.current.live);
+        } catch (error) {
+          rampLiveOutput(0, 0);
+          setReadyStatus("Enable speaker again");
+          setAudioIssueState(error?.message || "The browser blocked WebRTC audio playback.");
+        }
+      });
+
+      connection.addEventListener("connectionstatechange", () => {
+        if (liveSessionRef.current !== session || session.closed) return;
+        if (connection.connectionState === "connected") {
+          if (liveOutputModeRef.current === "html-media-element") {
+            setReadyStatus("Fixed timeline unavailable");
+          } else if (session.phase === "measuring" || session.phase === "locking") {
+            setReadyStatus(
+              session.outputReady
+                ? session.phase === "locking" ? "Locking fixed room timeline" : "Measuring room timing"
+                : "Connecting WebRTC audio"
+            );
+          } else if (session.timelineGuard?.quarantined) {
+            setReadyStatus("Synchronizing before join");
+          } else if (session.audible) {
+            const usesContextOutput = liveOutputModeRef.current.endsWith("source");
+            const outputBlocked = usesContextOutput
+              ? audioContextRef.current?.state !== "running"
+              : Boolean(liveAudioRef.current?.paused);
+            if (!remoteMutedRef.current && outputBlocked) {
+              unlockedRef.current = false;
+              setUnlockedState(false);
+              setReadyStatus("Tap to resume audio");
+            } else {
+              setReadyStatus(remoteMutedRef.current ? "Stopped by controller" : "Receiving WebRTC audio");
+            }
+          }
+        } else if (connection.connectionState === "failed") {
+          setReadyStatus("WebRTC connection failed");
+          setAudioIssueState("The direct audio path could not be established on this network.");
+        }
+      });
+
+      session.statsTimer = setInterval(async () => {
+        if (liveSessionRef.current !== session || session.closed) return;
+        try {
+          const stats = await connection.getStats();
+          for (const report of stats.values()) {
+            const mediaKind = report.kind || report.mediaType;
+            if (report.type !== "inbound-rtp" || mediaKind !== "audio") continue;
+            setRtcJitterState(Math.round(Number(report.jitter || 0) * 1000));
+            setRtcPacketsLostState(Math.max(0, Number(report.packetsLost || 0)));
+            setRtcConcealedState(Math.max(0, Number(report.concealedSamples || 0)));
+            rtcBytesReceivedRef.current = Math.max(0, Number(report.bytesReceived || 0));
+            rtcEmittedCountRef.current = Math.max(0, Number(report.jitterBufferEmittedCount || 0));
+            const audioLevel = Number(report.audioLevel);
+            rtcAudioLevelRef.current = Number.isFinite(audioLevel) ? clamp(audioLevel, 0, 1) : null;
+
+            const delaySample = webRtcPlayoutDelaySample(report, session.lastInboundStats);
+            session.lastInboundStats = captureWebRtcDelayStats(report);
+            if (!delaySample || !Number.isFinite(delaySample.actualDelayMs)) {
+              reportStatusSoon();
+              continue;
+            }
+
+            const smoothing = WEBRTC_SYNC_POLICY.measurementSmoothing;
+            session.measuredJitterDelayMs = Number.isFinite(session.measuredJitterDelayMs)
+              ? session.measuredJitterDelayMs * (1 - smoothing) + delaySample.actualDelayMs * smoothing
+              : delaySample.actualDelayMs;
+            const measuredDelayMs = session.measuredJitterDelayMs;
+            rtcPlayoutDelayRef.current = Math.round(measuredDelayMs);
+            setRtcPlayoutDelayState(rtcPlayoutDelayRef.current);
+
+            if (!Number.isFinite(session.roomTargetMs) || session.roomTargetMs <= 0) {
+              syncErrorRef.current = null;
+              setDriftState(null);
+              setLastCorrectionState("Collecting stable samples");
+              reportStatusSoon();
+              continue;
+            }
+
+            if (!session.postDelayLocked && !lockWebRtcPostDelay(session)) {
+              setLastCorrectionState("Waiting to fix local compensation");
+              reportStatusSoon();
+              continue;
+            }
+
+            const syncErrorMs = Math.round(fixedTimelineErrorMs({
+              roomTargetMs: session.roomTargetMs,
+              playoutDelayMs: measuredDelayMs,
+              outputLatencyMs: outputLatencyRef.current,
+              postDelayMs: session.postDelayMs,
+              deviceOffsetMs: deviceOffsetRef.current
+            }));
+            syncErrorRef.current = syncErrorMs;
+            setDriftState(syncErrorMs);
+
+            if (session.phase === "locking") {
+              setLastCorrectionState(
+                Math.abs(syncErrorMs) <= ROOM_SYNC_POLICY.recoverySyncErrorMs
+                  ? "Fixed timeline locked"
+                  : `Locking timeline ${syncErrorMs >= 0 ? "+" : ""}${syncErrorMs} ms`
+              );
+              reportStatusSoon();
+              continue;
+            }
+
+            if (session.phase === "armed" || session.phase === "playing") {
+              let postCorrection = null;
+              let correctionApplied = false;
+              let correctionBlocked = false;
+              if (session.phase === "playing") {
+                const silentRepair = Boolean(
+                  session.timelineGuard?.quarantined ||
+                  remoteMutedRef.current ||
+                  !session.audible
+                );
+                postCorrection = nextPostDelayCorrection({
+                  currentPostDelayMs: session.postDelayMs,
+                  syncErrorMs,
+                  maximumStepMs: silentRepair
+                    ? ROOM_SYNC_POLICY.quarantinedCorrectionStepMs
+                    : ROOM_SYNC_POLICY.softCorrectionStepMs
+                });
+                correctionApplied = Math.abs(postCorrection?.adjustmentMs || 0) >= 0.05;
+                correctionBlocked =
+                  Math.abs(syncErrorMs) > ROOM_SYNC_POLICY.recoverySyncErrorMs &&
+                  !correctionApplied &&
+                  Boolean(postCorrection?.saturated);
+                if (correctionApplied) {
+                  if (silentRepair) {
+                    setLivePostDelay(postCorrection.delayMs, session);
+                  } else {
+                    rampLivePostDelay(
+                      postCorrection.delayMs,
+                      ROOM_SYNC_POLICY.softCorrectionRampSeconds,
+                      session
+                    );
+                  }
+                  correctionCountRef.current += 1;
+                  setCorrectionCountState(correctionCountRef.current);
+                }
+              }
+
+              const nextGuard = nextFixedTimelineGuard(session.timelineGuard, syncErrorMs);
+              session.timelineGuard = nextGuard;
+              if (nextGuard.action === "quarantine") {
+                correctionCountRef.current += 1;
+                setCorrectionCountState(correctionCountRef.current);
+                setLastCorrectionState(`Output isolated ${syncErrorMs >= 0 ? "+" : ""}${syncErrorMs} ms`);
+                quarantineWebRtcOutput(session);
+              } else if (nextGuard.action === "rejoin") {
+                session.initialParticipant = true;
+                session.rejoining = true;
+                const sharedStartLocalMs = session.playAtServerMs - serverOffsetRef.current;
+                const rejoinAtLocalMs =
+                  session.phase === "armed" && sharedStartLocalMs > Date.now() + 80
+                    ? sharedStartLocalMs
+                    : Date.now() + 1200;
+                setLastCorrectionState("Timeline recovered; rejoining");
+                if (!scheduleWebRtcOutputAt(session, rejoinAtLocalMs, "Rejoining")) {
+                  quarantineWebRtcOutput(session);
+                }
+              } else if (nextGuard.quarantined) {
+                if (correctionApplied) {
+                  const adjustment = Math.round(postCorrection.adjustmentMs * 10) / 10;
+                  setLastCorrectionState(`Silent relock ${adjustment >= 0 ? "+" : ""}${adjustment} ms`);
+                  setReadyStatus("Relocking synchronization");
+                } else if (correctionBlocked) {
+                  setLastCorrectionState(`No delay headroom ${syncErrorMs >= 0 ? "+" : ""}${syncErrorMs} ms`);
+                  setReadyStatus("Room restart needed for this speaker");
+                } else {
+                  setLastCorrectionState(`Recovering ${syncErrorMs >= 0 ? "+" : ""}${syncErrorMs} ms`);
+                  setReadyStatus("Recovering synchronization");
+                }
+              } else if (Math.abs(syncErrorMs) <= ROOM_SYNC_POLICY.recoverySyncErrorMs) {
+                setLastCorrectionState("Fixed timeline locked");
+              } else if (correctionApplied) {
+                const adjustment = Math.round(postCorrection.adjustmentMs * 10) / 10;
+                setLastCorrectionState(`Soft correction ${adjustment >= 0 ? "+" : ""}${adjustment} ms`);
+              } else {
+                setLastCorrectionState(`Watching drift ${syncErrorMs >= 0 ? "+" : ""}${syncErrorMs} ms`);
+              }
+            }
+            reportStatusSoon();
+          }
+        } catch {}
+      }, 2000);
+
+      return connection;
+    },
+    [deviceInfo.isIOS, ensureLiveAudioOutput, ensureLiveStreamOutput, lockWebRtcPostDelay, quarantineWebRtcOutput, rampLiveOutput, rampLivePostDelay, reportStatusSoon, scheduleWebRtcOutputAt, send, setLivePostDelay, updateWebRtcTimeline]
+  );
+
+  const handleWebRtcSignal = useCallback(
+    async (message) => {
+      const session = liveSessionRef.current;
+      if (!session || session.closed || session.transport !== "webrtc" || !message.signal) return;
+      const remotePeerId = Number(message.fromId || 0);
+      if (!remotePeerId) return;
+      session.remotePeerId = remotePeerId;
+
+      if (message.signal.candidate) {
+        if (session.peerConnection?.remoteDescription) {
+          await session.peerConnection.addIceCandidate(message.signal.candidate);
+        } else {
+          session.pendingRemoteCandidates.push(message.signal.candidate);
+        }
+        return;
+      }
+
+      if (message.signal.description?.type !== "offer") return;
+      const connection = createWebRtcReceiver(session, remotePeerId);
+      await connection.setRemoteDescription(message.signal.description);
+      for (const candidate of session.pendingRemoteCandidates.splice(0)) {
+        await connection.addIceCandidate(candidate);
+      }
+      const answer = await connection.createAnswer();
+      await connection.setLocalDescription(answer);
+      const description = connection.localDescription?.toJSON
+        ? connection.localDescription.toJSON()
+        : connection.localDescription;
+      send({ type: "webrtcSignal", targetId: remotePeerId, signal: { description } });
+      session.localDescriptionSent = true;
+      for (const candidate of session.pendingLocalCandidates.splice(0)) {
+        send({ type: "webrtcSignal", targetId: remotePeerId, signal: { candidate } });
+      }
+    },
+    [createWebRtcReceiver, send]
+  );
+
   const createAudioContext = useCallback(() => {
     if (!audioContextRef.current) {
       const AudioApi = window.AudioContext || window.webkitAudioContext;
@@ -225,12 +1383,45 @@ export default function App() {
       gainRef.current.connect(audioContextRef.current.destination);
       setAudioContextState(audioContextRef.current.state || "unknown");
       audioContextRef.current.addEventListener?.("statechange", () => {
-        setAudioContextState(audioContextRef.current?.state || "closed");
+        const nextState = audioContextRef.current?.state || "closed";
+        setAudioContextState(nextState);
+        const outputLatencyMs = Math.round(estimateOutputLatencySeconds(audioContextRef.current) * 1000);
+        outputLatencyRef.current = outputLatencyMs;
+        setOutputLatencyState(outputLatencyMs);
+        const contextCarriesLiveAudio = liveOutputModeRef.current.endsWith("source") && liveSessionRef.current;
+        if (contextCarriesLiveAudio && nextState === "running") {
+          const liveSession = liveSessionRef.current;
+          unlockedRef.current = true;
+          setUnlockedState(true);
+          if (liveSession.audible && !liveSession.timelineGuard?.quarantined) {
+            restoreLiveOutput(0.04);
+            setReadyStatus(remoteMutedRef.current ? "Stopped by controller" : "Receiving WebRTC audio");
+          } else {
+            rampLiveOutput(0, 0);
+            setReadyStatus(
+              liveSession.phase === "locking"
+                ? "Locking fixed room timeline"
+                : liveSession.phase === "measuring"
+                  ? "Measuring room timing"
+                  : "Recovering synchronization"
+            );
+          }
+          setAudioIssueState("");
+        } else if (contextCarriesLiveAudio && document.visibilityState === "visible") {
+          unlockedRef.current = false;
+          setUnlockedState(false);
+          setReadyStatus("Tap to resume audio");
+          setAudioIssueState("iPad paused its audio engine. Tap Enable speaker to resume it.");
+        }
+        reportStatusSoon();
       });
     }
     setAudioContextState(audioContextRef.current.state || "unknown");
+    const outputLatencyMs = Math.round(estimateOutputLatencySeconds(audioContextRef.current) * 1000);
+    outputLatencyRef.current = outputLatencyMs;
+    setOutputLatencyState(outputLatencyMs);
     return audioContextRef.current;
-  }, []);
+  }, [rampLiveOutput, reportStatusSoon, restoreLiveOutput]);
 
   const ensureAudioContext = useCallback(async ({ resume = true } = {}) => {
     const audioContext = createAudioContext();
@@ -355,7 +1546,7 @@ export default function App() {
     const localPlayback = localPlaybackRef.current;
     const audioContext = audioContextRef.current;
     if (!localPlayback || !audioContext) return stateRef.current?.position || 0;
-    return localPlayback.offset + Math.max(0, audioContext.currentTime - localPlayback.contextStartedAt);
+    return localPlayback.offset + Math.max(0, audibleAudioContextTime(audioContext) - localPlayback.contextStartedAt);
   }, []);
 
   const updateCountdown = useCallback((seconds) => {
@@ -370,6 +1561,11 @@ export default function App() {
       const mediaAudio = mediaAudioRef.current;
       const mediaMode = playbackEngineRef.current === "media-element";
       if (!state?.playing || !state.startedAt || !unlockedRef.current) return;
+      if (remoteMutedRef.current) {
+        stopLocalSource();
+        setReadyStatus("Stopped by controller");
+        return;
+      }
       if (!mediaMode && !audioBuffer) return;
       if (mediaMode && !mediaAudio) return;
 
@@ -393,7 +1589,11 @@ export default function App() {
       }
 
       const adjustedTargetLocalMs = state.startedAt - serverOffsetRef.current + deviceOffsetRef.current;
-      const delaySeconds = Math.max(0, (adjustedTargetLocalMs - Date.now()) / 1000);
+      const outputLatencySeconds = estimateOutputLatencySeconds(audioContextRef.current);
+      setOutputLatencyState(Math.round(outputLatencySeconds * 1000));
+      const delaySeconds = mediaMode
+        ? Math.max(0, (adjustedTargetLocalMs - Date.now()) / 1000 - outputLatencySeconds)
+        : Math.max(0, contextTimeForAudibleEpoch(audioContextRef.current, adjustedTargetLocalMs) - audioContextRef.current.currentTime);
       setLastStartDelayState(Math.round(delaySeconds * 1000));
       const offsetSeconds = clamp(
         state.position +
@@ -411,7 +1611,7 @@ export default function App() {
       startLocalSource(delaySeconds, offsetSeconds);
       updateCountdown(delaySeconds);
     },
-    [currentLocalPosition, durationState, expectedPosition, startLocalSource, updateCountdown]
+    [currentLocalPosition, durationState, expectedPosition, startLocalSource, stopLocalSource, updateCountdown]
   );
 
   const loadAudio = useCallback(
@@ -478,6 +1678,40 @@ export default function App() {
         setPositionState(Number(stateRef.current.currentPosition ?? stateRef.current.position ?? 0));
       }
 
+      if (stateRef.current.live?.id) {
+        stopLocalSource();
+        setDurationState(0);
+        setCountdownState(null);
+        if (roleRef.current === "controller") {
+          if (liveSessionRef.current) stopLivePlayback();
+          const phase = stateRef.current.live.phase;
+          setReadyStatus(
+            phase === "measuring"
+              ? `Measuring ${stateRef.current.live.stableSpeakers || 0}/${stateRef.current.live.requiredSpeakers || 0}`
+              : phase === "locking"
+                ? `Locking ${stateRef.current.live.stableSpeakers || 0}/${stateRef.current.live.requiredSpeakers || 0}`
+                : phase === "armed"
+                  ? "Room timeline armed"
+                  : "Room playing"
+          );
+          return;
+        }
+        if (!unlockedRef.current) {
+          setReadyStatus("Locked");
+          return;
+        }
+        startLivePlayback(stateRef.current.live);
+        updateWebRtcTimeline(stateRef.current.live);
+        return;
+      }
+
+      if (liveSessionRef.current) stopLivePlayback();
+      if (roleRef.current === "controller") {
+        stopLocalSource();
+        setReadyStatus("Room controller");
+        return;
+      }
+
       const layer = ensureSelectedLayer(stateRef.current);
       const mediaMode = playbackEngineRef.current === "media-element";
       if (!layer) {
@@ -525,8 +1759,13 @@ export default function App() {
         localPlaybackRef.current = null;
       }
     },
-    [ensureSelectedLayer, loadAudio, scheduleFromState, stopLocalSource]
+    [ensureSelectedLayer, loadAudio, scheduleFromState, startLivePlayback, stopLivePlayback, stopLocalSource, updateWebRtcTimeline]
   );
+
+  useEffect(() => {
+    applyState(stateRef.current, true);
+    reportStatusSoon();
+  }, [applyState, reportStatusSoon, roleState]);
 
   const receiveTimeSample = useCallback(
     (message) => {
@@ -534,25 +1773,33 @@ export default function App() {
       const rtt = now - message.clientSent;
       const midpoint = message.clientSent + rtt / 2;
       const offset = message.serverTime - midpoint;
-      if (!Number.isFinite(offset)) return;
+      if (!Number.isFinite(offset) || !Number.isFinite(rtt) || rtt < 0 || rtt > 5000) return;
 
-      let nextOffset;
-      let nextLatency;
-      if (!latencyRef.current || rtt < latencyRef.current + 12) {
-        nextOffset = offset;
-        nextLatency = rtt;
-      } else {
-        nextOffset = serverOffsetRef.current * 0.85 + offset * 0.15;
-        nextLatency = latencyRef.current * 0.85 + rtt * 0.15;
-      }
+      const samples = [...clockSamplesRef.current, { offset, rtt, receivedAt: now }]
+        .filter((sample) => now - sample.receivedAt < 60_000)
+        .slice(-30);
+      clockSamplesRef.current = samples;
+
+      const ranked = [...samples].sort((left, right) => left.rtt - right.rtt);
+      const selectedCount = Math.min(ranked.length, Math.max(1, Math.ceil(ranked.length / 4), ranked.length >= 4 ? 4 : 1));
+      const selected = ranked.slice(0, selectedCount);
+      const nextOffset = median(selected.map((sample) => sample.offset));
+      const nextLatency = median(selected.map((sample) => sample.rtt));
+      const previousOffset = serverOffsetRef.current;
 
       serverOffsetRef.current = nextOffset;
       latencyRef.current = nextLatency;
       setServerOffsetState(nextOffset);
       setLatencyState(nextLatency);
       reportStatusSoon();
+
+      const state = stateRef.current;
+      const beforeScheduledStart = state?.playing && state.startedAt && Date.now() + nextOffset < state.startedAt;
+      if (beforeScheduledStart && selected.length >= 4 && Math.abs(nextOffset - previousOffset) >= 1.5) {
+        scheduleFromState(true);
+      }
     },
-    [reportStatusSoon]
+    [reportStatusSoon, scheduleFromState]
   );
 
   const calibrateClock = useCallback(
@@ -585,7 +1832,26 @@ export default function App() {
         playTestTone(message);
         return;
       }
-      if (message.type === "track" || message.type === "sync" || message.type === "lead") {
+      if (message.type === "webrtcSignal") {
+        handleWebRtcSignal(message).catch((error) => {
+          setReadyStatus("WebRTC signaling failed");
+          setAudioIssueState(error?.message || "Could not establish the direct audio path.");
+        });
+        return;
+      }
+      if (message.type === "deviceCommand") {
+        deviceCommandRef.current?.(message);
+        return;
+      }
+      if (
+        message.type === "track" ||
+        message.type === "sync" ||
+        message.type === "lead" ||
+        message.type === "liveStart" ||
+        message.type === "liveLock" ||
+        message.type === "liveArm" ||
+        message.type === "liveStop"
+      ) {
         applyState(message.state);
         return;
       }
@@ -593,7 +1859,7 @@ export default function App() {
         applyState(message.state, true);
       }
     },
-    [applyState, receiveTimeSample, reportStatusSoon]
+    [applyState, handleWebRtcSignal, receiveTimeSample, reportStatusSoon]
   );
 
   handleMessageRef.current = handleMessage;
@@ -603,18 +1869,28 @@ export default function App() {
     clearTimeout(reconnectTimerRef.current);
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(`${protocol}//${location.host}`);
+    socket.binaryType = "arraybuffer";
     socketRef.current = socket;
 
     socket.addEventListener("open", () => {
       setConnected(true);
+      clockSamplesRef.current = [];
       reportStatusNow();
       calibrateClock(10);
     });
     socket.addEventListener("message", (event) => {
-      handleMessageRef.current?.(JSON.parse(event.data));
+      if (event.data instanceof ArrayBuffer) {
+        appendLiveChunkRef.current?.(event.data);
+        return;
+      }
+      try {
+        handleMessageRef.current?.(JSON.parse(event.data));
+      } catch {}
     });
     socket.addEventListener("close", () => {
+      if (socketRef.current !== socket) return;
       setConnected(false);
+      if (liveSessionRef.current) stopLivePlayback();
       if (stateRef.current?.playing || sourceRef.current || activeSourcesRef.current.size) {
         const position = expectedPosition();
         stopLocalSource();
@@ -633,8 +1909,10 @@ export default function App() {
       }
       if (!shuttingDownRef.current) reconnectTimerRef.current = setTimeout(connect, 900);
     });
-    socket.addEventListener("error", () => setConnected(false));
-  }, [calibrateClock, expectedPosition, reportStatusNow, stopLocalSource]);
+    socket.addEventListener("error", () => {
+      if (socketRef.current === socket) setConnected(false);
+    });
+  }, [calibrateClock, expectedPosition, reportStatusNow, stopLivePlayback, stopLocalSource]);
 
   const closeSocket = useCallback(() => {
     shuttingDownRef.current = true;
@@ -642,7 +1920,8 @@ export default function App() {
     try {
       socketRef.current?.close(1000, "page unload");
     } catch {}
-  }, []);
+    stopLivePlayback();
+  }, [stopLivePlayback]);
 
   useEffect(() => {
     connect();
@@ -651,12 +1930,38 @@ export default function App() {
   }, [closeSocket, connect]);
 
   useEffect(() => {
-    const onPageHide = () => closeSocket();
-    window.addEventListener("pagehide", onPageHide);
-    window.addEventListener("beforeunload", onPageHide);
+    const sampleClock = () => send({ type: "time", clientSent: Date.now() });
+    const timer = setInterval(sampleClock, 2000);
+    const restoreForegroundSession = () => {
+      if (document.visibilityState !== "visible") return;
+      shuttingDownRef.current = false;
+      const socketState = socketRef.current?.readyState;
+      if (socketState !== WebSocket.OPEN && socketState !== WebSocket.CONNECTING) connect();
+      else calibrateClock(6);
+
+      const contextCarriesLiveAudio = liveOutputModeRef.current.endsWith("source") && liveSessionRef.current;
+      if (contextCarriesLiveAudio && audioContextRef.current?.state !== "running") {
+        unlockedRef.current = false;
+        setUnlockedState(false);
+        setReadyStatus("Tap to resume audio");
+        setAudioIssueState("iPad paused its audio engine. Tap Enable speaker to resume it.");
+        reportStatusSoon();
+      }
+    };
+    document.addEventListener("visibilitychange", restoreForegroundSession);
+    window.addEventListener("pageshow", restoreForegroundSession);
     return () => {
-      window.removeEventListener("pagehide", onPageHide);
-      window.removeEventListener("beforeunload", onPageHide);
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", restoreForegroundSession);
+      window.removeEventListener("pageshow", restoreForegroundSession);
+    };
+  }, [calibrateClock, connect, reportStatusSoon, send]);
+
+  useEffect(() => {
+    const onBeforeUnload = () => closeSocket();
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => {
+      window.removeEventListener("beforeunload", onBeforeUnload);
     };
   }, [closeSocket]);
 
@@ -664,6 +1969,7 @@ export default function App() {
     const timer = setInterval(() => {
       const state = stateRef.current;
       if (!state || seekingRef.current) return;
+      if (state.live?.id) return;
       const position = expectedPosition();
       setPositionState(position);
       const hasLocalPlayback =
@@ -712,12 +2018,95 @@ export default function App() {
 
   function setDeviceOffset(value) {
     const nextOffset = clamp(Math.round(Number(value) || 0), -300, 300);
+    const previousOffset = deviceOffsetRef.current;
     deviceOffsetRef.current = nextOffset;
     setDeviceOffsetState(nextOffset);
     localStorage.setItem("deviceOffsetMs", String(nextOffset));
     reportStatusSoon();
+    const liveSession = liveSessionRef.current;
+    if (liveSession?.transport === "webrtc" && liveSession.postDelayLocked) {
+      setLivePostDelay(liveSession.postDelayMs + nextOffset - previousOffset, liveSession);
+    }
     if (stateRef.current?.playing) scheduleFromState(true);
   }
+
+  function setRemoteMuted(nextMuted) {
+    const muted = Boolean(nextMuted);
+    remoteMutedRef.current = muted;
+    setRemoteMutedState(muted);
+
+    if (muted) {
+      rampLiveOutput(0, 0.03);
+      stopLocalSource();
+      setReadyStatus("Stopped by controller");
+      reportStatusSoon();
+      return;
+    }
+
+    const liveSession = liveSessionRef.current;
+    if (liveSession) {
+      if (liveSession.transport === "webrtc" && ["measuring", "locking"].includes(liveSession.phase)) {
+        rampLiveOutput(0, 0);
+        setReadyStatus(liveSession.phase === "locking" ? "Locking fixed room timeline" : "Measuring room timing");
+        reportStatusSoon();
+        return;
+      }
+      if (liveSession.transport === "webrtc" && liveSession.timelineGuard?.quarantined) {
+        rampLiveOutput(0, 0);
+        setReadyStatus("Recovering synchronization");
+        reportStatusSoon();
+        return;
+      }
+      const contextBlocked =
+        liveOutputModeRef.current.endsWith("source") && audioContextRef.current?.state !== "running";
+      const elementBlocked =
+        liveOutputModeRef.current === "html-media-element" && Boolean(liveAudioRef.current?.paused);
+      if (contextBlocked || elementBlocked) {
+        unlockedRef.current = false;
+        setUnlockedState(false);
+        setReadyStatus("Tap to resume audio");
+        setAudioIssueState("This device needs a local tap before audio can resume.");
+        reportStatusSoon();
+        return;
+      }
+      if (liveSession.unmuteAtLocalMs && liveSession.unmuteAtLocalMs > Date.now()) {
+        clearTimeout(liveSession.volumeTimer);
+        liveSession.volumeTimer = scheduleLiveOutputAt(liveSession.unmuteAtLocalMs);
+        setReadyStatus(`WebRTC starts in ${Math.max(1, Math.ceil((liveSession.unmuteAtLocalMs - Date.now()) / 1000))}`);
+      } else {
+        restoreLiveOutput(0.04);
+        if (liveSession.transport === "webrtc") liveSession.audible = true;
+        setReadyStatus(liveSession.transport === "webrtc" ? "Receiving WebRTC audio" : "Receiving live audio");
+      }
+    } else if (stateRef.current?.playing) {
+      scheduleFromState(true);
+    } else {
+      setReadyStatus(audioReadyRef.current ? "Ready" : "No audio");
+    }
+    reportStatusSoon();
+  }
+
+  function handleDeviceCommand(message) {
+    if (message.action === "mute") {
+      setRemoteMuted(true);
+      return;
+    }
+    if (message.action === "unmute") {
+      setRemoteMuted(false);
+      return;
+    }
+    if (message.action === "setOffset") {
+      setDeviceOffset(message.value);
+      return;
+    }
+    if (message.action === "reconnect") {
+      setReadyStatus("Reconnecting by controller");
+      try {
+        socketRef.current?.close(4001, "controller reconnect");
+      } catch {}
+    }
+  }
+  deviceCommandRef.current = handleDeviceCommand;
 
   function selectLayer(layerId) {
     const layer = layerById(stateRef.current.layers || [], layerId);
@@ -739,6 +2128,28 @@ export default function App() {
     setReadyStatus("Unlocking");
 
     try {
+      const liveAudio = liveAudioRef.current;
+      const existingLiveSession = liveSessionRef.current;
+      const hasActiveLiveStream = Boolean(existingLiveSession?.transport === "webrtc" && liveAudio?.srcObject);
+      let liveAudioUnlockPromise = null;
+      if (liveAudio) {
+        configureMediaElement(liveAudio);
+        if (hasActiveLiveStream) {
+          const streamUsesWebAudio = liveOutputModeRef.current === "webrtc-stream-source";
+          liveAudio.muted = streamUsesWebAudio || remoteMutedRef.current;
+          liveAudio.volume = streamUsesWebAudio || remoteMutedRef.current ? 0 : 1;
+        } else {
+          if (!silentAudioUrlRef.current) silentAudioUrlRef.current = createSilentWavUrl();
+          liveAudio.src = silentAudioUrlRef.current;
+          liveAudio.muted = false;
+          liveAudio.load();
+        }
+        try {
+          liveAudioUnlockPromise = liveAudio.play();
+        } catch {}
+      }
+
+      const live = stateRef.current.live;
       const layer = layerById(stateRef.current.layers || [], selectedLayerIdRef.current) || stateRef.current.layers?.[0];
       const audioContext = createAudioContext();
       let webAudioUnlocked = false;
@@ -755,9 +2166,21 @@ export default function App() {
         setAudioContextState(audioContext.state || "unknown");
       }
 
+      if (liveAudioUnlockPromise?.then) {
+        try {
+          await withTimeout(liveAudioUnlockPromise, 900);
+        } catch {}
+      }
+      if (liveAudio && !hasActiveLiveStream) {
+        try {
+          liveAudio.pause();
+          liveAudio.currentTime = 0;
+        } catch {}
+      }
+
       if (webAudioUnlocked) {
         playbackEngineRef.current = "web-audio";
-        setPlaybackEngineState("Web Audio");
+        setPlaybackEngineState(live && deviceInfo.isIOS ? "WebRTC / HTML audio" : "Web Audio");
       } else {
         await unlockMediaElement(layer);
         playbackEngineRef.current = "media-element";
@@ -770,6 +2193,33 @@ export default function App() {
       setReadyStatus(audioReadyRef.current ? "Ready" : "No audio");
       reportStatusSoon();
 
+      if (live) {
+        if (hasActiveLiveStream) {
+          const liveSession = liveSessionRef.current;
+          if (
+            liveSession?.audible &&
+            !liveSession.timelineGuard?.quarantined &&
+            !["measuring", "locking"].includes(liveSession.phase)
+          ) {
+            restoreLiveOutput(0.04);
+            setReadyStatus(remoteMutedRef.current ? "Stopped by controller" : "Receiving WebRTC audio");
+          } else {
+            rampLiveOutput(0, 0);
+            setReadyStatus(
+              liveSession?.phase === "locking"
+                ? "Locking fixed room timeline"
+                : liveSession?.phase === "measuring"
+                  ? "Measuring room timing"
+                  : "Recovering synchronization"
+            );
+          }
+          reportStatusSoon();
+          return;
+        }
+        if (liveSessionRef.current?.id === live.id) stopLivePlayback();
+        startLivePlayback(live);
+        return;
+      }
       if (layer && !audioBufferRef.current) await loadAudio(layer);
       if (stateRef.current?.playing && (audioBufferRef.current || playbackEngineRef.current === "media-element")) {
         scheduleFromState(true);
@@ -931,25 +2381,53 @@ export default function App() {
     setPositionState(position);
   }
 
-  function resyncAll() {
+  function restartPlayback() {
+    if (!stateRef.current?.layers?.length) return;
     calibrateClock(10);
-    if (stateRef.current?.playing) {
-      send({ type: "resync" });
-    } else {
-      scheduleFromState(true);
-    }
+    seekingRef.current = false;
+    pendingSeekRef.current = 0;
+    stopPlaybackLocally(0);
+    send({ type: "play", position: 0 });
   }
 
-  function commitSeek() {
+  function beginSeek() {
+    seekingRef.current = true;
+    pendingSeekRef.current = Number(positionState || 0);
+  }
+
+  function previewSeek(value) {
+    const nextPosition = Number(value || 0);
+    seekingRef.current = true;
+    pendingSeekRef.current = nextPosition;
+    setPositionState(nextPosition);
+  }
+
+  function commitSeek(value = pendingSeekRef.current) {
     if (!seekingRef.current) return;
+    const requested = Number(value);
+    const nextPosition = clamp(
+      Number.isFinite(requested) ? requested : pendingSeekRef.current,
+      0,
+      durationState || Number.MAX_SAFE_INTEGER
+    );
     seekingRef.current = false;
-    send({ type: "seek", position: Number(positionState || 0) });
+    pendingSeekRef.current = nextPosition;
+    setPositionState(nextPosition);
+    send({ type: "seek", position: nextPosition });
   }
 
   async function playTestTone(message = {}) {
     if (message.targetId && message.targetId !== clientIdRef.current) return;
     if (!unlockedRef.current) {
       setReadyStatus("Enable speaker first");
+      return;
+    }
+    if (liveOutputModeRef.current.endsWith("source") && audioContextRef.current?.state !== "running") {
+      unlockedRef.current = false;
+      setUnlockedState(false);
+      setReadyStatus("Tap to resume audio");
+      setAudioIssueState("This device needs a local tap before audio can resume.");
+      reportStatusSoon();
       return;
     }
     if (playbackEngineRef.current === "media-element" || audioContextRef.current?.state !== "running") {
@@ -984,234 +2462,404 @@ export default function App() {
 
   return (
     <>
-      <main className="app">
-        <section className="stage" aria-label="Synchronized playback console">
-          <div className="topbar">
+      <div className="shell">
+        <header className="app-header">
+          <div className="brand">
+            <span className="brand-mark" aria-hidden="true">HC</span>
             <div>
-              <p className="eyebrow">LAN SYNC</p>
-              <h1>Home Cinema</h1>
-            </div>
-            <div className="connection">
-              <span className={`dot ${connected ? "connected" : ""}`} />
-              <span>{connected ? "Connected" : "Reconnecting"}</span>
+              <strong>Home Cinema</strong>
+              <span>Adaptive LAN audio</span>
             </div>
           </div>
-
-          <div className="player">
-            <div className={`disc ${serverState.playing ? "playing" : ""}`} aria-hidden="true">
-              <div className="disc-core" />
-            </div>
-            <div className="track">
-              <p className="track-name">{trackLabel}</p>
-              <p className="track-meta">{syncLabel}</p>
-              <div className={`meter ${serverState.playing ? "playing" : ""}`} aria-hidden="true">
-                {Array.from({ length: 8 }, (_, index) => (
-                  <span key={index} style={{ "--i": index }} />
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <Countdown value={countdownState} />
-
-          <div className="transport">
-            <button className="icon-button" type="button" title="Stop" aria-label="Stop" onClick={stopPlayback}>
-              <Square />
-            </button>
-            <button className="primary-button" type="button" title="Play/Pause" aria-label="Play or pause" onClick={togglePlay}>
-              {serverState.playing ? <Pause /> : <Play />}
-            </button>
-            <button className="icon-button" type="button" title="Resync" aria-label="Resync" onClick={resyncAll}>
-              <RotateCw />
-            </button>
-          </div>
-
-          <div className="timeline">
-            <span>{formatTime(positionState)}</span>
-            <input
-              type="range"
-              min="0"
-              max={durationState || 100}
-              value={Math.min(positionState, durationState || 100)}
-              step="0.01"
-              aria-label="Playback position"
-              onPointerDown={() => {
-                seekingRef.current = true;
-              }}
-              onChange={(event) => {
-                seekingRef.current = true;
-                setPositionState(Number(event.target.value));
-              }}
-              onPointerUp={commitSeek}
-              onBlur={commitSeek}
-            />
-            <span>{formatTime(durationState)}</span>
-          </div>
-        </section>
-
-        <aside className="side">
-          <section className="panel host-panel">
-            <div className="segmented" role="group" aria-label="Device role">
+          <div className="header-actions">
+            <div className="segmented role-switch" role="group" aria-label="Device role">
               <button className={roleState === "controller" ? "active" : ""} type="button" onClick={() => setRole("controller")}>
-                Host
+                Controller
               </button>
               <button className={roleState === "speaker" ? "active" : ""} type="button" onClick={() => setRole("speaker")}>
-                Player
+                Speaker
               </button>
             </div>
+            <div className={`connection ${connected ? "is-connected" : ""}`}>
+              <span className="dot" />
+              <span>{connected ? "Network ready" : "Reconnecting"}</span>
+            </div>
+          </div>
+        </header>
 
-            <label className="upload">
-              <input type="file" accept="audio/*" multiple onChange={(event) => uploadSelectedFiles(event.target.files)} />
-              <Upload />
-              <span>{uploadText}</span>
-            </label>
+        <main className="app">
+          <section className="stage" aria-label="Synchronized playback console">
+            <div className="stage-heading">
+              <div>
+                <p className="eyebrow">CURRENT SESSION</p>
+              <h1>{liveActive ? "Live tab audio" : serverState.playing ? "Now playing" : "Ready when you are"}</h1>
+              </div>
+              <span className={`readiness ${audioReadyState ? "is-ready" : ""}`}>{readyStatus}</span>
+            </div>
 
-            <div className="segmented latency-modes" role="group" aria-label="Sync countdown">
-              {[3000, 4000, 5000].map((lead) => (
-                <button
-                  key={lead}
-                  className={Number(leadState) === lead ? "active" : ""}
-                  type="button"
-                  onClick={() => send({ type: "setLead", leadMs: lead })}
-                >
-                  {lead / 1000} sec
+            <div className="playback-card playback-card-simple">
+              <div className="track">
+                <p className="track-kicker">{liveActive ? "LIVE TAB AUDIO" : layers.length > 1 ? "MULTI-STEM PLAYBACK" : "ACTIVE AUDIO"}</p>
+                <p className="track-name">{trackLabel}</p>
+                <p className="track-meta">{syncLabel}</p>
+                <div className={`meter ${serverState.playing || livePlaying ? "playing" : ""}`} aria-hidden="true">
+                  {Array.from({ length: 12 }, (_, index) => (
+                    <span key={index} style={{ "--i": index }} />
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <Countdown value={countdownState} />
+
+            {roleState === "controller" && !liveActive && <div className="playback-controls">
+              <div className="transport">
+                <button className="icon-button" type="button" title="Stop" aria-label="Stop" onClick={stopPlayback}>
+                  <Square />
                 </button>
-              ))}
-            </div>
-          </section>
-
-          <section className="panel device-panel">
-            <h2>This Device</h2>
-            <label className="field-label" htmlFor="deviceNameInput">
-              Device name
-            </label>
-            <input
-              id="deviceNameInput"
-              className="device-name-input"
-              type="text"
-              maxLength="40"
-              autoComplete="off"
-              value={deviceNameState}
-              onChange={(event) => setDeviceName(event.target.value)}
-            />
-          </section>
-
-          <section className="panel">
-            <h2>Local Stem</h2>
-            <div className="layer-choices">
-              {!layers.length && "No stems"}
-              {layers.map((layer, index) => (
-                <button
-                  key={layer.id}
-                  className={`layer-button ${layer.id === selectedLayerIdState ? "active" : ""}`}
-                  type="button"
-                  onClick={() => selectLayer(layer.id)}
-                >
-                  <strong>{layer.name}</strong>
-                  <span className="badge">{index + 1}</span>
+                <button className="primary-button" type="button" title="Play/Pause" aria-label="Play or pause" onClick={togglePlay}>
+                  {serverState.playing ? <Pause /> : <Play />}
                 </button>
-              ))}
-            </div>
-          </section>
-
-          <section className="panel">
-            <h2>Sound Field</h2>
-            <div className="zone-choices" role="group" aria-label="Sound field position">
-              {zones.map(([zone, label]) => (
                 <button
-                  key={zone}
-                  className={selectedZoneState === zone ? "active" : ""}
+                  className="icon-button"
                   type="button"
-                  onClick={() => selectZone(zone)}
+                  title="Restart from beginning"
+                  aria-label="Restart playback from beginning"
+                  onClick={restartPlayback}
+                  disabled={!layers.length}
                 >
-                  {label}
+                  <RotateCw />
                 </button>
-              ))}
-            </div>
+              </div>
+
+              <div className="timeline">
+                <span>{formatTime(positionState)}</span>
+                <input
+                  type="range"
+                  min="0"
+                  max={durationState || 100}
+                  value={Math.min(positionState, durationState || 100)}
+                  step="0.01"
+                  aria-label="Playback position"
+                  aria-valuetext={`${formatTime(positionState)} of ${formatTime(durationState)}`}
+                  disabled={!durationState}
+                  style={{ "--progress": `${durationState ? Math.min(100, (positionState / durationState) * 100) : 0}%` }}
+                  onPointerDown={beginSeek}
+                  onChange={(event) => previewSeek(event.target.value)}
+                  onPointerUp={(event) => commitSeek(event.currentTarget.value)}
+                  onPointerCancel={(event) => commitSeek(event.currentTarget.value)}
+                  onTouchEnd={(event) => commitSeek(event.currentTarget.value)}
+                  onKeyUp={(event) => {
+                    if (["ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(event.key)) {
+                      commitSeek(event.currentTarget.value);
+                    }
+                  }}
+                  onBlur={(event) => commitSeek(event.currentTarget.value)}
+                />
+                <span>{formatTime(durationState)}</span>
+              </div>
+            </div>}
+            {liveActive && roleState === "controller" && (
+              <div className="controller-transport" aria-label="Live room controls">
+                <button
+                  className="room-control-button"
+                  type="button"
+                  disabled={!speakerCount}
+                  onClick={() => send({ type: "roomCommand", action: allSpeakersMuted ? "resumeSpeakers" : "muteSpeakers" })}
+                >
+                  {allSpeakersMuted ? <Volume2 /> : <VolumeX />}
+                  {allSpeakersMuted ? "Resume speakers" : "Stop speakers"}
+                </button>
+                <button className="room-control-button danger" type="button" onClick={() => send({ type: "stop" })}>
+                  <Square /> End live capture
+                </button>
+              </div>
+            )}
+            {liveActive && roleState === "speaker" && (
+              <div className={`live-source ${remoteMutedState || !livePlaying ? "is-stopped" : ""}`}>
+                {remoteMutedState ? <VolumeX size={17} /> : <Radio size={17} />}
+                <span>
+                  {remoteMutedState
+                    ? "Output stopped by the room controller."
+                    : livePhase === "measuring"
+                      ? "Measuring this speaker while output stays muted."
+                      : livePhase === "locking"
+                        ? "Locking this speaker to the fixed room timeline."
+                        : readyStatus}
+                </span>
+              </div>
+            )}
+
+            {roleState === "speaker" ? <div className="sync-health" aria-label="Live synchronization health">
+              <div className="sync-health-heading">
+                <div>
+                  <strong>Sync health</strong>
+                  <span>Live measurements</span>
+                </div>
+              </div>
+              <div className="sync-metrics">
+                <div><span>Network RTT</span><strong>{latencyState ? `${Math.round(latencyState)} ms` : "Measuring"}</strong></div>
+                <div><span>Clock offset</span><strong>{Math.round(serverOffsetState)} ms</strong></div>
+                <div><span>Playback drift</span><strong>{driftState === null ? "-- ms" : `${driftState} ms`}</strong></div>
+                <div className="manual-offset">
+                  <span>Manual compensation</span>
+                  <div>
+                    <button type="button" aria-label="Decrease compensation by 10 milliseconds" onClick={() => setDeviceOffset(deviceOffsetState - 10)}>−</button>
+                    <strong>{deviceOffsetState >= 0 ? "+" : ""}{deviceOffsetState} ms</strong>
+                    <button type="button" aria-label="Increase compensation by 10 milliseconds" onClick={() => setDeviceOffset(deviceOffsetState + 10)}>+</button>
+                  </div>
+                </div>
+              </div>
+            </div> : <div className="room-overview" aria-label="Room status">
+              <div><span>{livePlaying ? "Playing" : "Stable"}</span><strong>{livePlaying ? activeSpeakerCount : stableSpeakerCount}</strong></div>
+              <div><span>Stopped</span><strong>{stoppedSpeakerCount}</strong></div>
+              <div><span>Issues</span><strong>{issueSpeakerCount}</strong></div>
+              <div><span>Joined</span><strong>{speakerCount}</strong></div>
+            </div>}
           </section>
 
-          <section className="panel join-panel">
-            <h2>Scan to Join</h2>
-            <div className="join-qr" aria-label="Player QR code">
-              {joinUrls[0] ? <QrCode value={joinUrls[0]} /> : "QR unavailable"}
-            </div>
-            <div className="addresses">
-              {joinUrls.map((url) => (
-                <div key={url} className="address-row">
-                  <code>{url}</code>
-                  <button className="copy" type="button" onClick={() => navigator.clipboard?.writeText(url)}>
-                    <Copy size={16} />
-                    Copy
+          <aside className="side">
+            <section className="panel host-panel session-panel">
+              <div className="panel-heading">
+                <h2>{liveActive ? "Live capture" : "Audio"}</h2>
+                <span className="panel-note">{liveActive ? livePhaseLabel : layers.length ? `${layers.length} loaded` : "Required"}</span>
+              </div>
+              {liveActive ? (
+                <>
+                  <div className="live-session-summary">
+                    <div><span>Phase</span><strong>{livePhaseBlocked ? `${livePhaseLabel} blocked` : livePhaseLabel}</strong></div>
+                    <div><span>Transport</span><strong>WebRTC / Opus</strong></div>
+                    <div><span>{livePlaying ? "Active outputs" : "Stable speakers"}</span><strong>{livePlaying ? activeSpeakerCount : stableSpeakerCount} / {requiredSpeakerCount || speakerCount}</strong></div>
+                    <div><span>Room target</span><strong>{roomTargetMs ? `${roomTargetMs} ms` : "Measuring"}</strong></div>
+                  </div>
+                  {!livePlaying && (
+                    <div className={`phase-progress ${livePhaseBlocked ? "is-blocked" : ""}`}>
+                      <div className="phase-progress-heading">
+                        <span>
+                          {livePhaseBlocked
+                            ? "Measurement blocked"
+                            : `${livePhaseSampleCount}/${livePhaseSampleTarget} timing samples`}
+                        </span>
+                        <strong>{Math.round(livePhaseProgress)}%</strong>
+                      </div>
+                      <div
+                        className="phase-progress-track"
+                        role="progressbar"
+                        aria-label={`${livePhaseLabel} progress`}
+                        aria-valuemin="0"
+                        aria-valuemax="100"
+                        aria-valuenow={Math.round(livePhaseProgress)}
+                      >
+                        <span style={{ width: `${livePhaseProgress}%` }} />
+                      </div>
+                      <span className="phase-progress-detail">
+                        {livePhaseBlocked
+                          ? "Check the speaker Audio path and AudioContext state."
+                          : `${Math.ceil(livePhaseElapsedMs / 1000)}s elapsed · ${Math.max(0, Math.ceil((livePhaseTimeoutMs - livePhaseElapsedMs) / 1000))}s check window`}
+                      </span>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
+                  <label className="upload">
+                    <input type="file" accept="audio/*" multiple onChange={(event) => uploadSelectedFiles(event.target.files)} />
+                    <Upload />
+                    <span>{uploadText}</span>
+                  </label>
+                  <div className="field-row">
+                    <span>Start buffer</span>
+                    <div className="segmented latency-modes" role="group" aria-label="Sync countdown">
+                      {[3000, 4000, 5000].map((lead) => (
+                        <button
+                          key={lead}
+                          className={Number(leadState) === lead ? "active" : ""}
+                          type="button"
+                          onClick={() => send({ type: "setLead", leadMs: lead })}
+                        >
+                          {lead / 1000}s
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              )}
+            </section>
+
+            <details className="panel host-panel join-panel collapsible-panel" defaultOpen={speakerCount === 0}>
+              <summary>
+                <span>Add speakers</span>
+                <span className="panel-note">{speakerCount} joined</span>
+              </summary>
+              <div className="collapsible-content">
+                <div className="join-layout">
+                  <div className="join-qr" aria-label="Player QR code">
+                    {joinUrls[0] ? <QrCode value={joinUrls[0]} /> : "QR unavailable"}
+                  </div>
+                  <div className="join-instructions">
+                    <strong>Scan on each device</strong>
+                    <span>Open the link, then tap Enable speaker.</span>
+                    {joinUrls[0] && (
+                      <button className="copy-link" type="button" onClick={() => navigator.clipboard?.writeText(joinUrls[0])}>
+                        <Copy size={16} /> Copy join link
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </details>
+
+            <section className="panel players-panel host-panel">
+              <div className="panel-heading">
+                <div>
+                  <h2>Speakers</h2>
+                  <span className="panel-subtitle">
+                    {liveActive && !livePlaying
+                      ? `${stableSpeakerCount}/${requiredSpeakerCount || speakerCount} stable · ${livePhaseLabel}`
+                      : `${activeSpeakerCount} playing · ${issueSpeakerCount} issues · ${stoppedSpeakerCount} stopped`}
+                  </span>
+                </div>
+                <div className="speaker-panel-actions">
+                  <button
+                    className="text-button recovery-button"
+                    type="button"
+                    disabled={!retryableSpeakerCount}
+                    onClick={() => send({ type: "roomCommand", action: "retryIssues" })}
+                  >
+                    <RefreshCw size={15} /> Retry failed
+                  </button>
+                  <button className="text-button" type="button" disabled={!speakerCount} onClick={() => send({ type: "testTone" })}>
+                    <Radio size={15} /> Test all
                   </button>
                 </div>
-              ))}
-            </div>
-          </section>
+              </div>
+              <div className="peers">
+                {!speakerPeers.length && <div className="empty-state">Waiting for speakers to join…</div>}
+                {speakerPeers.map((peer) => (
+                  <PeerCard
+                    key={peer.id}
+                    peer={peer}
+                    layers={layers}
+                    onTest={() => send({ type: "testTone", targetId: peer.id })}
+                    onToggle={() => send({ type: "deviceCommand", targetId: peer.id, action: peer.muted ? "unmute" : "mute" })}
+                    onReconnect={() => send({ type: "deviceCommand", targetId: peer.id, action: "reconnect" })}
+                    onOffset={(value) => send({ type: "deviceCommand", targetId: peer.id, action: "setOffset", value })}
+                  />
+                ))}
+              </div>
+            </section>
 
-          <section className="panel players-panel">
-            <div className="panel-heading">
-              <h2>Players</h2>
-              <button className="text-button" type="button" onClick={() => send({ type: "testTone" })}>
-                Test
-              </button>
-            </div>
-            <div className="peers">
-              {!peers.length && "No players"}
-              {peers.map((peer) => (
-                <PeerCard key={peer.id} peer={peer} layers={layers} onTest={() => send({ type: "testTone", targetId: peer.id })} />
-              ))}
-            </div>
-          </section>
+            {roleState === "speaker" && <>
+            <section className="panel output-panel">
+              <div className="panel-heading">
+                <div>
+                  <p className="step-label">THIS DEVICE</p>
+                  <h2>Local output</h2>
+                </div>
+                <span className={`status ${audioReadyState ? "ready" : ""}`}>{readyStatus}</span>
+              </div>
 
-          <section className="panel compact">
-            <Stat label="Clock offset" value={`${Math.round(serverOffsetState)} ms`} />
-            <Stat label="Round trip" value={latencyState ? `${Math.round(latencyState)} ms` : "-- ms"} />
-            <Stat label="Countdown" value={`${Math.round(leadState)} ms`} />
-            <Stat label="Local offset" value={`${deviceOffsetState} ms`} />
-            <div className="calibration" aria-label="Local latency calibration">
-              <button type="button" onClick={() => setDeviceOffset(deviceOffsetState - 10)}>
-                -10
-              </button>
-              <button type="button" onClick={() => setDeviceOffset(0)}>
-                0
-              </button>
-              <button type="button" onClick={() => setDeviceOffset(deviceOffsetState + 10)}>
-                +10
-              </button>
-            </div>
-            <button className="mini-button speaker-test" type="button" onClick={() => playTestTone({ toneAt: Date.now() + 80 })}>
-              Speaker test
-            </button>
-            <Stat label="Engine" value={playbackEngineState} />
-            <Stat label="Audio" value={audioContextState} />
-            <Stat label="Status" value={readyStatus} />
-            {audioIssueState && <p className="audio-issue">{audioIssueState}</p>}
-          </section>
+              <label className="field-label" htmlFor="deviceNameInput">Device name</label>
+              <input
+                id="deviceNameInput"
+                className="device-name-input"
+                type="text"
+                maxLength="40"
+                autoComplete="off"
+                value={deviceNameState}
+                onChange={(event) => setDeviceName(event.target.value)}
+              />
 
-          <section className="panel diagnostics-panel compact">
-            <h2>Device Diagnostics</h2>
-            <Stat label="Device" value={deviceInfo.device} />
-            <Stat label="Browser" value={deviceInfo.browser} />
-            <Stat label="Browser engine" value={deviceInfo.engine} />
-            <Stat label="iOS WebKit" value={deviceInfo.isIOS ? "Yes" : "No"} />
-            <Stat label="Playback engine" value={playbackEngineState} />
-            <Stat label="AudioContext" value={audioContextState} />
-            <Stat label="Drift" value={driftState === null ? "-- ms" : `${driftState} ms`} />
-            <Stat label="Hard resyncs" value={String(correctionCountState)} />
-            <Stat label="Last correction" value={lastCorrectionState} />
-            <Stat label="Start delay" value={lastStartDelayState === null ? "-- ms" : `${lastStartDelayState} ms`} />
-            <Stat label="Web Audio test" value={webAudioTestState} />
-            <button className="mini-button speaker-test" type="button" onClick={forceWebAudioTest}>
-              Force Web Audio Test
-            </button>
-          </section>
-        </aside>
-      </main>
+              <div className="setting-block">
+                <span className="field-label">Audio layer</span>
+                <div className="layer-choices">
+                  {!layers.length && <span className="empty-inline">No audio loaded</span>}
+                  {layers.map((layer, index) => (
+                    <button
+                      key={layer.id}
+                      className={`layer-button ${layer.id === selectedLayerIdState ? "active" : ""}`}
+                      type="button"
+                      onClick={() => selectLayer(layer.id)}
+                    >
+                      <strong>{layer.name}</strong>
+                      <span className="badge">{index + 1}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
 
-      {!unlockedState && (
+              <div className="setting-block">
+                <span className="field-label">Room position</span>
+                <div className="zone-choices" role="group" aria-label="Sound field position">
+                  {zones.map(([zone, label]) => (
+                    <button
+                      key={zone}
+                      className={selectedZoneState === zone ? "active" : ""}
+                      type="button"
+                      title={zoneNames[zone]}
+                      onClick={() => selectZone(zone)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </section>
+
+            <details className="panel advanced-panel">
+              <summary>
+                <span>Calibration & diagnostics</span>
+                <span className="summary-value">{deviceOffsetState >= 0 ? "+" : ""}{deviceOffsetState} ms</span>
+              </summary>
+              <div className="advanced-content">
+                <div className="diagnostic-grid">
+                  <Stat label="Audio engine" value={playbackEngineState} />
+                  <Stat label="AudioContext" value={audioContextState} />
+                  <Stat label="Live output" value={liveOutputPathState} />
+                  <Stat label="Output estimate" value={outputLatencyState === null ? "-- ms" : `${outputLatencyState} ms`} />
+                  <Stat label="Browser" value={`${deviceInfo.browser} / ${deviceInfo.engine}`} />
+                  <Stat label="Sync engine" value={`v${ROOM_SYNC_ENGINE_VERSION}`} />
+                  <Stat label="Corrections" value={String(correctionCountState)} />
+                  <Stat label="Last correction" value={lastCorrectionState} />
+                  <Stat label="Start delay" value={lastStartDelayState === null ? "-- ms" : `${lastStartDelayState} ms`} />
+                  <Stat label="WebRTC jitter" value={rtcJitterState === null ? "-- ms" : `${rtcJitterState} ms`} />
+                  <Stat label="WebRTC playout" value={rtcPlayoutDelayState === null ? "-- ms" : `${rtcPlayoutDelayState} ms`} />
+                  <Stat label="Fixed compensation" value={rtcPostDelayState === null ? "-- ms" : `${rtcPostDelayState} ms`} />
+                  <Stat label="Packets lost" value={String(rtcPacketsLostState)} />
+                  <Stat label="Concealed samples" value={String(rtcConcealedState)} />
+                </div>
+
+                <div className="calibration-row">
+                  <span>Local timing offset</span>
+                  <div className="calibration" aria-label="Local latency calibration">
+                    <button type="button" onClick={() => setDeviceOffset(deviceOffsetState - 10)}>-10</button>
+                    <button type="button" onClick={() => setDeviceOffset(0)}>Reset</button>
+                    <button type="button" onClick={() => setDeviceOffset(deviceOffsetState + 10)}>+10</button>
+                  </div>
+                </div>
+
+                <div className="advanced-actions">
+                  <button className="mini-button" type="button" onClick={() => playTestTone({ toneAt: Date.now() + 80 })}>Speaker test</button>
+                  <button className="mini-button" type="button" onClick={forceWebAudioTest}>Test Web Audio</button>
+                </div>
+                {audioIssueState && <p className="audio-issue">{audioIssueState}</p>}
+              </div>
+            </details>
+            </>}
+          </aside>
+        </main>
+      </div>
+
+      {roleState === "speaker" && !unlockedState && (
         <div className="gesture">
           <div className="gesture-card">
+            <span className="gesture-mark">HC</span>
+            <div>
+              <h2>Turn this device into a speaker</h2>
+              <p>One tap unlocks audio. Keep this page open while listening.</p>
+            </div>
             <button
+              className="gesture-primary-button"
               type="button"
               onTouchStart={() => {
                 unlockAudio();
@@ -1224,12 +2872,18 @@ export default function App() {
               <Volume2 />
               Enable speaker
             </button>
-            <span>Audio: {audioContextState}</span>
+            {!isPlayerView && (
+              <button className="gesture-controller-button" type="button" onClick={() => setRole("controller")}>
+                Use as controller instead
+              </button>
+            )}
+            <span className="gesture-status">Audio engine: {audioContextState}</span>
             {audioIssueState && <strong>{audioIssueState}</strong>}
           </div>
         </div>
       )}
       <audio ref={mediaAudioRef} className="fallback-audio" preload="auto" playsInline aria-hidden="true" />
+      <audio ref={liveAudioRef} className="fallback-audio" preload="auto" playsInline aria-hidden="true" />
     </>
   );
 
@@ -1282,28 +2936,86 @@ function QrCode({ value }) {
   );
 }
 
-function PeerCard({ peer, layers, onTest }) {
+function PeerCard({ peer, layers, onTest, onToggle, onReconnect, onOffset }) {
   const layer = layerById(layers, peer.layerId);
-  const status = peer.ready ? "Ready" : peer.unlocked ? "No audio" : "Locked";
+  const offset = Math.round(Number(peer.deviceOffsetMs) || 0);
+  const health = peer.muted ? "stopped" : peer.health || (peer.ready ? "ready" : peer.unlocked ? "connecting" : "locked");
+  const hasIssue = health === "failed";
+  const needsTap = health === "locked" || health === "needs-action";
+  const refreshRequired = /refresh speaker page/i.test(peer.status || "");
+  const recovering = /recovering|relocking|synchronizing|missed start|room restart/i.test(peer.status || "");
+  const measuring = /measuring|locking/i.test(peer.status || "");
+  const status = {
+    ready: "Playing",
+    stopped: "Stopped",
+    failed: "Retry needed",
+    locked: "Needs tap",
+    "needs-action": "Needs tap",
+    connecting: "Connecting"
+  }[health] || "Connecting";
+  const displayStatus = refreshRequired ? "Refresh" : recovering ? "Recovering" : measuring ? "Measuring" : status;
   return (
-    <div className="peer-card">
+    <div className={`peer-card ${peer.muted ? "is-muted" : ""} ${hasIssue ? "has-issue" : ""}`}>
       <div className="peer-head">
         <strong>{peer.name}</strong>
-        <span className={`status ${peer.ready ? "ready" : ""}`}>{status}</span>
+        <span className={`status ${health === "ready" ? "ready" : ""} ${hasIssue ? "failed" : ""} ${health === "connecting" ? "waiting" : ""}`}>{displayStatus}</span>
       </div>
+      {(hasIssue || needsTap || health === "connecting") && <p className={`peer-status-detail ${hasIssue ? "failed" : ""}`}>{peer.status || status}</p>}
       <div className="peer-grid">
-        <span>Stem</span>
-        <strong>{layer?.name || (peer.role === "controller" ? "Host" : "None")}</strong>
+        <span>Source</span>
+        <strong>{layer?.name || "Live room audio"}</strong>
         <span>Position</span>
         <strong>{zoneNames[peer.zone] || "Front Left"}</strong>
-        <span>Offset</span>
-        <strong>{Math.round(Number(peer.deviceOffsetMs) || 0)} ms</strong>
         <span>Latency</span>
         <strong>{peer.latencyMs ? `${Math.round(peer.latencyMs)} ms` : "--"}</strong>
+        <span>Output</span>
+        <strong>{peer.outputLatencyMs ? `${Math.round(peer.outputLatencyMs)} ms` : "--"}</strong>
+        <span>Compensation</span>
+        <strong>{Number.isFinite(peer.postDelayMs) ? `${Math.round(peer.postDelayMs)} ms` : "--"}</strong>
+        <span>Audio path</span>
+        <strong>{formatPeerOutput(peer)}</strong>
+        <span>Inbound</span>
+        <strong>{peer.rtcBytesReceived > 0 ? "Receiving frames" : "--"}</strong>
+        <span>Timing</span>
+        <strong>
+          {peer.timelineState === "locked"
+            ? "Locked"
+            : peer.timelineState === "recovering"
+              ? "Recovering"
+              : peer.timingStable
+                ? `Stable${Number.isFinite(peer.timingSpreadMs) ? ` ±${Math.round(peer.timingSpreadMs)} ms` : ""}`
+                : "Measuring"}
+        </strong>
+        <span>Sync</span>
+        <strong>{Number.isFinite(peer.syncErrorMs) ? `${peer.syncErrorMs >= 0 ? "+" : ""}${Math.round(peer.syncErrorMs)} ms` : "--"}</strong>
       </div>
-      <button className="mini-button" type="button" onClick={onTest}>
-        Test tone
-      </button>
+      <div className="peer-offset-row">
+        <span>Timing offset</span>
+        <div className="peer-stepper" aria-label={`Timing offset for ${peer.name}`}>
+          <button type="button" aria-label={`Advance ${peer.name} by 10 milliseconds`} onClick={() => onOffset(offset - 10)}>−</button>
+          <strong>{offset >= 0 ? "+" : ""}{offset} ms</strong>
+          <button type="button" aria-label={`Delay ${peer.name} by 10 milliseconds`} onClick={() => onOffset(offset + 10)}>+</button>
+        </div>
+      </div>
+      <div className="peer-actions">
+        <button className={`peer-toggle ${peer.muted ? "resume" : ""}`} type="button" onClick={onToggle}>
+          {peer.muted ? <Volume2 /> : <VolumeX />}
+          {peer.muted ? "Resume output" : "Stop output"}
+        </button>
+        <button className="peer-icon-button" type="button" title="Test tone" aria-label={`Test ${peer.name}`} onClick={onTest}>
+          <Radio />
+        </button>
+        <button
+          className={`peer-reconnect ${hasIssue ? "is-primary" : ""}`}
+          type="button"
+          title={needsTap ? "This device needs a local tap" : "Reconnect"}
+          aria-label={`Reconnect ${peer.name}`}
+          disabled={needsTap}
+          onClick={onReconnect}
+        >
+          <RefreshCw /> Reconnect
+        </button>
+      </div>
     </div>
   );
 }
@@ -1317,12 +3029,49 @@ function Stat({ label, value }) {
   );
 }
 
+function formatPeerOutput(peer) {
+  const labels = {
+    "webrtc-stream-source": "Web Audio",
+    "media-element-source": "Web Audio media",
+    "html-media-element": "HTML audio",
+    none: "Idle"
+  };
+  const output = labels[peer.outputPath] || "Unknown";
+  if (peer.outputPath?.endsWith("source")) {
+    return `${output} / ${peer.audioContextState === "running" ? "running" : "paused"}`;
+  }
+  if (peer.outputPath === "html-media-element" && peer.livePaused) return `${output} / paused`;
+  return output;
+}
+
 function buildSyncLabel({ layers, selectedLayer, state, audioReady, audioLoading, countdown }) {
   if (!layers.length) return "Choose one or more stems on the host";
   if (audioLoading) return "Caching audio";
   if (!audioReady) return "Preparing audio";
   if (countdown) return `Starting in ${countdown}`;
   return state.playing ? `Playing: ${selectedLayer?.name || "default stem"}` : `Paused: ${selectedLayer?.name || "default stem"}`;
+}
+
+function deriveDeviceHealth({ role, status, muted, unlocked, live, hasLayer, audioReady }) {
+  if (role === "controller") return "ready";
+  if (muted) return "stopped";
+  if (!unlocked) return "locked";
+
+  const normalizedStatus = String(status || "").toLowerCase();
+  if (/failed|signaling failed|connection lost|timed out/.test(normalizedStatus)) return "failed";
+  if (/enable speaker again|blocked|unsupported|unavailable/.test(normalizedStatus)) return "needs-action";
+  if (live) return normalizedStatus.startsWith("receiving ") ? "ready" : "connecting";
+  if (!hasLayer || audioReady) return "ready";
+  return "connecting";
+}
+
+function captureWebRtcDelayStats(report) {
+  return {
+    jitterBufferEmittedCount: report.jitterBufferEmittedCount,
+    jitterBufferDelay: report.jitterBufferDelay,
+    jitterBufferTargetDelay: report.jitterBufferTargetDelay,
+    jitterBufferMinimumDelay: report.jitterBufferMinimumDelay
+  };
 }
 
 function playerJoinUrl(url) {
@@ -1400,6 +3149,53 @@ function formatTime(seconds) {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function median(values) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function estimateOutputLatencySeconds(audioContext) {
+  if (!audioContext) return 0;
+  const baseLatency = Number(audioContext.baseLatency || 0);
+  const outputLatency = Number(audioContext.outputLatency || 0);
+  return Math.max(0, baseLatency + outputLatency);
+}
+
+function getUsableOutputTimestamp(audioContext) {
+  if (!audioContext?.getOutputTimestamp) return null;
+  try {
+    const timestamp = audioContext.getOutputTimestamp();
+    if (
+      Number.isFinite(timestamp?.contextTime) &&
+      Number.isFinite(timestamp?.performanceTime) &&
+      timestamp.performanceTime > 0
+    ) {
+      return timestamp;
+    }
+  } catch {}
+  return null;
+}
+
+function contextTimeForAudibleEpoch(audioContext, targetEpochMs) {
+  if (!audioContext) return 0;
+  const targetPerformanceMs = targetEpochMs - performance.timeOrigin;
+  const timestamp = getUsableOutputTimestamp(audioContext);
+  if (timestamp) {
+    return timestamp.contextTime + (targetPerformanceMs - timestamp.performanceTime) / 1000;
+  }
+
+  const timeUntilTarget = (targetPerformanceMs - performance.now()) / 1000;
+  return audioContext.currentTime + timeUntilTarget - estimateOutputLatencySeconds(audioContext);
+}
+
+function audibleAudioContextTime(audioContext) {
+  const timestamp = getUsableOutputTimestamp(audioContext);
+  if (timestamp) return timestamp.contextTime;
+  return Math.max(0, audioContext.currentTime - estimateOutputLatencySeconds(audioContext));
 }
 
 function primeAudioHardware(audioContext, outputNode, durationSeconds = 0.06, gain = 0.0008) {

@@ -5,6 +5,16 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  appendRoomTimingSample,
+  fixedRoomTargetMs,
+  latestEligibleRoomSpeakers,
+  ROOM_SYNC_ENGINE_VERSION,
+  ROOM_SYNC_POLICY,
+  roomTimingSample,
+  stableRoomTiming,
+  supportsRoomSyncVersion
+} from "./src/roomSync.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
@@ -15,6 +25,8 @@ const uploadPath = path.join(mediaDir, "current-audio");
 const metaPath = path.join(mediaDir, "track.json");
 const port = Number(process.env.PORT || 4173);
 let leadMs = clamp(Number(process.env.SYNC_LEAD_MS || 3000), 550, 6000);
+const liveStartLeadMs = clamp(Number(process.env.LIVE_START_LEAD_MS || 1800), 1200, 5000);
+const webRtcBufferMs = clamp(Number(process.env.WEBRTC_BUFFER_MS || 120), 60, 1000);
 
 const clients = new Set();
 let nextClientId = 1;
@@ -22,11 +34,16 @@ let nextClientId = 1;
 let state = {
   track: null,
   layers: [],
+  live: null,
   playing: false,
   position: 0,
   startedAt: null,
   updatedAt: Date.now()
 };
+let liveOwnerClientId = null;
+let liveBootstrapChunk = null;
+let livePreflight = null;
+let livePhaseTimer = null;
 
 await fsp.mkdir(mediaDir, { recursive: true });
 await fsp.mkdir(layersDir, { recursive: true });
@@ -41,7 +58,9 @@ const server = http.createServer(async (req, res) => {
         port,
         addresses: getLanAddresses(port),
         serverTime: Date.now(),
-        leadMs
+        leadMs,
+        liveStartLeadMs,
+        webRtcBufferMs
       });
     }
 
@@ -111,9 +130,34 @@ server.on("upgrade", (req, socket) => {
     zone: "front-left",
     ready: false,
     unlocked: false,
+    muted: false,
+    health: "connecting",
+    status: "Connecting",
+    syncErrorMs: null,
+    playoutDelayMs: null,
+    postDelayMs: 0,
+    fixedTargetMs: null,
     latencyMs: null,
+    outputLatencyMs: 0,
     deviceOffsetMs: 0,
+    audioContextState: "none",
+    outputPath: "none",
+    livePaused: true,
+    liveMuted: false,
+    liveReadyState: 0,
+    rtcBytesReceived: 0,
+    rtcEmittedCount: 0,
+    rtcAudioLevel: null,
+    timingSamples: [],
+    timingStable: false,
+    timingSpreadMs: null,
+    timingLiveId: null,
+    timelineState: "idle",
+    syncEngineVersion: 0,
     deviceKey: null,
+    liveId: null,
+    liveBootstrapId: null,
+    webRtcAnnouncedLiveId: null,
     lastSeen: Date.now(),
     name: `Device ${nextClientId - 1}`
   };
@@ -145,6 +189,7 @@ server.listen(port, "0.0.0.0", () => {
 });
 
 setInterval(() => {
+  evaluateLivePreflight();
   broadcast({
     type: "sync",
     serverTime: Date.now(),
@@ -210,6 +255,7 @@ async function handleUpload(req, res) {
 
   write.on("finish", async () => {
     await fsp.rename(tempPath, layerFilePath(layerId));
+    stopLive("track-replaced");
     const layer = {
       id: layerId,
       name: safeName,
@@ -235,6 +281,7 @@ async function handleUpload(req, res) {
 }
 
 async function handleClear(res) {
+  stopLive("track-cleared");
   state.layers = [];
   state.track = null;
   state.playing = false;
@@ -328,19 +375,143 @@ function handleMessage(client, message) {
   if (message.type === "identify") {
     client.name = String(message.name || client.name).slice(0, 40);
     client.deviceKey = String(message.deviceKey || client.deviceKey || "").slice(0, 120) || null;
-    client.role = message.role === "controller" ? "controller" : "speaker";
+    client.role = message.role === "controller" ? "controller" : message.role === "capture" ? "capture" : "speaker";
     client.layerId = message.layerId || client.layerId;
     client.zone = normalizeZone(message.zone || client.zone);
     client.ready = Boolean(message.ready);
     client.unlocked = Boolean(message.unlocked);
+    if (message.syncEngineVersion !== undefined) {
+      client.syncEngineVersion = clamp(Math.round(finiteNumber(message.syncEngineVersion, 0)), 0, 999);
+    }
+    if (message.muted !== undefined) client.muted = Boolean(message.muted);
+    client.health = message.health === undefined
+      ? client.muted ? "stopped" : client.ready ? "ready" : client.unlocked ? "connecting" : "locked"
+      : normalizeHealth(message.health, client.health);
+    client.status = message.status === undefined
+      ? client.health === "ready" ? "Ready" : client.health === "locked" ? "Needs local tap" : client.status
+      : String(message.status || "").replace(/[\r\n]+/g, " ").slice(0, 80);
+    if (message.syncErrorMs !== undefined) client.syncErrorMs = nullableMetric(message.syncErrorMs, -1000, 1000);
+    if (message.playoutDelayMs !== undefined) client.playoutDelayMs = nullableMetric(message.playoutDelayMs, 0, 4000);
+    if (message.postDelayMs !== undefined) client.postDelayMs = nullableMetric(message.postDelayMs, 0, 1000) ?? 0;
+    if (message.fixedTargetMs !== undefined) client.fixedTargetMs = nullableMetric(message.fixedTargetMs, 0, 4000);
+    else if (message.adaptiveTargetMs !== undefined) {
+      client.fixedTargetMs = nullableMetric(message.adaptiveTargetMs, 0, 4000);
+    }
     client.latencyMs = finiteNumber(message.latencyMs, client.latencyMs);
+    client.outputLatencyMs = clamp(finiteNumber(message.outputLatencyMs, client.outputLatencyMs), 0, 1000);
     client.deviceOffsetMs = finiteNumber(message.deviceOffsetMs, client.deviceOffsetMs);
+    if (message.audioContextState !== undefined) {
+      client.audioContextState = String(message.audioContextState || "none").slice(0, 24);
+    }
+    if (message.outputPath !== undefined) client.outputPath = String(message.outputPath || "none").slice(0, 40);
+    if (message.livePaused !== undefined) client.livePaused = Boolean(message.livePaused);
+    if (message.liveMuted !== undefined) client.liveMuted = Boolean(message.liveMuted);
+    if (message.liveReadyState !== undefined) {
+      client.liveReadyState = clamp(Math.round(finiteNumber(message.liveReadyState, client.liveReadyState)), 0, 4);
+    }
+    if (message.rtcBytesReceived !== undefined) {
+      client.rtcBytesReceived = clamp(
+        Math.round(finiteNumber(message.rtcBytesReceived, client.rtcBytesReceived)),
+        0,
+        Number.MAX_SAFE_INTEGER
+      );
+    }
+    if (message.rtcEmittedCount !== undefined) {
+      client.rtcEmittedCount = clamp(
+        Math.round(finiteNumber(message.rtcEmittedCount, client.rtcEmittedCount)),
+        0,
+        Number.MAX_SAFE_INTEGER
+      );
+    }
+    if (message.rtcAudioLevel !== undefined) client.rtcAudioLevel = nullableMetric(message.rtcAudioLevel, 0, 1);
+    if (message.timelineState !== undefined) {
+      const timelineState = String(message.timelineState || "idle");
+      client.timelineState = ["idle", "measuring", "locking", "armed", "locked", "recovering"].includes(timelineState)
+        ? timelineState
+        : client.timelineState;
+    }
     client.lastSeen = Date.now();
+    retireSupersededSpeakerRoutes(client);
+    recordLiveTiming(client);
+    if (
+      state.live &&
+      state.live.transport !== "webrtc" &&
+      liveBootstrapChunk &&
+      client.role !== "capture" &&
+      client.unlocked &&
+      client.liveBootstrapId !== state.live.id
+    ) {
+      sendBinary(client, liveBootstrapChunk);
+      client.liveBootstrapId = state.live.id;
+    }
+    announceWebRtcPeer(client);
+    evaluateLivePreflight();
+    broadcastPeers();
+    return;
+  }
+
+  if (message.type === "liveStart") {
+    startLive(client, message);
+    return;
+  }
+
+  if (message.type === "liveStop") {
+    if (liveOwnerClientId === client.id) stopLive("capture-stopped");
+    return;
+  }
+
+  if (message.type === "webrtcSignal") {
+    relayWebRtcSignal(client, message);
+    return;
+  }
+
+  if (message.type === "deviceCommand") {
+    if (client.role !== "controller") return;
+    const targetId = Number(message.targetId || 0);
+    const target = [...clients].find((item) => item.id === targetId && item.role === "speaker");
+    const action = String(message.action || "");
+    if (!target || !["mute", "unmute", "reconnect", "setOffset"].includes(action)) return;
+
+    if (action === "mute" || action === "unmute") target.muted = action === "mute";
+    if (action === "setOffset") {
+      target.deviceOffsetMs = clamp(finiteNumber(message.value, target.deviceOffsetMs), -300, 300);
+    }
+    send(target, {
+      type: "deviceCommand",
+      action,
+      value: action === "setOffset" ? target.deviceOffsetMs : undefined,
+      requestedBy: client.name
+    });
+    evaluateLivePreflight();
+    broadcastPeers();
+    return;
+  }
+
+  if (message.type === "roomCommand") {
+    if (client.role !== "controller") return;
+    const action = String(message.action || "");
+    if (!["muteSpeakers", "resumeSpeakers", "retryIssues"].includes(action)) return;
+    if (action === "retryIssues") {
+      for (const target of clients) {
+        if (target.role === "speaker" && target.health === "failed") {
+          send(target, { type: "deviceCommand", action: "reconnect", requestedBy: client.name });
+        }
+      }
+      return;
+    }
+    const muted = action === "muteSpeakers";
+    for (const target of clients) {
+      if (target.role !== "speaker") continue;
+      target.muted = muted;
+      send(target, { type: "deviceCommand", action: muted ? "mute" : "unmute", requestedBy: client.name });
+    }
+    evaluateLivePreflight();
     broadcastPeers();
     return;
   }
 
   if (message.type === "setLead") {
+    if (client.role !== "controller") return;
     leadMs = clamp(Number(message.leadMs || leadMs), 550, 6000);
     state.updatedAt = Date.now();
     broadcast({ type: "lead", state: publicState() });
@@ -348,6 +519,7 @@ function handleMessage(client, message) {
   }
 
   if (message.type === "testTone") {
+    if (client.role !== "controller") return;
     const payload = {
       type: "testTone",
       targetId: Number(message.targetId || 0),
@@ -364,6 +536,8 @@ function handleMessage(client, message) {
   }
 
   if (message.type === "play") {
+    if (client.role !== "controller") return;
+    if (state.live) return;
     if (!state.layers.length) return;
     const position = clamp(Number(message.position ?? currentPosition()), 0, trackDurationFallback());
     state.playing = true;
@@ -375,6 +549,8 @@ function handleMessage(client, message) {
   }
 
   if (message.type === "resync") {
+    if (client.role !== "controller") return;
+    if (state.live) return;
     if (!state.layers.length || !state.playing) return;
     state.position = currentPosition();
     state.startedAt = Date.now() + leadMs;
@@ -384,6 +560,8 @@ function handleMessage(client, message) {
   }
 
   if (message.type === "pause") {
+    if (client.role !== "controller") return;
+    if (state.live) return;
     state.position = currentPosition();
     state.playing = false;
     state.startedAt = null;
@@ -393,6 +571,11 @@ function handleMessage(client, message) {
   }
 
   if (message.type === "stop") {
+    if (client.role !== "controller") return;
+    if (state.live) {
+      stopLive("controller-stopped");
+      return;
+    }
     state.position = 0;
     state.playing = false;
     state.startedAt = null;
@@ -402,6 +585,8 @@ function handleMessage(client, message) {
   }
 
   if (message.type === "seek") {
+    if (client.role !== "controller") return;
+    if (state.live) return;
     const position = Math.max(0, Number(message.position || 0));
     state.position = position;
     state.updatedAt = Date.now();
@@ -414,6 +599,302 @@ function handleMessage(client, message) {
   }
 }
 
+function startLive(client, message) {
+  if (client.role !== "capture") {
+    send(client, { type: "error", message: "Only a capture endpoint can start live audio." });
+    return;
+  }
+  if (state.live) {
+    send(client, { type: "error", message: "A live tab audio session is already active." });
+    return;
+  }
+
+  const transport = message.transport === "webrtc" ? "webrtc" : "websocket";
+  const mimeType = transport === "webrtc" ? "audio/opus" : String(message.mimeType || "").toLowerCase();
+  if (transport !== "webrtc" && !isSupportedLiveMimeType(mimeType)) {
+    send(client, { type: "error", message: "Unsupported live audio format." });
+    return;
+  }
+
+  const now = Date.now();
+  const bufferMs = transport === "webrtc"
+    ? clamp(finiteNumber(message.bufferMs, webRtcBufferMs), 60, 1000)
+    : liveStartLeadMs;
+  const joinDelayMs = transport === "webrtc" ? leadMs : bufferMs;
+  const candidateKeys = new Set(
+    eligibleRoomSpeakers().map(speakerIdentity)
+  );
+  state.playing = false;
+  state.position = 0;
+  state.startedAt = null;
+  state.live = {
+    id: crypto.randomUUID(),
+    name: String(message.name || "Browser tab audio").replace(/[\r\n]+/g, " ").slice(0, 120),
+    mimeType,
+    transport,
+    startedAt: now,
+    phase: transport === "webrtc" ? "measuring" : "armed",
+    playAt: transport === "webrtc" ? null : now + joinDelayMs,
+    bufferMs,
+    roomTargetMs: transport === "webrtc" ? null : bufferMs,
+    joinDelayMs,
+    requiredSpeakers: candidateKeys.size,
+    stableSpeakers: 0,
+    excludedSpeakers: 0,
+    phaseProgress: 0,
+    phaseSampleCount: 0,
+    phaseSampleTarget: ROOM_SYNC_POLICY.sampleWindow,
+    phaseElapsedMs: 0,
+    phaseTimeoutMs: ROOM_SYNC_POLICY.preflightTimeoutMs,
+    phaseBlocked: false,
+    participantIds: []
+  };
+  state.updatedAt = Date.now();
+  liveOwnerClientId = client.id;
+  liveBootstrapChunk = null;
+  livePreflight = transport === "webrtc"
+    ? { liveId: state.live.id, phaseStartedAt: now, candidateKeys }
+    : null;
+  clearTimeout(livePhaseTimer);
+  livePhaseTimer = null;
+  for (const peer of clients) {
+    peer.timingSamples = [];
+    peer.timingStable = false;
+    peer.timingSpreadMs = null;
+    peer.timingLiveId = state.live.id;
+    if (peer.role === "speaker") {
+      peer.syncErrorMs = null;
+      peer.playoutDelayMs = null;
+      peer.postDelayMs = 0;
+      peer.fixedTargetMs = null;
+      peer.rtcBytesReceived = 0;
+      peer.rtcEmittedCount = 0;
+      peer.timelineState = "measuring";
+    }
+  }
+  client.liveId = state.live.id;
+  broadcast({ type: "liveStart", state: publicState() });
+  if (transport === "webrtc") {
+    for (const peer of eligibleRoomSpeakers()) announceWebRtcPeer(peer);
+    evaluateLivePreflight();
+  }
+}
+
+function recordLiveTiming(client) {
+  if (
+    !state.live ||
+    state.live.transport !== "webrtc" ||
+    !["measuring", "locking"].includes(state.live.phase) ||
+    !livePreflight
+  ) return;
+  if (!isCompatibleSpeaker(client) || !client.unlocked || client.muted) return;
+  const identity = speakerIdentity(client);
+  if (state.live.phase === "measuring") livePreflight.candidateKeys.add(identity);
+  if (!livePreflight.candidateKeys.has(identity)) return;
+  if (client.timingLiveId !== state.live.id) {
+    client.timingLiveId = state.live.id;
+    client.timingSamples = [];
+  }
+
+  const sample = roomTimingSample({
+    at: client.lastSeen,
+    playoutDelayMs: client.playoutDelayMs,
+    outputLatencyMs: client.outputLatencyMs,
+    postDelayMs: client.postDelayMs,
+    deviceOffsetMs: client.deviceOffsetMs,
+    rtcBytesReceived: client.rtcBytesReceived,
+    rtcProgress: client.rtcEmittedCount || client.rtcBytesReceived
+  });
+  if (!sample) return;
+  const nextSamples = appendRoomTimingSample(client.timingSamples, sample);
+  if (nextSamples === client.timingSamples) return;
+  client.timingSamples = nextSamples;
+  const timing = stableRoomTiming(client.timingSamples, client.lastSeen);
+  client.timingStable = timing.stable;
+  client.timingSpreadMs = timing.spreadMs;
+}
+
+function evaluateLivePreflight() {
+  if (
+    !state.live ||
+    state.live.transport !== "webrtc" ||
+    !["measuring", "locking"].includes(state.live.phase) ||
+    !livePreflight
+  ) return;
+  const now = Date.now();
+  const candidates = eligibleRoomSpeakers().filter((client) =>
+    livePreflight.candidateKeys.has(speakerIdentity(client))
+  );
+  const stableCandidates = candidates.filter((client) =>
+    client.timingStable &&
+    (client.rtcEmittedCount > 0 || client.rtcBytesReceived > 0) &&
+    client.outputPath.endsWith("source") &&
+    client.audioContextState === "running"
+  );
+
+  state.live.requiredSpeakers = candidates.length;
+  state.live.stableSpeakers = stableCandidates.length;
+  state.live.excludedSpeakers = Math.max(0, candidates.length - stableCandidates.length);
+  state.updatedAt = now;
+
+  if (state.live.phase === "locking") {
+    const lockedCandidates = stableCandidates.filter((client) => {
+      const timing = stableRoomTiming(client.timingSamples, now);
+      return timing.stable && Math.abs(timing.delayMs - state.live.roomTargetMs) <= ROOM_SYNC_POLICY.lockToleranceMs;
+    });
+    state.live.stableSpeakers = lockedCandidates.length;
+    state.live.excludedSpeakers = Math.max(0, candidates.length - lockedCandidates.length);
+    const lockTimedOut = now - livePreflight.phaseStartedAt >= ROOM_SYNC_POLICY.lockTimeoutMs;
+    updateLivePhaseProgress(candidates, lockedCandidates, now, ROOM_SYNC_POLICY.lockTimeoutMs);
+    state.live.phaseBlocked = candidates.length > 0 && lockTimedOut && !lockedCandidates.length;
+    if (!lockedCandidates.length) return;
+    if (lockedCandidates.length !== candidates.length && !lockTimedOut) return;
+    armLiveRoom(lockedCandidates, candidates);
+    return;
+  }
+
+  const timedOut = now - livePreflight.phaseStartedAt >= ROOM_SYNC_POLICY.preflightTimeoutMs;
+  updateLivePhaseProgress(candidates, stableCandidates, now, ROOM_SYNC_POLICY.preflightTimeoutMs);
+  state.live.phaseBlocked = candidates.length > 0 && timedOut && !stableCandidates.length;
+  if (!stableCandidates.length) return;
+  if (stableCandidates.length !== candidates.length && !timedOut) return;
+  lockLiveRoom(stableCandidates, candidates);
+}
+
+function lockLiveRoom(stableCandidates, candidates) {
+  if (!state.live || state.live.phase !== "measuring") return;
+  const timings = stableCandidates.map((client) => stableRoomTiming(client.timingSamples));
+  const roomTargetMs = fixedRoomTargetMs(timings, state.live.bufferMs);
+  state.live.phase = "locking";
+  state.live.roomTargetMs = roomTargetMs;
+  state.live.stableSpeakers = 0;
+  state.live.requiredSpeakers = stableCandidates.length;
+  state.live.excludedSpeakers = Math.max(0, candidates.length - stableCandidates.length);
+  state.live.phaseProgress = 0;
+  state.live.phaseSampleCount = 0;
+  state.live.phaseElapsedMs = 0;
+  state.live.phaseTimeoutMs = ROOM_SYNC_POLICY.lockTimeoutMs;
+  state.live.phaseBlocked = false;
+  state.live.participantIds = stableCandidates.map((client) => client.id);
+  state.updatedAt = Date.now();
+  livePreflight = {
+    liveId: state.live.id,
+    phaseStartedAt: Date.now(),
+    candidateKeys: new Set(stableCandidates.map(speakerIdentity))
+  };
+  for (const client of stableCandidates) {
+    client.timingSamples = [];
+    client.timingStable = false;
+    client.timingSpreadMs = null;
+  }
+  broadcast({ type: "liveLock", state: publicState() });
+}
+
+function updateLivePhaseProgress(candidates, acceptedCandidates, now, timeoutMs) {
+  const sampleCount = candidates.length
+    ? Math.min(...candidates.map((client) => Math.min(client.timingSamples.length, ROOM_SYNC_POLICY.sampleWindow)))
+    : 0;
+  const allAccepted = candidates.length > 0 && acceptedCandidates.length === candidates.length;
+  const sampleProgress = Math.min(0.9, sampleCount / ROOM_SYNC_POLICY.sampleWindow);
+  state.live.phaseProgress = allAccepted ? 100 : Math.round(sampleProgress * 100);
+  state.live.phaseSampleCount = sampleCount;
+  state.live.phaseSampleTarget = ROOM_SYNC_POLICY.sampleWindow;
+  state.live.phaseElapsedMs = Math.max(0, now - livePreflight.phaseStartedAt);
+  state.live.phaseTimeoutMs = timeoutMs;
+}
+
+function armLiveRoom(stableCandidates, candidates) {
+  if (!state.live || state.live.phase !== "locking") return;
+  const roomTargetMs = state.live.roomTargetMs;
+  const playAt = Date.now() + leadMs;
+  const liveId = state.live.id;
+  state.live.phase = "armed";
+  state.live.playAt = playAt;
+  state.live.roomTargetMs = roomTargetMs;
+  state.live.stableSpeakers = stableCandidates.length;
+  state.live.requiredSpeakers = candidates.length;
+  state.live.excludedSpeakers = Math.max(0, candidates.length - stableCandidates.length);
+  state.live.participantIds = stableCandidates.map((client) => client.id);
+  state.live.phaseProgress = 100;
+  state.live.phaseSampleCount = ROOM_SYNC_POLICY.sampleWindow;
+  state.live.phaseElapsedMs = Date.now() - livePreflight.phaseStartedAt;
+  state.live.phaseBlocked = false;
+  state.updatedAt = Date.now();
+  livePreflight = null;
+  broadcast({ type: "liveArm", state: publicState() });
+  clearTimeout(livePhaseTimer);
+  livePhaseTimer = setTimeout(() => {
+    if (!state.live || state.live.id !== liveId || state.live.phase !== "armed") return;
+    state.live.phase = "playing";
+    state.updatedAt = Date.now();
+    broadcast({ type: "sync", serverTime: Date.now(), state: publicState() });
+  }, Math.max(0, playAt - Date.now()) + 80);
+}
+
+function stopLive(reason) {
+  if (!state.live) return;
+  clearTimeout(livePhaseTimer);
+  livePhaseTimer = null;
+  livePreflight = null;
+  state.live = null;
+  state.updatedAt = Date.now();
+  liveOwnerClientId = null;
+  liveBootstrapChunk = null;
+  broadcast({ type: "liveStop", state: publicState(), reason });
+}
+
+function handleBinaryMessage(client, payload) {
+  if (!state.live || state.live.transport === "webrtc" || liveOwnerClientId !== client.id) return;
+  if (payload.length > 2 * 1024 * 1024) {
+    send(client, { type: "error", message: "Live audio chunk is too large." });
+    stopLive("chunk-too-large");
+    return;
+  }
+  const isBootstrap = !liveBootstrapChunk;
+  if (isBootstrap) liveBootstrapChunk = Buffer.from(payload);
+  broadcastBinary(payload, client, isBootstrap ? state.live.id : null);
+}
+
+function announceWebRtcPeer(client) {
+  if (
+    !state.live ||
+    state.live.transport !== "webrtc" ||
+    !liveOwnerClientId ||
+    client.id === liveOwnerClientId ||
+    client.role !== "speaker" ||
+    !client.unlocked ||
+    !isCompatibleSpeaker(client) ||
+    newestSpeakerConnection(client) !== client ||
+    client.webRtcAnnouncedLiveId === state.live.id
+  ) {
+    return;
+  }
+
+  const owner = [...clients].find((item) => item.id === liveOwnerClientId);
+  if (!owner) return;
+  client.webRtcAnnouncedLiveId = state.live.id;
+  send(owner, {
+    type: "webrtcPeerJoin",
+    peerId: client.id,
+    name: client.name,
+    bufferMs: state.live.bufferMs,
+    joinDelayMs: state.live.joinDelayMs
+  });
+}
+
+function relayWebRtcSignal(client, message) {
+  if (!state.live || state.live.transport !== "webrtc" || !liveOwnerClientId) return;
+  const targetId = Number(message.targetId || 0);
+  const target = [...clients].find((item) => item.id === targetId);
+  const isOwnerRoute = client.id === liveOwnerClientId || targetId === liveOwnerClientId;
+  if (!target || !isOwnerRoute || !message.signal || typeof message.signal !== "object") return;
+  send(target, {
+    type: "webrtcSignal",
+    fromId: client.id,
+    signal: message.signal
+  });
+}
+
 function publicState() {
   const now = Date.now();
   return {
@@ -422,7 +903,8 @@ function publicState() {
     serverTime: now,
     position: state.position,
     currentPosition: currentPosition(now),
-    leadMs
+    leadMs,
+    requiredSyncEngineVersion: ROOM_SYNC_ENGINE_VERSION
   };
 }
 
@@ -476,6 +958,11 @@ function readFrames(client) {
       return;
     }
 
+    if (opcode === 0x2) {
+      handleBinaryMessage(client, payload);
+      continue;
+    }
+
     if (opcode !== 0x1) continue;
 
     try {
@@ -489,17 +976,26 @@ function readFrames(client) {
 function send(client, payload) {
   if (client.socket.destroyed) return;
   const data = Buffer.from(JSON.stringify(payload));
+  sendFrame(client, 0x1, data);
+}
+
+function sendBinary(client, payload) {
+  if (client.socket.destroyed) return;
+  sendFrame(client, 0x2, payload);
+}
+
+function sendFrame(client, opcode, data) {
   let header;
   if (data.length < 126) {
-    header = Buffer.from([0x81, data.length]);
+    header = Buffer.from([0x80 | opcode, data.length]);
   } else if (data.length < 65536) {
     header = Buffer.alloc(4);
-    header[0] = 0x81;
+    header[0] = 0x80 | opcode;
     header[1] = 126;
     header.writeUInt16BE(data.length, 2);
   } else {
     header = Buffer.alloc(10);
-    header[0] = 0x81;
+    header[0] = 0x80 | opcode;
     header[1] = 127;
     header.writeBigUInt64BE(BigInt(data.length), 2);
   }
@@ -510,9 +1006,24 @@ function broadcast(payload) {
   for (const client of clients) send(client, payload);
 }
 
+function broadcastBinary(payload, sender, bootstrapId = null) {
+  for (const client of clients) {
+    if (client !== sender && client.role !== "capture" && client.unlocked) {
+      sendBinary(client, payload);
+      if (bootstrapId) client.liveBootstrapId = bootstrapId;
+    }
+  }
+}
+
 function removeClient(client) {
   if (!clients.has(client)) return;
+  if (liveOwnerClientId && liveOwnerClientId !== client.id) {
+    const owner = [...clients].find((item) => item.id === liveOwnerClientId);
+    if (owner) send(owner, { type: "webrtcPeerLeave", peerId: client.id });
+  }
+  if (liveOwnerClientId === client.id) stopLive("capture-disconnected");
   clients.delete(client);
+  evaluateLivePreflight();
   broadcastPeers();
 }
 
@@ -526,25 +1037,48 @@ function broadcastPeers() {
 function peerList() {
   const latestByDevice = new Map();
   for (const client of clients) {
-    const key = client.deviceKey || `socket-${client.id}`;
+    const key = `${client.role}:${client.deviceKey || `socket-${client.id}`}`;
     const existing = latestByDevice.get(key);
-    if (!existing || client.lastSeen >= existing.lastSeen) {
+    if (!existing || client.id > existing.id) {
       latestByDevice.set(key, client);
     }
   }
 
-  return [...latestByDevice.values()].map((client) => ({
-    id: client.id,
-    name: client.name,
-    role: client.role,
-    layerId: client.layerId,
-    zone: client.zone,
-    ready: client.ready,
-    unlocked: client.unlocked,
-    latencyMs: client.latencyMs,
-    deviceOffsetMs: client.deviceOffsetMs,
-    online: true
-  }));
+  return [...latestByDevice.values()].map((client) => {
+    const compatible = client.role !== "speaker" || isCompatibleSpeaker(client);
+    return {
+      id: client.id,
+      name: client.name,
+      role: client.role,
+      layerId: client.layerId,
+      zone: client.zone,
+      ready: compatible && client.ready,
+      unlocked: client.unlocked,
+      muted: client.muted,
+      health: compatible ? client.health : "needs-action",
+      status: compatible ? client.status : `Refresh speaker page (sync engine v${ROOM_SYNC_ENGINE_VERSION})`,
+      syncErrorMs: client.syncErrorMs,
+      playoutDelayMs: client.playoutDelayMs,
+      postDelayMs: client.postDelayMs,
+      fixedTargetMs: client.fixedTargetMs,
+      latencyMs: client.latencyMs,
+      outputLatencyMs: client.outputLatencyMs,
+      deviceOffsetMs: client.deviceOffsetMs,
+      audioContextState: client.audioContextState,
+      outputPath: client.outputPath,
+      livePaused: client.livePaused,
+      liveMuted: client.liveMuted,
+      liveReadyState: client.liveReadyState,
+      rtcBytesReceived: client.rtcBytesReceived,
+      rtcEmittedCount: client.rtcEmittedCount,
+      rtcAudioLevel: client.rtcAudioLevel,
+      timingStable: compatible && client.timingStable,
+      timingSpreadMs: client.timingSpreadMs,
+      timelineState: compatible ? client.timelineState : "idle",
+      syncEngineVersion: client.syncEngineVersion,
+      online: true
+    };
+  });
 }
 
 function primaryTrack(layers = state.layers) {
@@ -582,9 +1116,64 @@ function normalizeZone(zone) {
   return allowed.has(zone) ? zone : "front-left";
 }
 
+function speakerIdentity(client) {
+  return client.deviceKey || `socket-${client.id}`;
+}
+
+function isCompatibleSpeaker(client) {
+  return client.role === "speaker" && supportsRoomSyncVersion(client.syncEngineVersion);
+}
+
+function newestSpeakerConnection(client) {
+  if (!isCompatibleSpeaker(client)) return null;
+  const identity = speakerIdentity(client);
+  let newest = null;
+  for (const candidate of clients) {
+    if (!isCompatibleSpeaker(candidate) || speakerIdentity(candidate) !== identity) continue;
+    if (!newest || candidate.id > newest.id) newest = candidate;
+  }
+  return newest;
+}
+
+function eligibleRoomSpeakers() {
+  return latestEligibleRoomSpeakers([...clients]);
+}
+
+function retireSupersededSpeakerRoutes(client) {
+  if (!state.live || state.live.transport !== "webrtc" || newestSpeakerConnection(client) !== client) return;
+  const owner = [...clients].find((item) => item.id === liveOwnerClientId);
+  if (!owner) return;
+  const identity = speakerIdentity(client);
+  for (const candidate of clients) {
+    if (
+      candidate === client ||
+      !isCompatibleSpeaker(candidate) ||
+      speakerIdentity(candidate) !== identity ||
+      candidate.webRtcAnnouncedLiveId !== state.live.id
+    ) continue;
+    send(owner, { type: "webrtcPeerLeave", peerId: candidate.id });
+    candidate.webRtcAnnouncedLiveId = null;
+  }
+}
+
+function normalizeHealth(value, fallback = "connecting") {
+  const allowed = new Set(["ready", "connecting", "failed", "locked", "needs-action", "stopped"]);
+  return allowed.has(value) ? value : fallback;
+}
+
+function isSupportedLiveMimeType(value) {
+  return value === "audio/webm" || value === "audio/webm;codecs=opus";
+}
+
 function finiteNumber(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
+}
+
+function nullableMetric(value, min, max) {
+  if (value === null || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? clamp(number, min, max) : null;
 }
 
 function sendJson(res, data) {

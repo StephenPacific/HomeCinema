@@ -24,6 +24,24 @@ Synchronize music playback across phones, tablets, and computers on the same loc
 
 The QR code opens `?mode=player`, which gives phones and tablets a lighter player view with playback controls, device name, local stem, sound-field position, latency, and offset controls.
 
+## Chrome Tab Audio Extension
+
+The included Chrome extension can relay audio from the current desktop Chrome tab into the Home Cinema room. This is useful for browser music, video, and web players: the video stays on the host computer while the tab's audio is relayed to the joined speakers.
+
+1. Start Home Cinema with `npm start`.
+2. In Chrome, open `chrome://extensions`, turn on Developer mode, then choose **Load unpacked** and select the [`extension`](extension/) folder.
+3. Open Home Cinema, have speakers join from the QR code, and tap **Enable speaker** on each device before beginning the live capture.
+4. Open the Chrome extension from the toolbar. Its default Home Cinema address is `http://127.0.0.1:4173`; change it only when the server runs on another port or host.
+5. With the music or video tab active, press **Start audio**. The original tab audio remains audible on the host computer with the same short playout target used by the room. Press **Stop** in the extension to end the session.
+
+Live tab audio uses WebRTC with Opus. WebSocket remains responsible for room state, device discovery, clock measurements, and WebRTC signaling. Current Chrome and Edge releases are the recommended speaker browsers for this mode. Uploaded tracks retain the wider browser support described below. Only one live tab capture can be active in a room at a time. Protected DRM playback may not permit capture; the extension does not bypass DRM.
+
+Live WebRTC sessions use a four-phase startup: `Measuring`, `Locking`, `Armed`, and `Playing`. The extension and speakers establish their media paths while muted. The server waits for consecutive RTP timing samples and chooses a fixed room target from the slowest stable speaker. Each faster speaker then fills its one-time gap with a deterministic Web Audio delay instead of forcing Chrome's advisory jitter-buffer target. Only after the combined browser and fixed local delay is verified does the server schedule the shared start timestamp.
+
+Speaker pages report a room-sync engine version. Stale pages and superseded connections remain visible for diagnosis but are not counted as timing candidates and do not receive the live WebRTC track. Reloading the page upgrades the receiver without allowing an old tab to block the room at 90%.
+
+The room target stays frozen after playback starts. Speakers continue reporting clock, playout, packet-loss, and output diagnostics. Drift inside the correction range is removed by a bounded local-delay servo: at most 3 ms every two-second sample, applied as a 1.8-second Web Audio ramp so the output does not jump. A speaker with sustained hard drift is faded out, retuned faster while silent, and allowed back only after consecutive in-tolerance samples. If a late device has no delay headroom left, it remains muted until the room is restarted instead of disrupting the other speakers.
+
 ## Stems
 
 Stem mode works best when you prepare separate files from the same song, for example:
@@ -57,7 +75,7 @@ Avoid Bluetooth speakers, AirPlay, and TV casting when you need tight sync. Thos
 
 - The server uses only built-in Node.js modules.
 - The frontend is a React app built with Vite and served by the same LAN server.
-- Browsers receive playback commands over WebSocket.
+- Browsers receive playback commands and WebRTC signaling over WebSocket; live tab audio travels over WebRTC/Opus.
 - Every device estimates its clock offset from the server with repeated time samples.
 - The host schedules playback at a future server timestamp; each device converts that into local time and starts Web Audio there.
 - Multi-stem playback uses one shared timeline; each device loads only its selected stem.

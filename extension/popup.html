@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Home Cinema</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <span class="mark">HC</span>
+        <div>
+          <strong>Home Cinema</strong>
+          <span>WebRTC tab audio</span>
+        </div>
+        <span id="statusDot" class="dot" aria-hidden="true"></span>
+      </header>
+
+      <label for="serverUrl">Home Cinema address</label>
+      <input id="serverUrl" type="url" inputmode="url" autocomplete="url" spellcheck="false" />
+
+      <section class="tab-card" aria-label="Current browser tab">
+        <span>Current tab</span>
+        <strong id="tabTitle">Loading...</strong>
+      </section>
+
+      <p id="statusText" class="status" role="status">Ready to capture the active tab.</p>
+
+      <section id="progressPanel" class="progress-panel" aria-label="Room initialization progress" hidden>
+        <div>
+          <span id="progressLabel">Measuring</span>
+          <strong id="progressValue">0%</strong>
+        </div>
+        <span class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <span id="progressBar"></span>
+        </span>
+        <small id="progressDetail">Waiting for timing samples</small>
+      </section>
+
+      <div class="actions">
+        <button id="startButton" class="primary" type="button">Start audio</button>
+        <button id="stopButton" class="secondary" type="button">Stop</button>
+      </div>
+      <button id="openButton" class="link-button" type="button">Open Home Cinema</button>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

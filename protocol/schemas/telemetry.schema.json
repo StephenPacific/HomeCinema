@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://home-cinema.local/protocol/telemetry.schema.json",
+  "title": "Endpoint telemetry report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["endpoint_id", "observed_at_monotonic_ms", "network", "protocol", "audio"],
+  "properties": {
+    "endpoint_id": { "type": "string", "minLength": 1 },
+    "observed_at_monotonic_ms": { "type": "number", "minimum": 0 },
+    "network": { "type": "object" },
+    "protocol": { "type": "object" },
+    "audio": { "type": "object" },
+    "acoustic": { "type": ["object", "null"] }
+  }
+}

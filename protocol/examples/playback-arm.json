@@ -1,0 +1,18 @@
+{
+  "protocol_version": "1.0",
+  "message_type": "playback.arm",
+  "session_id": "session-demo",
+  "server_incarnation_id": "incarnation-demo",
+  "epoch": 8,
+  "sequence": 1,
+  "message_id": "arm-demo-8-1",
+  "sent_at_server_ms": 1783681200000,
+  "payload": {
+    "epoch": 8,
+    "effective_at_server_ms": 1783681205000,
+    "start_position_ms": 0,
+    "manifest_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "render_plan_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "minimum_buffer_lead_ms": 1000
+  }
+}

@@ -1,0 +1,189 @@
+export const ROOM_SYNC_ENGINE_VERSION = 3;
+
+export const ROOM_SYNC_POLICY = Object.freeze({
+  sampleWindow: 3,
+  maximumSampleAgeMs: 8000,
+  maximumStableSpreadMs: 12,
+  preflightTimeoutMs: 12_000,
+  lockTimeoutMs: 12_000,
+  lockToleranceMs: 10,
+  roomSafetyMarginMs: 8,
+  minimumRoomTargetMs: 100,
+  maximumRoomTargetMs: 500,
+  hardSyncErrorMs: 25,
+  recoverySyncErrorMs: 8,
+  softCorrectionGain: 0.25,
+  softCorrectionStepMs: 3,
+  quarantinedCorrectionStepMs: 12,
+  softCorrectionRampSeconds: 1.8,
+  violationSamples: 3,
+  recoverySamples: 3
+});
+
+export function supportsRoomSyncVersion(value, requiredVersion = ROOM_SYNC_ENGINE_VERSION) {
+  const version = Number(value);
+  const required = Number(requiredVersion);
+  return Number.isFinite(version) && Number.isFinite(required) && version >= required;
+}
+
+export function latestEligibleRoomSpeakers(clients, requiredVersion = ROOM_SYNC_ENGINE_VERSION) {
+  const latestByDevice = new Map();
+  for (const client of clients || []) {
+    if (client?.role !== "speaker" || !supportsRoomSyncVersion(client.syncEngineVersion, requiredVersion)) continue;
+    const identity = client.deviceKey || `socket-${client.id}`;
+    const existing = latestByDevice.get(identity);
+    if (!existing || Number(client.id) > Number(existing.id)) latestByDevice.set(identity, client);
+  }
+  return [...latestByDevice.values()].filter((client) => client.unlocked && !client.muted);
+}
+
+export function roomTimingSample({
+  at = Date.now(),
+  playoutDelayMs,
+  outputLatencyMs = 0,
+  postDelayMs = 0,
+  deviceOffsetMs = 0,
+  rtcBytesReceived = 0,
+  rtcProgress = rtcBytesReceived
+}) {
+  if (playoutDelayMs === null || playoutDelayMs === undefined || playoutDelayMs === "") return null;
+  const delay = Number(playoutDelayMs);
+  const output = Number(outputLatencyMs);
+  const postDelay = Number(postDelayMs);
+  const offset = Number(deviceOffsetMs);
+  const progress = Number(rtcProgress);
+  if (![at, delay, output, postDelay, offset, progress].every(Number.isFinite)) return null;
+  return {
+    at,
+    normalizedDelayMs: Math.max(0, delay + output + postDelay - offset),
+    rtcProgress: Math.max(0, progress)
+  };
+}
+
+export function fixedPostDelayMs({
+  roomTargetMs,
+  playoutDelayMs,
+  outputLatencyMs = 0,
+  deviceOffsetMs = 0,
+  maximumDelayMs = 1000
+}) {
+  const values = [roomTargetMs, playoutDelayMs, outputLatencyMs, deviceOffsetMs, maximumDelayMs].map(Number);
+  if (!values.every(Number.isFinite)) return null;
+  const [target, playout, output, offset, maximum] = values;
+  return clamp(target + offset - playout - output, 0, Math.max(0, maximum));
+}
+
+export function fixedTimelineErrorMs({
+  roomTargetMs,
+  playoutDelayMs,
+  outputLatencyMs = 0,
+  postDelayMs = 0,
+  deviceOffsetMs = 0
+}) {
+  const values = [roomTargetMs, playoutDelayMs, outputLatencyMs, postDelayMs, deviceOffsetMs].map(Number);
+  if (!values.every(Number.isFinite)) return null;
+  const [target, playout, output, postDelay, offset] = values;
+  return playout + output + postDelay - target - offset;
+}
+
+export function nextPostDelayCorrection({
+  currentPostDelayMs,
+  syncErrorMs,
+  maximumStepMs = ROOM_SYNC_POLICY.softCorrectionStepMs,
+  maximumDelayMs = 1000,
+  policy = ROOM_SYNC_POLICY
+}) {
+  const values = [currentPostDelayMs, syncErrorMs, maximumStepMs, maximumDelayMs].map(Number);
+  if (!values.every(Number.isFinite)) return null;
+  const [current, error, stepLimit, delayLimit] = values;
+  const boundedCurrent = clamp(current, 0, Math.max(0, delayLimit));
+  if (Math.abs(error) <= policy.recoverySyncErrorMs || stepLimit <= 0) {
+    return { delayMs: boundedCurrent, adjustmentMs: 0, saturated: false };
+  }
+
+  const requestedAdjustmentMs = -error * policy.softCorrectionGain;
+  const boundedAdjustmentMs = clamp(requestedAdjustmentMs, -stepLimit, stepLimit);
+  const delayMs = clamp(boundedCurrent + boundedAdjustmentMs, 0, Math.max(0, delayLimit));
+  const adjustmentMs = delayMs - boundedCurrent;
+  return {
+    delayMs,
+    adjustmentMs,
+    saturated: Math.abs(adjustmentMs - requestedAdjustmentMs) > 0.01
+  };
+}
+
+export function stableRoomTiming(samples, now = Date.now(), policy = ROOM_SYNC_POLICY) {
+  const window = (samples || []).filter(Boolean).slice(-policy.sampleWindow);
+  if (window.length < policy.sampleWindow) return { stable: false, delayMs: null, spreadMs: null };
+  if (now - window[window.length - 1].at > policy.maximumSampleAgeMs) {
+    return { stable: false, delayMs: null, spreadMs: null };
+  }
+
+  for (let index = 1; index < window.length; index += 1) {
+    if (window[index].at <= window[index - 1].at) return { stable: false, delayMs: null, spreadMs: null };
+    if (window[index].rtcProgress <= window[index - 1].rtcProgress) {
+      return { stable: false, delayMs: null, spreadMs: null };
+    }
+  }
+
+  const delays = window.map((sample) => sample.normalizedDelayMs);
+  const spreadMs = Math.max(...delays) - Math.min(...delays);
+  if (spreadMs > policy.maximumStableSpreadMs) return { stable: false, delayMs: null, spreadMs };
+  return { stable: true, delayMs: median(delays), spreadMs };
+}
+
+export function appendRoomTimingSample(samples, sample, policy = ROOM_SYNC_POLICY) {
+  if (!sample) return [...(samples || [])];
+  const previous = samples?.at(-1);
+  if (previous?.rtcProgress === sample.rtcProgress) return samples;
+  const base = previous && sample.rtcProgress < previous.rtcProgress ? [] : [...(samples || [])];
+  return [...base, sample].slice(-(policy.sampleWindow + 2));
+}
+
+export function fixedRoomTargetMs(stableTimings, fallbackMs = 120, policy = ROOM_SYNC_POLICY) {
+  const delays = (stableTimings || [])
+    .filter((timing) => timing?.stable && Number.isFinite(timing.delayMs))
+    .map((timing) => timing.delayMs);
+  const slowestDelayMs = delays.length ? Math.max(...delays) : Number(fallbackMs) || policy.minimumRoomTargetMs;
+  return Math.round(
+    clamp(
+      slowestDelayMs + policy.roomSafetyMarginMs,
+      policy.minimumRoomTargetMs,
+      policy.maximumRoomTargetMs
+    )
+  );
+}
+
+export function nextFixedTimelineGuard(state, syncErrorMs, policy = ROOM_SYNC_POLICY) {
+  const previous = {
+    quarantined: Boolean(state?.quarantined),
+    violationCount: Math.max(0, Number(state?.violationCount) || 0),
+    recoveryCount: Math.max(0, Number(state?.recoveryCount) || 0)
+  };
+  const error = Math.abs(Number(syncErrorMs));
+  if (!Number.isFinite(error)) return { ...previous, action: "none" };
+
+  if (!previous.quarantined) {
+    const violationCount = error > policy.hardSyncErrorMs ? previous.violationCount + 1 : 0;
+    if (violationCount >= policy.violationSamples) {
+      return { quarantined: true, violationCount, recoveryCount: 0, action: "quarantine" };
+    }
+    return { quarantined: false, violationCount, recoveryCount: 0, action: "none" };
+  }
+
+  const recoveryCount = error <= policy.recoverySyncErrorMs ? previous.recoveryCount + 1 : 0;
+  if (recoveryCount >= policy.recoverySamples) {
+    return { quarantined: false, violationCount: 0, recoveryCount, action: "rejoin" };
+  }
+  return { quarantined: true, violationCount: previous.violationCount, recoveryCount, action: "none" };
+}
+
+function median(values) {
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://home-cinema.local/protocol/commands.schema.json",
+  "title": "Phase 1 command payloads",
+  "oneOf": [
+    { "$ref": "#/$defs/preload" },
+    { "$ref": "#/$defs/arm" },
+    { "$ref": "#/$defs/cancel" },
+    { "$ref": "#/$defs/stop" },
+    { "$ref": "#/$defs/playbackStatus" }
+  ],
+  "$defs": {
+    "preload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest_hash"],
+      "properties": {
+        "manifest_hash": { "type": "string" }
+      }
+    },
+    "arm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["epoch", "effective_at_server_ms", "start_position_ms", "manifest_hash", "render_plan_hash", "minimum_buffer_lead_ms"],
+      "properties": {
+        "epoch": { "type": "integer", "minimum": 1 },
+        "effective_at_server_ms": { "type": "number", "minimum": 0 },
+        "start_position_ms": { "type": "integer", "minimum": 0 },
+        "manifest_hash": { "type": "string" },
+        "render_plan_hash": { "type": "string" },
+        "minimum_buffer_lead_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "cancel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason"],
+      "properties": { "reason": { "type": "string", "minLength": 1 } }
+    },
+    "stop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timeline_position_ms"],
+      "properties": { "timeline_position_ms": { "type": "integer", "minimum": 0 } }
+    },
+    "playbackStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "epoch", "clock_confidence"],
+      "properties": {
+        "status": { "enum": ["ARMED", "PLAYING", "DEGRADED", "NACK"] },
+        "epoch": { "type": "integer", "minimum": 0 },
+        "estimated_start_error_ms": { "type": ["number", "null"] },
+        "clock_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "reason": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

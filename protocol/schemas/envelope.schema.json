@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://home-cinema.local/protocol/envelope.schema.json",
+  "title": "Protocol envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "session_id",
+    "server_incarnation_id",
+    "epoch",
+    "sequence",
+    "message_id",
+    "sent_at_server_ms",
+    "payload"
+  ],
+  "properties": {
+    "protocol_version": { "const": "1.0" },
+    "message_type": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+    },
+    "session_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "server_incarnation_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "epoch": { "type": "integer", "minimum": 0 },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "message_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "sent_at_server_ms": { "type": "number", "minimum": 0 },
+    "payload": { "type": "object" }
+  }
+}

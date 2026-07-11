@@ -1,0 +1,22 @@
+{
+  "protocol_version": "1.0",
+  "message_type": "session.snapshot",
+  "session_id": "session-demo",
+  "server_incarnation_id": "incarnation-demo",
+  "epoch": 0,
+  "sequence": 0,
+  "message_id": "snapshot-demo-1",
+  "sent_at_server_ms": 1783681199000,
+  "payload": {
+    "session_id": "session-demo",
+    "server_incarnation_id": "incarnation-demo",
+    "epoch": 0,
+    "sequence": 0,
+    "state": "READY",
+    "manifest_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "render_plan_hash": null,
+    "timeline_position_ms": 0,
+    "effective_at_server_ms": null,
+    "revision": 3
+  }
+}

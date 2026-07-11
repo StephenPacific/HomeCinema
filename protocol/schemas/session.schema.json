@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://home-cinema.local/protocol/session.schema.json",
+  "title": "Session snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "session_id",
+    "server_incarnation_id",
+    "epoch",
+    "sequence",
+    "state",
+    "timeline_position_ms",
+    "revision"
+  ],
+  "properties": {
+    "session_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "server_incarnation_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "epoch": { "type": "integer", "minimum": 0 },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "state": {
+      "enum": ["IDLE", "PRELOADING", "READY", "ARMED", "PLAYING", "PAUSED", "STOPPED", "DEGRADED"]
+    },
+    "manifest_hash": { "type": ["string", "null"] },
+    "render_plan_hash": { "type": ["string", "null"] },
+    "timeline_position_ms": { "type": "integer", "minimum": 0 },
+    "effective_at_server_ms": { "type": ["number", "null"], "minimum": 0 },
+    "revision": { "type": "integer", "minimum": 0 }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://home-cinema.local/protocol/endpoint.schema.json",
+  "title": "Endpoint status",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["endpoint_id", "state", "capability_role", "audio_unlocked", "page_visible"],
+  "properties": {
+    "endpoint_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "state": {
+      "enum": ["DISCOVERED", "JOINED", "CALIBRATING", "PRELOADING", "READY", "ARMING", "ARMED", "PLAYING", "DEGRADED", "REJOINING"]
+    },
+    "capability_role": { "enum": ["FOREGROUND_CAPABLE", "AMBIENCE_CAPABLE", "CONTROL_ONLY"] },
+    "audio_unlocked": { "type": "boolean" },
+    "page_visible": { "type": "boolean" },
+    "manifest_hash": { "type": ["string", "null"] },
+    "clock_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "audio_context_state": { "type": ["string", "null"] }
+  }
+}
