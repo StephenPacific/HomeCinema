@@ -135,7 +135,7 @@ test("capture reconnect keeps the tab stream alive until the user stops it", asy
   assert.equal(trackStopCount, 1);
 });
 
-test("capture output stays muted through measuring and locking, then arms once", async () => {
+test("capture output stays muted through locking, then arms once at Controller volume", async () => {
   const source = await readFile(new URL("../extension/offscreen.js", import.meta.url), "utf8");
   const sockets = [];
   const gainEvents = [];
@@ -258,6 +258,9 @@ test("capture output stays muted through measuring and locking, then arms once",
   emitState("liveLock", { id: "live-1", transport: "webrtc", phase: "locking", roomTargetMs: 155 });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(gainEvents.some((event) => event.type === "ramp" && event.value === 1), false);
+  sockets[0].emit("message", {
+    data: JSON.stringify({ type: "deviceCommand", action: "setVolume", value: 0.4 })
+  });
 
   emitState("liveArm", {
     id: "live-1",
@@ -267,5 +270,6 @@ test("capture output stays muted through measuring and locking, then arms once",
     playAt: 2000
   });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(gainEvents.filter((event) => event.type === "ramp" && event.value === 1).length, 1);
+  assert.equal(gainEvents.filter((event) => event.type === "ramp" && event.value === 0.4).length, 1);
+  assert.equal(gainEvents.some((event) => event.type === "ramp" && event.value === 1), false);
 });

@@ -388,13 +388,16 @@ function handleMessage(client, message) {
     client.name = String(message.name || client.name).slice(0, 40);
     client.deviceKey = String(message.deviceKey || client.deviceKey || "").slice(0, 120) || null;
     client.role = message.role === "controller" ? "controller" : message.role === "capture" ? "capture" : "speaker";
-    if (client.role === "speaker" && !client.volumeAnnounced) {
-      const savedVolume = client.deviceKey ? speakerVolumes.get(client.deviceKey) : null;
+    const acceptsRoomVolume = client.role === "speaker" || client.role === "capture";
+    if (acceptsRoomVolume && !client.volumeAnnounced) {
+      const savedVolume = client.role === "speaker" && client.deviceKey
+        ? speakerVolumes.get(client.deviceKey)
+        : null;
       client.volume = Number.isFinite(savedVolume) ? savedVolume : state.roomVolume;
-      if (client.deviceKey) speakerVolumes.set(client.deviceKey, client.volume);
+      if (client.role === "speaker" && client.deviceKey) speakerVolumes.set(client.deviceKey, client.volume);
       client.volumeAnnounced = true;
       send(client, { type: "deviceCommand", action: "setVolume", value: client.volume });
-    } else if (client.role !== "speaker") {
+    } else if (!acceptsRoomVolume) {
       client.volumeAnnounced = false;
     }
     client.layerId = message.layerId || client.layerId;
@@ -531,9 +534,9 @@ function handleMessage(client, message) {
       state.roomVolume = clamp(finiteNumber(message.value, state.roomVolume), 0, 1);
       state.updatedAt = Date.now();
       for (const target of clients) {
-        if (target.role !== "speaker") continue;
+        if (target.role !== "speaker" && target.role !== "capture") continue;
         target.volume = state.roomVolume;
-        if (target.deviceKey) speakerVolumes.set(target.deviceKey, target.volume);
+        if (target.role === "speaker" && target.deviceKey) speakerVolumes.set(target.deviceKey, target.volume);
         send(target, { type: "deviceCommand", action: "setVolume", value: target.volume, requestedBy: client.name });
       }
       broadcast({ type: "sync", serverTime: Date.now(), state: publicState() });

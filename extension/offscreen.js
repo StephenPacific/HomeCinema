@@ -7,6 +7,7 @@ const state = {
   audioContext: null,
   localDelay: null,
   localGain: null,
+  localVolume: 1,
   localDelayMs: 0,
   localOutputLatencySeconds: 0,
   controllerAudioTimer: null,
@@ -139,6 +140,10 @@ function connectCaptureSocket() {
       try {
         socket.close();
       } catch {}
+      return;
+    }
+    if (message.type === "deviceCommand" && message.action === "setVolume") {
+      setLocalVolume(message.value);
       return;
     }
     if (message.type === "liveStart" && message.state?.live?.transport === "webrtc") {
@@ -375,7 +380,7 @@ async function armLocalPlayback(stream, delayMs, startDelayMs) {
   gain.gain.cancelScheduledValues(now);
   gain.gain.setValueAtTime(0, now);
   gain.gain.setValueAtTime(0, unmuteAt);
-  gain.gain.linearRampToValueAtTime(1, unmuteAt + 0.04);
+  gain.gain.linearRampToValueAtTime(state.localVolume, unmuteAt + 0.04);
 }
 
 function setLocalDelay(delayMs) {
@@ -500,6 +505,38 @@ function muteLocalPlayback() {
   state.localGain.gain.setValueAtTime(0, now);
 }
 
+function setLocalVolume(value) {
+  state.localVolume = Math.max(0, Math.min(1, Number(value) || 0));
+  const audioContext = state.audioContext;
+  const gain = state.localGain;
+  if (!audioContext || !gain) return;
+
+  if (state.livePhase === "armed" && state.unmuteAt > Date.now()) {
+    const now = audioContext.currentTime;
+    const unmuteAt = now + Math.max(
+      0,
+      (state.unmuteAt - Date.now()) / 1000 - Number(state.localOutputLatencySeconds || 0)
+    );
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.setValueAtTime(0, unmuteAt);
+    gain.gain.linearRampToValueAtTime(state.localVolume, unmuteAt + 0.04);
+    return;
+  }
+  if (state.livePhase !== "playing") return;
+
+  const now = audioContext.currentTime;
+  const parameter = gain.gain;
+  if (typeof parameter.cancelAndHoldAtTime === "function") {
+    parameter.cancelAndHoldAtTime(now);
+  } else {
+    const currentValue = Number.isFinite(parameter.value) ? parameter.value : state.localVolume;
+    parameter.cancelScheduledValues(now);
+    parameter.setValueAtTime(currentValue, now);
+  }
+  parameter.linearRampToValueAtTime(state.localVolume, now + 0.06);
+}
+
 function updateCaptureStatus() {
   if (!state.stream || !state.socket) return;
   if (state.livePhase === "measuring") {
@@ -606,6 +643,7 @@ function finishCapture(status, notifyServer = true) {
   state.phaseBlocked = false;
   state.lockAttempt = 0;
   state.maximumLockAttempts = 3;
+  state.localVolume = 1;
   resetControllerAudioMonitor();
   for (const peerId of [...state.peers.keys()]) closeWebRtcPeer(peerId);
   if (socket && socket.readyState === WebSocket.OPEN && notifyServer) {
