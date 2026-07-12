@@ -2,6 +2,12 @@ import { Copy, Pause, Play, Radio, RefreshCw, RotateCw, Square, Upload, Volume2,
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { configurePlaybackAudioSession, readAudioSession } from "./audioSession.js";
 import {
+  captureRtcSnapshot,
+  DEVICE_HEALTH_POLICY,
+  fastFuseReason,
+  rtcWindowMetrics
+} from "./deviceHealth.js";
+import {
   expectedLivePositionSeconds,
   LIVE_SYNC_POLICY,
   liveDriftCorrection,
@@ -62,6 +68,8 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [serverState, setServerState] = useState(EMPTY_STATE);
   const [peers, setPeers] = useState([]);
+  const [roomDiagnosticState, setRoomDiagnosticState] = useState(null);
+  const [incidentLogState, setIncidentLogState] = useState([]);
   const [joinOptions, setJoinOptions] = useState([]);
   const [selectedJoinUrl, setSelectedJoinUrl] = useState("");
   const [controllerMonitorOpen, setControllerMonitorOpen] = useState(true);
@@ -133,6 +141,18 @@ export default function App() {
   const rtcBytesReceivedRef = useRef(0);
   const rtcEmittedCountRef = useRef(0);
   const rtcAudioLevelRef = useRef(null);
+  const rtcJitterRef = useRef(null);
+  const rtcPacketsReceivedRef = useRef(0);
+  const rtcPacketsLostRef = useRef(0);
+  const rtcConcealedRef = useRef(0);
+  const rtcTotalSamplesRef = useRef(0);
+  const rtcPacketLossRateRef = useRef(null);
+  const rtcConcealmentRateRef = useRef(null);
+  const rtcRtpStallRef = useRef(0);
+  const rtcConnectionStateRef = useRef("idle");
+  const rawSyncErrorRef = useRef(null);
+  const outputLatencyDeltaRef = useRef(0);
+  const fastFuseReasonRef = useRef("");
   const audioBufferRef = useRef(null);
   const sourceRef = useRef(null);
   const activeSourcesRef = useRef(new Set());
@@ -163,12 +183,16 @@ export default function App() {
   const liveActive = Boolean(serverState.live?.id);
   const speakerPeers = peers.filter((peer) => peer.role === "speaker");
   const capturePeer = peers.find((peer) => peer.role === "capture") || null;
+  const monitoredPeers = [capturePeer, ...speakerPeers].filter(Boolean);
   const controllerMetrics = capturePeer?.controllerAudioMetrics || null;
   const controllerOutputHealth = controllerAudioHealth(controllerMetrics);
   const speakerCount = speakerPeers.length;
   const activeSpeakerCount = speakerPeers.filter((peer) => peer.ready && !peer.muted).length;
   const stoppedSpeakerCount = speakerPeers.filter((peer) => peer.muted).length;
-  const issueSpeakerCount = speakerPeers.filter((peer) => ["failed", "needs-action"].includes(peer.health)).length;
+  const issueSpeakerCount = speakerPeers.filter((peer) =>
+    ["failed", "needs-action"].includes(peer.health) ||
+    ["warning", "critical", "repairing"].includes(peer.diagnostic?.overall?.state)
+  ).length;
   const retryableSpeakerCount = speakerPeers.filter((peer) => peer.health === "failed").length;
   const allSpeakersMuted = speakerCount > 0 && stoppedSpeakerCount === speakerCount;
   const livePhase = serverState.live?.phase || (liveActive ? "playing" : "idle");
@@ -286,6 +310,18 @@ export default function App() {
       rtcBytesReceived: rtcBytesReceivedRef.current,
       rtcEmittedCount: rtcEmittedCountRef.current,
       rtcAudioLevel: rtcAudioLevelRef.current,
+      rtcJitterMs: rtcJitterRef.current,
+      rtcPacketsReceived: rtcPacketsReceivedRef.current,
+      rtcPacketsLost: rtcPacketsLostRef.current,
+      rtcConcealedSamples: rtcConcealedRef.current,
+      rtcTotalSamplesReceived: rtcTotalSamplesRef.current,
+      rtcPacketLossRate: rtcPacketLossRateRef.current,
+      rtcConcealmentRate: rtcConcealmentRateRef.current,
+      rtcRtpStallMs: rtcRtpStallRef.current,
+      rtcConnectionState: rtcConnectionStateRef.current,
+      rawSyncErrorMs: rawSyncErrorRef.current,
+      outputLatencyDeltaMs: outputLatencyDeltaRef.current,
+      fastFuseReason: fastFuseReasonRef.current,
       timelineState,
       syncEngineVersion: ROOM_SYNC_ENGINE_VERSION
     });
@@ -527,7 +563,7 @@ export default function App() {
   }, [rampLiveOutput]);
 
   const quarantineWebRtcOutput = useCallback(
-    (session, status = "Recovering synchronization") => {
+    (session, status = "Recovering synchronization", fadeSeconds = ROOM_SYNC_POLICY.quarantineFadeSeconds) => {
       if (!session || session.closed) return;
       clearTimeout(session.volumeTimer);
       clearTimeout(session.joinTimer);
@@ -544,7 +580,7 @@ export default function App() {
         violationCount: session.timelineGuard?.violationCount || 0,
         recoveryCount: 0
       };
-      rampLiveOutput(0, ROOM_SYNC_POLICY.quarantineFadeSeconds);
+      rampLiveOutput(0, fadeSeconds);
       setReadyStatus(status);
       reportStatusSoon();
     },
@@ -773,6 +809,18 @@ export default function App() {
     rtcBytesReceivedRef.current = 0;
     rtcEmittedCountRef.current = 0;
     rtcAudioLevelRef.current = null;
+    rtcJitterRef.current = null;
+    rtcPacketsReceivedRef.current = 0;
+    rtcPacketsLostRef.current = 0;
+    rtcConcealedRef.current = 0;
+    rtcTotalSamplesRef.current = 0;
+    rtcPacketLossRateRef.current = null;
+    rtcConcealmentRateRef.current = null;
+    rtcRtpStallRef.current = 0;
+    rtcConnectionStateRef.current = "idle";
+    rawSyncErrorRef.current = null;
+    outputLatencyDeltaRef.current = 0;
+    fastFuseReasonRef.current = "";
     setDriftState(null);
     setRtcJitterState(null);
     setRtcPlayoutDelayState(null);
@@ -840,6 +888,9 @@ export default function App() {
         lockAttempt: Number(live.lockAttempt || 0),
         measuredJitterDelayMs: null,
         lastInboundStats: null,
+        lastRtpProgressAt: Date.now(),
+        lastOutputLatencyMs: null,
+        fastFuseReason: null,
         unmuteAtLocalMs: null,
         joinTimer: null,
         volumeTimer: null,
@@ -1171,6 +1222,7 @@ export default function App() {
       const connection = new RTCPeerConnection({ iceServers: [] });
       session.peerConnection = connection;
       session.remotePeerId = remotePeerId;
+      rtcConnectionStateRef.current = connection.connectionState || "new";
 
       connection.addEventListener("icecandidate", (event) => {
         if (!event.candidate || session.closed) return;
@@ -1241,6 +1293,8 @@ export default function App() {
 
       connection.addEventListener("connectionstatechange", () => {
         if (liveSessionRef.current !== session || session.closed) return;
+        rtcConnectionStateRef.current = connection.connectionState || "unknown";
+        reportStatusSoon();
         if (connection.connectionState === "connected") {
           clearTimeout(session.disconnectTimer);
           session.disconnectTimer = null;
@@ -1276,13 +1330,17 @@ export default function App() {
               !session.closed &&
               connection.connectionState === "disconnected"
             ) {
-              quarantineWebRtcOutput(session, "Connection interrupted; recovering");
+              session.fastFuseReason = "RTP_STALLED";
+              fastFuseReasonRef.current = session.fastFuseReason;
+              quarantineWebRtcOutput(session, "Isolated: connection interrupted", 0.08);
             }
-          }, 1_000);
+          }, DEVICE_HEALTH_POLICY.fastFuseRtpStallMs);
         } else if (connection.connectionState === "failed") {
           clearTimeout(session.disconnectTimer);
           session.disconnectTimer = null;
-          quarantineWebRtcOutput(session, "WebRTC connection failed");
+          session.fastFuseReason = "WEBRTC_FAILED";
+          fastFuseReasonRef.current = session.fastFuseReason;
+          quarantineWebRtcOutput(session, "Isolated: WebRTC connection failed", 0.08);
           setAudioIssueState("The direct audio path could not be established on this network.");
         }
       });
@@ -1296,16 +1354,68 @@ export default function App() {
           for (const report of stats.values()) {
             const mediaKind = report.kind || report.mediaType;
             if (report.type !== "inbound-rtp" || mediaKind !== "audio") continue;
-            setRtcJitterState(Math.round(Number(report.jitter || 0) * 1000));
-            setRtcPacketsLostState(Math.max(0, Number(report.packetsLost || 0)));
-            setRtcConcealedState(Math.max(0, Number(report.concealedSamples || 0)));
-            rtcBytesReceivedRef.current = Math.max(0, Number(report.bytesReceived || 0));
-            rtcEmittedCountRef.current = Math.max(0, Number(report.jitterBufferEmittedCount || 0));
+            const sampledAt = Date.now();
+            const previousInboundStats = session.lastInboundStats;
+            const currentInboundStats = captureRtcSnapshot(report);
+            const healthWindow = rtcWindowMetrics(currentInboundStats, previousInboundStats, {
+              now: sampledAt,
+              lastProgressAt: session.lastRtpProgressAt
+            });
+            session.lastInboundStats = currentInboundStats;
+            session.lastRtpProgressAt = healthWindow.lastProgressAt;
+
+            rtcJitterRef.current = healthWindow.jitterMs;
+            rtcPacketsReceivedRef.current = Math.max(0, Number(currentInboundStats.packetsReceived || 0));
+            rtcPacketsLostRef.current = Math.max(0, Number(currentInboundStats.packetsLost || 0));
+            rtcConcealedRef.current = Math.max(0, Number(currentInboundStats.concealedSamples || 0));
+            rtcTotalSamplesRef.current = Math.max(0, Number(currentInboundStats.totalSamplesReceived || 0));
+            rtcPacketLossRateRef.current = healthWindow.packetLossRate;
+            rtcConcealmentRateRef.current = healthWindow.concealmentRate;
+            rtcRtpStallRef.current = healthWindow.rtpStallMs;
+            rtcBytesReceivedRef.current = Math.max(0, Number(currentInboundStats.bytesReceived || 0));
+            rtcEmittedCountRef.current = Math.max(0, Number(currentInboundStats.jitterBufferEmittedCount || 0));
+            setRtcJitterState(healthWindow.jitterMs === null ? null : Math.round(healthWindow.jitterMs));
+            setRtcPacketsLostState(rtcPacketsLostRef.current);
+            setRtcConcealedState(rtcConcealedRef.current);
             const audioLevel = Number(report.audioLevel);
             rtcAudioLevelRef.current = Number.isFinite(audioLevel) ? clamp(audioLevel, 0, 1) : null;
 
-            const delaySample = webRtcPlayoutDelaySample(report, session.lastInboundStats);
-            session.lastInboundStats = captureWebRtcDelayStats(report);
+            const currentOutputLatencyMs = Math.round(estimateOutputLatencySeconds(audioContextRef.current) * 1000);
+            outputLatencyDeltaRef.current = Number.isFinite(session.lastOutputLatencyMs)
+              ? currentOutputLatencyMs - session.lastOutputLatencyMs
+              : 0;
+            session.lastOutputLatencyMs = currentOutputLatencyMs;
+            outputLatencyRef.current = currentOutputLatencyMs;
+            setOutputLatencyState(currentOutputLatencyMs);
+
+            const fastFuseMetrics = {
+              active: session.phase === "playing",
+              muted: remoteMutedRef.current,
+              connectionState: connection.connectionState,
+              audioContextState: audioContextRef.current?.state || "none",
+              requiresAudioContext: liveOutputModeRef.current.endsWith("source"),
+              rtpStallMs: healthWindow.rtpStallMs,
+              outputLatencyDeltaMs: outputLatencyDeltaRef.current,
+              packetLossRate: healthWindow.packetLossRate,
+              packetSampleCount: healthWindow.packetSampleCount,
+              concealmentRate: healthWindow.concealmentRate,
+              totalSamplesDelta: healthWindow.totalSamplesDelta
+            };
+            let fuse = fastFuseReason(fastFuseMetrics);
+            if (fuse) {
+              session.fastFuseReason = fuse.code;
+              fastFuseReasonRef.current = fuse.code;
+              if (!session.timelineGuard?.quarantined) {
+                correctionCountRef.current += 1;
+                setCorrectionCountState(correctionCountRef.current);
+                setLastCorrectionState(`Fast Fuse: ${fuse.label}`);
+                quarantineWebRtcOutput(session, `Isolated: ${fuse.label}`, 0.08);
+                reportStatusSoon();
+                continue;
+              }
+            }
+
+            const delaySample = webRtcPlayoutDelaySample(currentInboundStats, previousInboundStats);
             if (!delaySample || !Number.isFinite(delaySample.actualDelayMs)) {
               reportStatusSoon();
               continue;
@@ -1348,7 +1458,25 @@ export default function App() {
               deviceOffsetMs: deviceOffsetRef.current
             }));
             syncErrorRef.current = syncErrorMs;
+            rawSyncErrorRef.current = rawSyncErrorMs;
             setDriftState(syncErrorMs);
+
+            fuse = fastFuseReason({
+              ...fastFuseMetrics,
+              rawSyncErrorMs
+            });
+            if (fuse) {
+              session.fastFuseReason = fuse.code;
+              fastFuseReasonRef.current = fuse.code;
+              if (!session.timelineGuard?.quarantined) {
+                correctionCountRef.current += 1;
+                setCorrectionCountState(correctionCountRef.current);
+                setLastCorrectionState(`Fast Fuse: ${fuse.label}`);
+                quarantineWebRtcOutput(session, `Isolated: ${fuse.label}`, 0.08);
+                reportStatusSoon();
+                continue;
+              }
+            }
 
             if (session.rejoining && Math.abs(syncErrorMs) > ROOM_SYNC_POLICY.recoverySyncErrorMs) {
               setLastCorrectionState(`Rejoin canceled ${syncErrorMs >= 0 ? "+" : ""}${syncErrorMs} ms`);
@@ -1412,7 +1540,10 @@ export default function App() {
               }
 
               const guardErrorMs = roomGuardError({ smoothedErrorMs: syncErrorMs, rawErrorMs: rawSyncErrorMs });
-              const nextGuard = nextFixedTimelineGuard(session.timelineGuard, guardErrorMs);
+              const recoveryGuardErrorMs = fuse && session.timelineGuard?.quarantined
+                ? Math.max(ROOM_SYNC_POLICY.hardSyncErrorMs + 1, Math.abs(guardErrorMs))
+                : guardErrorMs;
+              const nextGuard = nextFixedTimelineGuard(session.timelineGuard, recoveryGuardErrorMs);
               session.timelineGuard = nextGuard;
               if (nextGuard.action === "quarantine") {
                 correctionCountRef.current += 1;
@@ -1420,6 +1551,8 @@ export default function App() {
                 setLastCorrectionState(`Output isolated ${guardErrorMs >= 0 ? "+" : ""}${guardErrorMs} ms`);
                 quarantineWebRtcOutput(session);
               } else if (nextGuard.action === "rejoin") {
+                session.fastFuseReason = null;
+                fastFuseReasonRef.current = "";
                 session.initialParticipant = true;
                 session.rejoining = true;
                 const sharedStartLocalMs = session.playAtServerMs - serverOffsetRef.current;
@@ -1546,6 +1679,12 @@ export default function App() {
           }
           setAudioIssueState("");
         } else if (contextCarriesLiveAudio && document.visibilityState === "visible") {
+          const liveSession = liveSessionRef.current;
+          if (liveSession?.phase === "playing" && !liveSession.timelineGuard?.quarantined) {
+            liveSession.fastFuseReason = "AUDIO_ENGINE_STOPPED";
+            fastFuseReasonRef.current = liveSession.fastFuseReason;
+            quarantineWebRtcOutput(liveSession, "Isolated: audio engine stopped", 0.08);
+          }
           unlockedRef.current = false;
           setUnlockedState(false);
           setReadyStatus("Tap to resume audio");
@@ -1559,7 +1698,7 @@ export default function App() {
     outputLatencyRef.current = outputLatencyMs;
     setOutputLatencyState(outputLatencyMs);
     return audioContextRef.current;
-  }, [applyPlaybackAudioSession, rampLiveOutput, reportStatusSoon, restoreLiveOutput]);
+  }, [applyPlaybackAudioSession, quarantineWebRtcOutput, rampLiveOutput, reportStatusSoon, restoreLiveOutput]);
 
   const ensureAudioContext = useCallback(async ({ resume = true } = {}) => {
     const audioContext = createAudioContext();
@@ -1956,6 +2095,8 @@ export default function App() {
         clientIdRef.current = message.id;
         applyState(message.state);
         setPeers(message.peers || []);
+        setRoomDiagnosticState(message.roomDiagnostic || null);
+        setIncidentLogState(message.incidents || []);
         reportStatusSoon();
         return;
       }
@@ -1965,6 +2106,8 @@ export default function App() {
       }
       if (message.type === "peers") {
         setPeers(message.peers || []);
+        setRoomDiagnosticState(message.roomDiagnostic || null);
+        setIncidentLogState(message.incidents || []);
         return;
       }
       if (message.type === "testTone") {
@@ -3011,6 +3154,11 @@ export default function App() {
                 />
                 <strong>{Math.round(roomVolume * 100)}%</strong>
               </div>
+              <DeviceHealthMonitor
+                devices={monitoredPeers}
+                roomDiagnostic={roomDiagnosticState}
+                incidents={incidentLogState}
+              />
               <div className="peers">
                 {!speakerPeers.length && <div className="empty-state">Waiting for speakers to join…</div>}
                 {speakerPeers.map((peer) => (
@@ -3211,12 +3359,91 @@ function QrCode({ value }) {
   );
 }
 
+function DeviceHealthMonitor({ devices, roomDiagnostic, incidents }) {
+  const roomState = roomDiagnostic?.state || "healthy";
+  const roomLabel = roomDiagnostic?.label || (devices.length ? "Collecting device health" : "Room ready");
+  return (
+    <section className="device-health-monitor" aria-label="Room device health">
+      <div className={`device-health-summary ${roomState}`}>
+        <div>
+          <span>Room health</span>
+          <strong>{roomLabel}</strong>
+        </div>
+        <span className="health-live-label">Live diagnosis</span>
+      </div>
+
+      <div className="device-health-table" role="table" aria-label="Connection, audio, and synchronization health">
+        <div className="device-health-row device-health-header" role="row">
+          <span role="columnheader">Device</span>
+          <span role="columnheader">Connection</span>
+          <span role="columnheader">Audio</span>
+          <span role="columnheader">Sync</span>
+          <span role="columnheader">Current action</span>
+        </div>
+        {!devices.length && <div className="device-health-empty">Waiting for device telemetry...</div>}
+        {devices.map((device) => {
+          const diagnostic = device.diagnostic;
+          return (
+            <div className="device-health-row" role="row" key={`${device.role}-${device.id}`}>
+              <div className="device-health-name" role="cell">
+                <strong>{device.role === "capture" ? "Controller output" : device.name}</strong>
+                <span>{device.role === "capture" ? "Source computer" : zoneNames[device.zone] || "Speaker"}</span>
+              </div>
+              <HealthLayerCell layer={diagnostic?.connection} fallback="Online" />
+              <HealthLayerCell layer={diagnostic?.audio} fallback="Waiting" />
+              <HealthLayerCell layer={diagnostic?.sync} fallback="Idle" />
+              <div className="device-health-action" role="cell">
+                <strong>{diagnostic?.overall?.action || "Collecting"}</strong>
+                <span>{diagnostic?.overall?.reason || device.status || "Waiting for telemetry"}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <details className="device-health-events">
+        <summary>
+          <span>Recent events</span>
+          <span>{incidents.length}</span>
+        </summary>
+        <div className="device-health-event-list">
+          {!incidents.length && <span className="device-health-no-events">No health incidents in this session.</span>}
+          {incidents.slice(0, 8).map((incident) => (
+            <div className={`device-health-event ${incident.state || "healthy"}`} key={incident.id}>
+              <time>{formatIncidentTime(incident.at)}</time>
+              <strong>{incident.deviceName === "Chrome tab capture" ? "Controller output" : incident.deviceName}</strong>
+              <span>{incident.label}</span>
+            </div>
+          ))}
+        </div>
+      </details>
+    </section>
+  );
+}
+
+function HealthLayerCell({ layer, fallback }) {
+  const state = layer?.state || "unknown";
+  return (
+    <div className={`device-health-layer ${state}`} role="cell" title={layer?.reason || layer?.label || fallback}>
+      <span aria-hidden="true" />
+      <strong>{layer?.label || fallback}</strong>
+    </div>
+  );
+}
+
+function formatIncidentTime(value) {
+  const date = new Date(Number(value));
+  if (Number.isNaN(date.getTime())) return "--:--:--";
+  return date.toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
 function PeerCard({ peer, layers, onTest, onToggle, onReconnect, onOffset, onVolume }) {
   const layer = layerById(layers, peer.layerId);
   const offset = Math.round(Number(peer.deviceOffsetMs) || 0);
   const volume = clamp(Number(peer.volume ?? 1), 0, 1);
   const health = peer.muted ? "stopped" : peer.health || (peer.ready ? "ready" : peer.unlocked ? "connecting" : "locked");
-  const hasIssue = health === "failed";
+  const diagnosticState = peer.diagnostic?.overall?.state;
+  const hasIssue = health === "failed" || diagnosticState === "critical";
   const needsTap = health === "locked" || health === "needs-action";
   const refreshRequired = /refresh speaker page/i.test(peer.status || "");
   const recovering = /recovering|relocking|synchronizing|missed start|room restart/i.test(peer.status || "");
@@ -3229,7 +3456,18 @@ function PeerCard({ peer, layers, onTest, onToggle, onReconnect, onOffset, onVol
     "needs-action": "Needs tap",
     connecting: "Connecting"
   }[health] || "Connecting";
-  const displayStatus = refreshRequired ? "Refresh" : recovering ? "Recovering" : measuring ? "Measuring" : status;
+  const diagnosticStatus = ["warning", "critical", "repairing"].includes(diagnosticState)
+    ? peer.diagnostic.overall.label
+    : null;
+  const displayStatus = refreshRequired
+    ? "Refresh"
+    : diagnosticStatus
+      ? diagnosticStatus
+      : recovering
+        ? "Recovering"
+        : measuring
+          ? "Measuring"
+          : status;
   return (
     <div className={`peer-card ${peer.muted ? "is-muted" : ""} ${hasIssue ? "has-issue" : ""}`}>
       <div className="peer-head">
@@ -3367,15 +3605,6 @@ function deriveDeviceHealth({ role, status, muted, unlocked, live, hasLayer, aud
   if (live) return normalizedStatus.startsWith("receiving ") ? "ready" : "connecting";
   if (!hasLayer || audioReady) return "ready";
   return "connecting";
-}
-
-function captureWebRtcDelayStats(report) {
-  return {
-    jitterBufferEmittedCount: report.jitterBufferEmittedCount,
-    jitterBufferDelay: report.jitterBufferDelay,
-    jitterBufferTargetDelay: report.jitterBufferTargetDelay,
-    jitterBufferMinimumDelay: report.jitterBufferMinimumDelay
-  };
 }
 
 function playerJoinUrl(url) {

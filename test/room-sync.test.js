@@ -59,16 +59,17 @@ test("room sync version rejects stale speaker pages", () => {
   assert.equal(supportsRoomSyncVersion(undefined), false);
   assert.equal(supportsRoomSyncVersion(2), false);
   assert.equal(supportsRoomSyncVersion(3), false);
-  assert.equal(supportsRoomSyncVersion(4), true);
+  assert.equal(supportsRoomSyncVersion(4), false);
+  assert.equal(supportsRoomSyncVersion(5), true);
 });
 
 test("room candidates reject old engines and keep only the newest connection per device", () => {
   const candidates = latestEligibleRoomSpeakers([
-    { id: 1, role: "speaker", deviceKey: "living-room", syncEngineVersion: 4, unlocked: true, muted: false },
-    { id: 2, role: "speaker", deviceKey: "living-room", syncEngineVersion: 4, unlocked: true, muted: false },
+    { id: 1, role: "speaker", deviceKey: "living-room", syncEngineVersion: 5, unlocked: true, muted: false },
+    { id: 2, role: "speaker", deviceKey: "living-room", syncEngineVersion: 5, unlocked: true, muted: false },
     { id: 3, role: "speaker", deviceKey: "old-page", syncEngineVersion: 3, unlocked: true, muted: false },
-    { id: 4, role: "speaker", deviceKey: "muted", syncEngineVersion: 4, unlocked: true, muted: true },
-    { id: 5, role: "controller", deviceKey: "controller", syncEngineVersion: 4, unlocked: true, muted: false }
+    { id: 4, role: "speaker", deviceKey: "muted", syncEngineVersion: 5, unlocked: true, muted: true },
+    { id: 5, role: "controller", deviceKey: "controller", syncEngineVersion: 5, unlocked: true, muted: false }
   ]);
   assert.deepEqual(candidates.map((client) => client.id), [2]);
 });
@@ -170,9 +171,10 @@ test("fast monitoring does not accelerate audible correction", () => {
 });
 
 test("recovery envelope favors fast isolation and a slower verified return", () => {
-  assert.equal(ROOM_SYNC_POLICY.monitorIntervalMs, 500);
+  assert.equal(ROOM_SYNC_POLICY.monitorIntervalMs, 250);
+  assert.equal(ROOM_SYNC_POLICY.silentCorrectionIntervalMs, 500);
   assert.equal(ROOM_SYNC_POLICY.quarantineFadeSeconds, 0.12);
-  assert.equal(ROOM_SYNC_POLICY.recoverySamples, 6);
+  assert.equal(ROOM_SYNC_POLICY.recoverySamples, 12);
   assert.equal(ROOM_SYNC_POLICY.rejoinLeadMs, 1_200);
   assert.equal(ROOM_SYNC_POLICY.rejoinFadeSeconds, 0.65);
 });
@@ -185,7 +187,7 @@ test("fixed timeline quarantines sustained drift and rejoins only after sustaine
   assert.equal(guard.action, "quarantine");
   assert.equal(guard.quarantined, true);
 
-  for (const error of [5, 7, 4, 6, 3]) {
+  for (const error of [5, 7, 4, 6, 3, 5, 4, 3, 6, 2, 7]) {
     guard = nextFixedTimelineGuard(guard, error);
     assert.equal(guard.action, "none");
   }

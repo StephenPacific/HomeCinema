@@ -2,7 +2,7 @@ import { canonicalControllerServiceUrl } from "./server-url.js";
 
 const WEBRTC_TARGET_BUFFER_MS = 120;
 const CONTROLLER_AUDIO_SAMPLE_INTERVAL_MS = 500;
-const CONTROLLER_AUDIO_REPORT_INTERVAL_MS = 2000;
+const CONTROLLER_AUDIO_REPORT_INTERVAL_MS = 500;
 const CONTROLLER_AUDIO_WINDOW_MS = 30_000;
 
 const state = {

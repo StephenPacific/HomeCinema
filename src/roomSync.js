@@ -1,4 +1,4 @@
-export const ROOM_SYNC_ENGINE_VERSION = 4;
+export const ROOM_SYNC_ENGINE_VERSION = 5;
 
 export const ROOM_SYNC_POLICY = Object.freeze({
   sampleWindow: 3,
@@ -11,7 +11,8 @@ export const ROOM_SYNC_POLICY = Object.freeze({
   roomSafetyMarginMs: 8,
   minimumRoomTargetMs: 100,
   maximumRoomTargetMs: 500,
-  monitorIntervalMs: 500,
+  monitorIntervalMs: 250,
+  silentCorrectionIntervalMs: 500,
   audibleCorrectionIntervalMs: 2_000,
   hardSyncErrorMs: 25,
   emergencySyncErrorMs: 80,
@@ -25,7 +26,7 @@ export const ROOM_SYNC_POLICY = Object.freeze({
   rejoinLeadMs: 1_200,
   rejoinFadeSeconds: 0.65,
   violationSamples: 3,
-  recoverySamples: 6
+  recoverySamples: 12
 });
 
 export function roomLockTimeoutAction({
@@ -139,7 +140,9 @@ export function roomCorrectionPlan({
   lastCorrectionAt = 0,
   policy = ROOM_SYNC_POLICY
 }) {
-  const intervalMs = silent ? policy.monitorIntervalMs : policy.audibleCorrectionIntervalMs;
+  const intervalMs = silent
+    ? policy.silentCorrectionIntervalMs || policy.monitorIntervalMs
+    : policy.audibleCorrectionIntervalMs;
   const currentTime = Number(now);
   const previousTime = Number(lastCorrectionAt);
   return {

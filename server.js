@@ -18,6 +18,11 @@ import {
 } from "./src/roomSync.js";
 import { isLocalClientAddress, lanAddressCandidates } from "./src/networkAddresses.js";
 import { sanitizeControllerAudioMetrics } from "./src/controllerMetrics.js";
+import {
+  classifyDeviceHealth,
+  roomHealthContext,
+  summarizeRoomHealth
+} from "./src/deviceHealth.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
@@ -33,7 +38,10 @@ const webRtcBufferMs = clamp(Number(process.env.WEBRTC_BUFFER_MS || 120), 60, 10
 
 const clients = new Set();
 const speakerVolumes = new Map();
+const deviceIncidents = [];
 let nextClientId = 1;
+let nextIncidentId = 1;
+let roomDiagnostic = { state: "healthy", label: "Room ready", reason: "HEALTHY" };
 
 let state = {
   track: null,
@@ -146,11 +154,13 @@ server.on("upgrade", (req, socket) => {
     health: "connecting",
     status: "Connecting",
     syncErrorMs: null,
+    rawSyncErrorMs: null,
     playoutDelayMs: null,
     postDelayMs: 0,
     fixedTargetMs: null,
     latencyMs: null,
     outputLatencyMs: 0,
+    outputLatencyDeltaMs: 0,
     deviceOffsetMs: 0,
     audioContextState: "none",
     audioSessionType: "unavailable",
@@ -164,6 +174,20 @@ server.on("upgrade", (req, socket) => {
     rtcBytesReceived: 0,
     rtcEmittedCount: 0,
     rtcAudioLevel: null,
+    rtcJitterMs: null,
+    rtcPacketsReceived: 0,
+    rtcPacketsLost: 0,
+    rtcConcealedSamples: 0,
+    rtcTotalSamplesReceived: 0,
+    rtcPacketLossRate: null,
+    rtcConcealmentRate: null,
+    rtcRtpStallMs: 0,
+    rtcConnectionState: "idle",
+    fastFuseReason: "",
+    controllerOutputLatencyDeltaMs: 0,
+    diagnostic: null,
+    diagnosticKey: "",
+    hasIdentified: false,
     timingSamples: [],
     timingStable: false,
     timingSpreadMs: null,
@@ -192,7 +216,9 @@ server.on("upgrade", (req, socket) => {
     localConnection: isLocalClientAddress(client.remoteAddress, networkInterfaces),
     localControllerUrl: `http://127.0.0.1:${port}`,
     state: publicState(),
-    peers: peerList()
+    peers: peerList(),
+    roomDiagnostic,
+    incidents: recentIncidents()
   });
   broadcastPeers();
 });
@@ -215,6 +241,10 @@ setInterval(() => {
     state: publicState()
   });
 }, 1000);
+
+setInterval(() => {
+  if (state.live) broadcastPeers();
+}, 500);
 
 async function loadTrackMeta() {
   try {
@@ -392,6 +422,7 @@ function handleMessage(client, message) {
   }
 
   if (message.type === "identify") {
+    client.hasIdentified = true;
     client.name = String(message.name || client.name).slice(0, 40);
     client.deviceKey = String(message.deviceKey || client.deviceKey || "").slice(0, 120) || null;
     client.role = message.role === "controller" ? "controller" : message.role === "capture" ? "capture" : "speaker";
@@ -422,6 +453,9 @@ function handleMessage(client, message) {
       ? client.health === "ready" ? "Ready" : client.health === "locked" ? "Needs local tap" : client.status
       : String(message.status || "").replace(/[\r\n]+/g, " ").slice(0, 80);
     if (message.syncErrorMs !== undefined) client.syncErrorMs = nullableMetric(message.syncErrorMs, -1000, 1000);
+    if (message.rawSyncErrorMs !== undefined) {
+      client.rawSyncErrorMs = nullableMetric(message.rawSyncErrorMs, -1000, 1000);
+    }
     if (message.playoutDelayMs !== undefined) client.playoutDelayMs = nullableMetric(message.playoutDelayMs, 0, 4000);
     if (message.postDelayMs !== undefined) client.postDelayMs = nullableMetric(message.postDelayMs, 0, 1000) ?? 0;
     if (message.fixedTargetMs !== undefined) client.fixedTargetMs = nullableMetric(message.fixedTargetMs, 0, 4000);
@@ -430,6 +464,9 @@ function handleMessage(client, message) {
     }
     client.latencyMs = finiteNumber(message.latencyMs, client.latencyMs);
     client.outputLatencyMs = clamp(finiteNumber(message.outputLatencyMs, client.outputLatencyMs), 0, 1000);
+    if (message.outputLatencyDeltaMs !== undefined) {
+      client.outputLatencyDeltaMs = nullableMetric(message.outputLatencyDeltaMs, -1000, 1000) ?? 0;
+    }
     client.deviceOffsetMs = finiteNumber(message.deviceOffsetMs, client.deviceOffsetMs);
     if (message.audioContextState !== undefined) {
       client.audioContextState = String(message.audioContextState || "none").slice(0, 24);
@@ -461,6 +498,37 @@ function handleMessage(client, message) {
       );
     }
     if (message.rtcAudioLevel !== undefined) client.rtcAudioLevel = nullableMetric(message.rtcAudioLevel, 0, 1);
+    if (message.rtcJitterMs !== undefined) client.rtcJitterMs = nullableMetric(message.rtcJitterMs, 0, 10_000);
+    if (message.rtcPacketsReceived !== undefined) {
+      client.rtcPacketsReceived = boundedCounter(message.rtcPacketsReceived, client.rtcPacketsReceived);
+    }
+    if (message.rtcPacketsLost !== undefined) {
+      client.rtcPacketsLost = boundedCounter(message.rtcPacketsLost, client.rtcPacketsLost);
+    }
+    if (message.rtcConcealedSamples !== undefined) {
+      client.rtcConcealedSamples = boundedCounter(message.rtcConcealedSamples, client.rtcConcealedSamples);
+    }
+    if (message.rtcTotalSamplesReceived !== undefined) {
+      client.rtcTotalSamplesReceived = boundedCounter(message.rtcTotalSamplesReceived, client.rtcTotalSamplesReceived);
+    }
+    if (message.rtcPacketLossRate !== undefined) {
+      client.rtcPacketLossRate = nullableMetric(message.rtcPacketLossRate, 0, 1);
+    }
+    if (message.rtcConcealmentRate !== undefined) {
+      client.rtcConcealmentRate = nullableMetric(message.rtcConcealmentRate, 0, 1);
+    }
+    if (message.rtcRtpStallMs !== undefined) {
+      client.rtcRtpStallMs = nullableMetric(message.rtcRtpStallMs, 0, 120_000) ?? 0;
+    }
+    if (message.rtcConnectionState !== undefined) {
+      const connectionState = String(message.rtcConnectionState || "idle").toLowerCase();
+      client.rtcConnectionState = ["new", "connecting", "connected", "disconnected", "failed", "closed", "idle"].includes(connectionState)
+        ? connectionState
+        : "unknown";
+    }
+    if (message.fastFuseReason !== undefined) {
+      client.fastFuseReason = String(message.fastFuseReason || "").replace(/[^A-Z0-9_]/g, "").slice(0, 48);
+    }
     if (message.timelineState !== undefined) {
       const timelineState = String(message.timelineState || "idle");
       client.timelineState = ["idle", "measuring", "locking", "armed", "locked", "recovering"].includes(timelineState)
@@ -491,6 +559,9 @@ function handleMessage(client, message) {
     if (client.role !== "capture") return;
     const metrics = sanitizeControllerAudioMetrics(message.metrics);
     if (!metrics) return;
+    client.controllerOutputLatencyDeltaMs = Number.isFinite(client.controllerAudioMetrics?.totalOutputLatencyMs)
+      ? metrics.totalOutputLatencyMs - client.controllerAudioMetrics.totalOutputLatencyMs
+      : 0;
     client.controllerAudioMetrics = metrics;
     client.lastSeen = Date.now();
     logControllerAudioMetrics(client, metrics);
@@ -1156,6 +1227,17 @@ function removeClient(client) {
     const owner = [...clients].find((item) => item.id === liveOwnerClientId);
     if (owner) send(owner, { type: "webrtcPeerLeave", peerId: client.id });
   }
+  if (!client.hidden && client.hasIdentified && ["speaker", "capture"].includes(client.role)) {
+    addIncident({
+      deviceId: client.id,
+      deviceName: client.name,
+      state: "critical",
+      layer: "connection",
+      reason: "CONTROL_OFFLINE",
+      label: "Connection: Offline",
+      action: "Reconnect transport"
+    });
+  }
   if (liveOwnerClientId === client.id) stopLive("capture-disconnected");
   clients.delete(client);
   evaluateLivePreflight();
@@ -1163,13 +1245,16 @@ function removeClient(client) {
 }
 
 function broadcastPeers() {
+  refreshDeviceDiagnostics();
   broadcast({
     type: "peers",
-    peers: peerList()
+    peers: peerList(),
+    roomDiagnostic,
+    incidents: recentIncidents()
   });
 }
 
-function peerList() {
+function latestVisibleClients() {
   const latestByDevice = new Map();
   for (const client of clients) {
     if (client.hidden) continue;
@@ -1179,8 +1264,123 @@ function peerList() {
       latestByDevice.set(key, client);
     }
   }
+  return [...latestByDevice.values()];
+}
 
-  return [...latestByDevice.values()].map((client) => {
+function refreshDeviceDiagnostics() {
+  const monitored = latestVisibleClients().filter((client) =>
+    client.hasIdentified && ["speaker", "capture"].includes(client.role)
+  );
+  const metricsByClient = monitored.map((client) => ({ client, metrics: diagnosticMetrics(client) }));
+  const context = roomHealthContext(metricsByClient.map(({ metrics }) => metrics));
+
+  for (const { client, metrics } of metricsByClient) {
+    const previousDiagnostic = client.diagnostic;
+    const nextDiagnostic = classifyDeviceHealth(metrics, context);
+    client.diagnostic = nextDiagnostic;
+    const nextKey = `${nextDiagnostic.overall.state}:${nextDiagnostic.overall.layer || "room"}:${nextDiagnostic.overall.reason}`;
+    if (nextKey !== client.diagnosticKey) {
+      const previousIssue = isDiagnosticIssue(previousDiagnostic);
+      const nextIssue = isDiagnosticIssue(nextDiagnostic);
+      if (previousIssue || nextIssue) {
+        addIncident({
+          deviceId: client.id,
+          deviceName: client.name,
+          state: nextDiagnostic.overall.state,
+          layer: nextDiagnostic.overall.layer,
+          reason: nextDiagnostic.overall.reason,
+          label: previousIssue && !nextIssue
+            ? "Recovered"
+            : `${titleCase(nextDiagnostic.overall.layer || "device")}: ${nextDiagnostic.overall.label}`,
+          action: nextDiagnostic.overall.action
+        });
+      }
+      client.diagnosticKey = nextKey;
+    }
+  }
+
+  roomDiagnostic = summarizeRoomHealth(
+    metricsByClient.map(({ client }) => ({ id: client.id, name: displayDeviceName(client), diagnostic: client.diagnostic })),
+    context
+  );
+}
+
+function diagnosticMetrics(client) {
+  const liveActive = Boolean(state.live?.id);
+  if (client.role === "capture") {
+    const metrics = client.controllerAudioMetrics;
+    return {
+      role: "capture",
+      active: liveActive,
+      online: true,
+      unlocked: true,
+      muted: client.muted,
+      telemetryAgeMs: Math.max(0, Date.now() - client.lastSeen),
+      connectionState: "connected",
+      audioContextState: metrics?.contextState || "none",
+      outputPath: metrics ? "controller-local-output" : "none",
+      outputLatencyDeltaMs: client.controllerOutputLatencyDeltaMs,
+      syncErrorMs: metrics?.estimatedTimelineErrorMs,
+      rawSyncErrorMs: metrics?.estimatedTimelineErrorMs,
+      timelineState: liveActive ? state.live.phase === "playing" ? "locked" : state.live.phase : "idle"
+    };
+  }
+  return {
+    role: client.role,
+    active: liveActive,
+    online: true,
+    unlocked: client.unlocked,
+    muted: client.muted,
+    telemetryAgeMs: Math.max(0, Date.now() - client.lastSeen),
+    connectionState: client.rtcConnectionState,
+    jitterMs: client.rtcJitterMs,
+    packetLossRate: client.rtcPacketLossRate,
+    concealmentRate: client.rtcConcealmentRate,
+    rtpStallMs: client.rtcRtpStallMs,
+    audioContextState: client.audioContextState,
+    outputPath: client.outputPath,
+    outputLatencyDeltaMs: client.outputLatencyDeltaMs,
+    syncErrorMs: client.syncErrorMs,
+    rawSyncErrorMs: client.rawSyncErrorMs,
+    timelineState: client.timelineState,
+    fastFuseReason: client.fastFuseReason
+  };
+}
+
+function isDiagnosticIssue(diagnostic) {
+  return ["warning", "critical", "repairing"].includes(diagnostic?.overall?.state);
+}
+
+function addIncident({ deviceId = null, deviceName, state, layer, reason, label, action }) {
+  const previous = deviceIncidents[0];
+  const key = `${deviceId || "room"}:${state}:${layer || "room"}:${reason}`;
+  if (previous?.key === key && Date.now() - previous.at < 1000) return;
+  deviceIncidents.unshift({
+    id: nextIncidentId++,
+    key,
+    at: Date.now(),
+    deviceId,
+    deviceName: deviceName || "Room",
+    state,
+    layer: layer || null,
+    reason,
+    label,
+    action
+  });
+  if (deviceIncidents.length > 40) deviceIncidents.length = 40;
+}
+
+function recentIncidents() {
+  return deviceIncidents.slice(0, 12).map(({ key: _key, ...incident }) => incident);
+}
+
+function displayDeviceName(client) {
+  return client.role === "capture" ? "Controller output" : client.name;
+}
+
+function peerList() {
+  return latestVisibleClients().map((client) => {
+
     const compatible = client.role !== "speaker" || isCompatibleSpeaker(client);
     return {
       id: client.id,
@@ -1212,6 +1412,19 @@ function peerList() {
       rtcBytesReceived: client.rtcBytesReceived,
       rtcEmittedCount: client.rtcEmittedCount,
       rtcAudioLevel: client.rtcAudioLevel,
+      rtcJitterMs: client.rtcJitterMs,
+      rtcPacketsReceived: client.rtcPacketsReceived,
+      rtcPacketsLost: client.rtcPacketsLost,
+      rtcConcealedSamples: client.rtcConcealedSamples,
+      rtcTotalSamplesReceived: client.rtcTotalSamplesReceived,
+      rtcPacketLossRate: client.rtcPacketLossRate,
+      rtcConcealmentRate: client.rtcConcealmentRate,
+      rtcRtpStallMs: client.rtcRtpStallMs,
+      rtcConnectionState: client.rtcConnectionState,
+      rawSyncErrorMs: client.rawSyncErrorMs,
+      outputLatencyDeltaMs: client.outputLatencyDeltaMs,
+      fastFuseReason: client.fastFuseReason,
+      diagnostic: compatible ? client.diagnostic : null,
       timingStable: compatible && client.timingStable,
       timingSpreadMs: client.timingSpreadMs,
       timelineState: compatible ? client.timelineState : "idle",
@@ -1330,6 +1543,15 @@ function nullableMetric(value, min, max) {
   if (value === null || value === "") return null;
   const number = Number(value);
   return Number.isFinite(number) ? clamp(number, min, max) : null;
+}
+
+function boundedCounter(value, fallback = 0) {
+  return clamp(Math.round(finiteNumber(value, fallback)), 0, Number.MAX_SAFE_INTEGER);
+}
+
+function titleCase(value) {
+  const text = String(value || "");
+  return text ? `${text[0].toUpperCase()}${text.slice(1)}` : "Device";
 }
 
 function sendJson(res, data) {
