@@ -3027,22 +3027,14 @@ export default function App() {
             {roleState === "speaker" ? <div className="sync-health" aria-label="Live synchronization health">
               <div className="sync-health-heading">
                 <div>
-                  <strong>Sync health</strong>
-                  <span>Live measurements</span>
+                  <strong>Speaker status</strong>
+                  <span>Automatic timing</span>
                 </div>
               </div>
-              <div className="sync-metrics">
+              <div className="sync-metrics speaker-sync-metrics">
                 <div><span>Network RTT</span><strong>{latencyState ? `${Math.round(latencyState)} ms` : "Measuring"}</strong></div>
-                <div><span>Clock offset</span><strong>{Math.round(serverOffsetState)} ms</strong></div>
-                <div><span>Playback drift</span><strong>{driftState === null ? "-- ms" : `${driftState} ms`}</strong></div>
-                <div className="manual-offset">
-                  <span>Manual compensation</span>
-                  <div>
-                    <button type="button" aria-label="Decrease compensation by 10 milliseconds" onClick={() => setDeviceOffset(deviceOffsetState - 10)}>−</button>
-                    <strong>{deviceOffsetState >= 0 ? "+" : ""}{deviceOffsetState} ms</strong>
-                    <button type="button" aria-label="Increase compensation by 10 milliseconds" onClick={() => setDeviceOffset(deviceOffsetState + 10)}>+</button>
-                  </div>
-                </div>
+                <div><span>Sync</span><strong>{driftState === null ? "Measuring" : `${driftState >= 0 ? "+" : ""}${driftState} ms`}</strong></div>
+                <div><span>Room delay</span><strong>{roomTargetMs ? `${roomTargetMs} ms` : "Measuring"}</strong></div>
               </div>
             </div> : <div className="room-overview" aria-label="Room status">
               <div><span>{livePlaying ? "Playing" : "Stable"}</span><strong>{livePlaying ? activeSpeakerCount : stableSpeakerCount}</strong></div>
@@ -3284,7 +3276,7 @@ export default function App() {
                 onChange={(event) => setDeviceName(event.target.value)}
               />
 
-              <div className="setting-block">
+              {!liveActive && <div className="setting-block">
                 <span className="field-label">Audio layer</span>
                 <div className="layer-choices">
                   {!layers.length && <span className="empty-inline">No audio loaded</span>}
@@ -3300,7 +3292,7 @@ export default function App() {
                     </button>
                   ))}
                 </div>
-              </div>
+              </div>}
 
               <div className="setting-block">
                 <span className="field-label">Room position</span>
@@ -3331,6 +3323,9 @@ export default function App() {
                   <Stat label="AudioContext" value={audioContextState} />
                   <Stat label="Audio session" value={formatAudioSession(audioSessionInfoState)} />
                   <Stat label="Live output" value={liveOutputPathState} />
+                  <Stat label="Network RTT" value={latencyState ? `${Math.round(latencyState)} ms` : "-- ms"} />
+                  <Stat label="Clock offset" value={`${Math.round(serverOffsetState)} ms`} />
+                  <Stat label="Playback drift" value={driftState === null ? "-- ms" : `${driftState >= 0 ? "+" : ""}${driftState} ms`} />
                   <Stat label="Output estimate" value={outputLatencyState === null ? "-- ms" : `${outputLatencyState} ms`} />
                   <Stat label="Browser" value={`${deviceInfo.browser} / ${deviceInfo.engine}`} />
                   <Stat label="Sync engine" value={`v${ROOM_SYNC_ENGINE_VERSION}`} />
@@ -3572,36 +3567,34 @@ function PeerCard({ peer, layers, onTest, onToggle, onReconnect, onOffset, onVol
         <span className={`status ${health === "ready" ? "ready" : ""} ${hasIssue ? "failed" : ""} ${health === "connecting" ? "waiting" : ""}`}>{displayStatus}</span>
       </div>
       {(hasIssue || needsTap || health === "connecting") && <p className={`peer-status-detail ${hasIssue ? "failed" : ""}`}>{peer.status || status}</p>}
-      <div className="peer-grid">
-        <span>Source</span>
-        <strong>{layer?.name || "Live room audio"}</strong>
-        <span>Position</span>
-        <strong>{zoneNames[peer.zone] || "Front Left"}</strong>
-        <span>Latency</span>
-        <strong>{peer.latencyMs ? `${Math.round(peer.latencyMs)} ms` : "--"}</strong>
-        <span>Output</span>
-        <strong>{peer.outputLatencyMs ? `${Math.round(peer.outputLatencyMs)} ms` : "--"}</strong>
-        <span>Compensation</span>
-        <strong>{Number.isFinite(peer.postDelayMs) ? `${Math.round(peer.postDelayMs)} ms` : "--"}</strong>
-        <span>Audio path</span>
-        <strong>{formatPeerOutput(peer)}</strong>
-        <span>Audio session</span>
-        <strong>{formatPeerAudioSession(peer)}</strong>
-        <span>Inbound</span>
-        <strong>{peer.rtcBytesReceived > 0 ? "Receiving frames" : "--"}</strong>
-        <span>Timing</span>
-        <strong>
-          {peer.timelineState === "locked"
-            ? "Locked"
-            : peer.timelineState === "recovering"
-              ? "Recovering"
-              : peer.timingStable
-                ? `Stable${Number.isFinite(peer.timingSpreadMs) ? ` ±${Math.round(peer.timingSpreadMs)} ms` : ""}`
-                : "Measuring"}
-        </strong>
-        <span>Sync</span>
-        <strong>{Number.isFinite(peer.syncErrorMs) ? `${peer.syncErrorMs >= 0 ? "+" : ""}${Math.round(peer.syncErrorMs)} ms` : "--"}</strong>
+      <div className="peer-summary-grid">
+        <div><span>Position</span><strong>{zoneNames[peer.zone] || "Front Left"}</strong></div>
+        <div><span>Network</span><strong>{peer.latencyMs ? `${Math.round(peer.latencyMs)} ms` : "--"}</strong></div>
+        <div><span>Output</span><strong>{peer.outputLatencyMs ? `${Math.round(peer.outputLatencyMs)} ms` : "--"}</strong></div>
+        <div><span>Sync</span><strong>{Number.isFinite(peer.syncErrorMs) ? `${peer.syncErrorMs >= 0 ? "+" : ""}${Math.round(peer.syncErrorMs)} ms` : "--"}</strong></div>
       </div>
+      <details className="peer-details">
+        <summary>
+          <span>Details</span>
+          <span>{peer.rtcBytesReceived > 0 ? "Receiving" : "Waiting"}</span>
+        </summary>
+        <div className="peer-technical-grid">
+          <div className="wide"><span>Source</span><strong>{layer?.name || "Live room audio"}</strong></div>
+          <div><span>Compensation</span><strong>{Number.isFinite(peer.postDelayMs) ? `${Math.round(peer.postDelayMs)} ms` : "--"}</strong></div>
+          <div><span>Timing</span><strong>
+            {peer.timelineState === "locked"
+              ? "Locked"
+              : peer.timelineState === "recovering"
+                ? "Recovering"
+                : peer.timingStable
+                  ? `Stable${Number.isFinite(peer.timingSpreadMs) ? ` ±${Math.round(peer.timingSpreadMs)} ms` : ""}`
+                  : "Measuring"}
+          </strong></div>
+          <div className="wide"><span>Audio path</span><strong>{formatPeerOutput(peer)}</strong></div>
+          <div><span>Audio session</span><strong>{formatPeerAudioSession(peer)}</strong></div>
+          <div><span>Inbound</span><strong>{peer.rtcBytesReceived > 0 ? "Receiving frames" : "--"}</strong></div>
+        </div>
+      </details>
       <div className="peer-offset-row">
         <span>Timing offset</span>
         <div className="peer-stepper" aria-label={`Timing offset for ${peer.name}`}>
