@@ -8,8 +8,11 @@ import {
   latestEligibleRoomSpeakers,
   nextFixedTimelineGuard,
   nextPostDelayCorrection,
+  roomCorrectionPlan,
+  roomGuardError,
   roomLockTimeoutAction,
   roomTimingSample,
+  ROOM_SYNC_POLICY,
   stableRoomTiming,
   supportsRoomSyncVersion
 } from "../src/roomSync.js";
@@ -55,17 +58,17 @@ test("preflight requires fresh consecutive RTP samples with stable delay", () =>
 test("room sync version rejects stale speaker pages", () => {
   assert.equal(supportsRoomSyncVersion(undefined), false);
   assert.equal(supportsRoomSyncVersion(2), false);
-  assert.equal(supportsRoomSyncVersion(3), true);
+  assert.equal(supportsRoomSyncVersion(3), false);
   assert.equal(supportsRoomSyncVersion(4), true);
 });
 
 test("room candidates reject old engines and keep only the newest connection per device", () => {
   const candidates = latestEligibleRoomSpeakers([
-    { id: 1, role: "speaker", deviceKey: "living-room", syncEngineVersion: 3, unlocked: true, muted: false },
-    { id: 2, role: "speaker", deviceKey: "living-room", syncEngineVersion: 3, unlocked: true, muted: false },
-    { id: 3, role: "speaker", deviceKey: "old-page", syncEngineVersion: 2, unlocked: true, muted: false },
-    { id: 4, role: "speaker", deviceKey: "muted", syncEngineVersion: 3, unlocked: true, muted: true },
-    { id: 5, role: "controller", deviceKey: "controller", syncEngineVersion: 3, unlocked: true, muted: false }
+    { id: 1, role: "speaker", deviceKey: "living-room", syncEngineVersion: 4, unlocked: true, muted: false },
+    { id: 2, role: "speaker", deviceKey: "living-room", syncEngineVersion: 4, unlocked: true, muted: false },
+    { id: 3, role: "speaker", deviceKey: "old-page", syncEngineVersion: 3, unlocked: true, muted: false },
+    { id: 4, role: "speaker", deviceKey: "muted", syncEngineVersion: 4, unlocked: true, muted: true },
+    { id: 5, role: "controller", deviceKey: "controller", syncEngineVersion: 4, unlocked: true, muted: false }
   ]);
   assert.deepEqual(candidates.map((client) => client.id), [2]);
 });
@@ -151,6 +154,29 @@ test("quarantined correction can relock faster but cannot create negative delay"
   );
 });
 
+test("fast monitoring does not accelerate audible correction", () => {
+  assert.deepEqual(
+    roomCorrectionPlan({ silent: false, now: 1_500, lastCorrectionAt: 1_000 }),
+    { due: false, intervalMs: 2_000, maximumStepMs: 3 }
+  );
+  assert.deepEqual(
+    roomCorrectionPlan({ silent: false, now: 3_000, lastCorrectionAt: 1_000 }),
+    { due: true, intervalMs: 2_000, maximumStepMs: 3 }
+  );
+  assert.deepEqual(
+    roomCorrectionPlan({ silent: true, now: 1_500, lastCorrectionAt: 1_000 }),
+    { due: true, intervalMs: 500, maximumStepMs: 3 }
+  );
+});
+
+test("recovery envelope favors fast isolation and a slower verified return", () => {
+  assert.equal(ROOM_SYNC_POLICY.monitorIntervalMs, 500);
+  assert.equal(ROOM_SYNC_POLICY.quarantineFadeSeconds, 0.12);
+  assert.equal(ROOM_SYNC_POLICY.recoverySamples, 6);
+  assert.equal(ROOM_SYNC_POLICY.rejoinLeadMs, 1_200);
+  assert.equal(ROOM_SYNC_POLICY.rejoinFadeSeconds, 0.65);
+});
+
 test("fixed timeline quarantines sustained drift and rejoins only after sustained recovery", () => {
   let guard = nextFixedTimelineGuard(null, 31);
   guard = nextFixedTimelineGuard(guard, 29);
@@ -159,10 +185,19 @@ test("fixed timeline quarantines sustained drift and rejoins only after sustaine
   assert.equal(guard.action, "quarantine");
   assert.equal(guard.quarantined, true);
 
+  for (const error of [5, 7, 4, 6, 3]) {
+    guard = nextFixedTimelineGuard(guard, error);
+    assert.equal(guard.action, "none");
+  }
   guard = nextFixedTimelineGuard(guard, 5);
-  guard = nextFixedTimelineGuard(guard, 7);
-  assert.equal(guard.action, "none");
-  guard = nextFixedTimelineGuard(guard, 4);
   assert.equal(guard.action, "rejoin");
   assert.equal(guard.quarantined, false);
+});
+
+test("an emergency timeline jump is isolated on the first monitor sample", () => {
+  assert.equal(roomGuardError({ smoothedErrorMs: 24, rawErrorMs: 96 }), 96);
+  assert.equal(roomGuardError({ smoothedErrorMs: 28, rawErrorMs: 42 }), 28);
+  const guard = nextFixedTimelineGuard(null, 90);
+  assert.equal(guard.action, "quarantine");
+  assert.equal(guard.quarantined, true);
 });

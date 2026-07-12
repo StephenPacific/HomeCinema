@@ -1,4 +1,4 @@
-export const ROOM_SYNC_ENGINE_VERSION = 3;
+export const ROOM_SYNC_ENGINE_VERSION = 4;
 
 export const ROOM_SYNC_POLICY = Object.freeze({
   sampleWindow: 3,
@@ -11,14 +11,21 @@ export const ROOM_SYNC_POLICY = Object.freeze({
   roomSafetyMarginMs: 8,
   minimumRoomTargetMs: 100,
   maximumRoomTargetMs: 500,
+  monitorIntervalMs: 500,
+  audibleCorrectionIntervalMs: 2_000,
   hardSyncErrorMs: 25,
+  emergencySyncErrorMs: 80,
   recoverySyncErrorMs: 8,
   softCorrectionGain: 0.25,
   softCorrectionStepMs: 3,
-  quarantinedCorrectionStepMs: 12,
+  quarantinedCorrectionStepMs: 3,
   softCorrectionRampSeconds: 1.8,
+  startFadeSeconds: 0.04,
+  quarantineFadeSeconds: 0.12,
+  rejoinLeadMs: 1_200,
+  rejoinFadeSeconds: 0.65,
   violationSamples: 3,
-  recoverySamples: 3
+  recoverySamples: 6
 });
 
 export function roomLockTimeoutAction({
@@ -126,6 +133,35 @@ export function nextPostDelayCorrection({
   };
 }
 
+export function roomCorrectionPlan({
+  silent = false,
+  now = Date.now(),
+  lastCorrectionAt = 0,
+  policy = ROOM_SYNC_POLICY
+}) {
+  const intervalMs = silent ? policy.monitorIntervalMs : policy.audibleCorrectionIntervalMs;
+  const currentTime = Number(now);
+  const previousTime = Number(lastCorrectionAt);
+  return {
+    due:
+      Number.isFinite(currentTime) &&
+      (!Number.isFinite(previousTime) || previousTime <= 0 || currentTime - previousTime >= intervalMs),
+    intervalMs,
+    maximumStepMs: silent ? policy.quarantinedCorrectionStepMs : policy.softCorrectionStepMs
+  };
+}
+
+export function roomGuardError({
+  smoothedErrorMs,
+  rawErrorMs,
+  policy = ROOM_SYNC_POLICY
+}) {
+  const smoothed = Number(smoothedErrorMs);
+  const raw = Number(rawErrorMs);
+  if (Number.isFinite(raw) && Math.abs(raw) >= policy.emergencySyncErrorMs) return raw;
+  return Number.isFinite(smoothed) ? smoothed : raw;
+}
+
 export function stableRoomTiming(samples, now = Date.now(), policy = ROOM_SYNC_POLICY) {
   const window = (samples || []).filter(Boolean).slice(-policy.sampleWindow);
   if (window.length < policy.sampleWindow) return { stable: false, delayMs: null, spreadMs: null };
@@ -178,6 +214,15 @@ export function nextFixedTimelineGuard(state, syncErrorMs, policy = ROOM_SYNC_PO
   if (!Number.isFinite(error)) return { ...previous, action: "none" };
 
   if (!previous.quarantined) {
+    const emergencyError = Number(policy.emergencySyncErrorMs);
+    if (Number.isFinite(emergencyError) && error >= emergencyError) {
+      return {
+        quarantined: true,
+        violationCount: policy.violationSamples,
+        recoveryCount: 0,
+        action: "quarantine"
+      };
+    }
     const violationCount = error > policy.hardSyncErrorMs ? previous.violationCount + 1 : 0;
     if (violationCount >= policy.violationSamples) {
       return { quarantined: true, violationCount, recoveryCount: 0, action: "quarantine" };

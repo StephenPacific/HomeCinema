@@ -15,6 +15,8 @@ import {
   fixedTimelineErrorMs,
   nextFixedTimelineGuard,
   nextPostDelayCorrection,
+  roomCorrectionPlan,
+  roomGuardError,
   ROOM_SYNC_ENGINE_VERSION,
   ROOM_SYNC_POLICY
 } from "./roomSync.js";
@@ -123,6 +125,7 @@ export default function App() {
   const liveDelayRef = useRef(null);
   const liveGainRef = useRef(null);
   const liveOutputModeRef = useRef("none");
+  const liveElementVolumeTimerRef = useRef(null);
   const rtcBytesReceivedRef = useRef(0);
   const rtcEmittedCountRef = useRef(0);
   const rtcAudioLevelRef = useRef(null);
@@ -414,12 +417,30 @@ export default function App() {
     const nextTarget = clamp(Number(target) || 0, 0, 1);
     const audioContext = audioContextRef.current;
     const gain = liveGainRef.current;
+    clearInterval(liveElementVolumeTimerRef.current);
+    liveElementVolumeTimerRef.current = null;
     if (!audioContext || !gain) {
       const liveAudio = liveAudioRef.current;
-      if (liveAudio) {
-        liveAudio.muted = nextTarget <= 0.001;
+      if (!liveAudio) return;
+      const durationMs = Math.max(0, Number(durationSeconds) || 0) * 1000;
+      if (durationMs <= 0) {
         liveAudio.volume = nextTarget;
+        liveAudio.muted = nextTarget <= 0.001;
+        return;
       }
+
+      const initialVolume = liveAudio.muted ? 0 : clamp(Number(liveAudio.volume) || 0, 0, 1);
+      const startedAt = Date.now();
+      if (nextTarget > 0.001) liveAudio.muted = false;
+      liveElementVolumeTimerRef.current = setInterval(() => {
+        const progress = clamp((Date.now() - startedAt) / durationMs, 0, 1);
+        liveAudio.volume = initialVolume + (nextTarget - initialVolume) * progress;
+        if (progress < 1) return;
+        clearInterval(liveElementVolumeTimerRef.current);
+        liveElementVolumeTimerRef.current = null;
+        liveAudio.volume = nextTarget;
+        liveAudio.muted = nextTarget <= 0.001;
+      }, 20);
       return;
     }
 
@@ -443,22 +464,29 @@ export default function App() {
     [rampLiveOutput]
   );
 
-  const scheduleLiveOutputAt = useCallback((targetEpochMs, fadeSeconds = 0.04) => {
+  const scheduleLiveOutputAt = useCallback((targetEpochMs, fadeSeconds = ROOM_SYNC_POLICY.startFadeSeconds) => {
     const audioContext = audioContextRef.current;
     const gain = liveGainRef.current;
     const liveAudio = liveAudioRef.current;
+    clearInterval(liveElementVolumeTimerRef.current);
+    liveElementVolumeTimerRef.current = null;
     if (!audioContext || !gain) {
       if (!liveAudio) return null;
       liveAudio.muted = true;
       liveAudio.volume = 0;
       return setTimeout(() => {
         const muted = remoteMutedRef.current;
-        liveAudio.muted = muted;
-        liveAudio.volume = muted ? 0 : outputVolumeRef.current;
-        if (!muted && liveAudio.paused) {
+        if (muted) {
+          rampLiveOutput(0, 0);
+          return;
+        }
+        liveAudio.muted = false;
+        liveAudio.volume = 0;
+        if (liveAudio.paused) {
           const playPromise = liveAudio.play();
           if (playPromise?.catch) playPromise.catch(() => {});
         }
+        rampLiveOutput(outputVolumeRef.current, fadeSeconds);
       }, Math.max(0, targetEpochMs - Date.now()));
     }
 
@@ -470,13 +498,14 @@ export default function App() {
     parameter.setValueAtTime(0, startAt);
     parameter.linearRampToValueAtTime(remoteMutedRef.current ? 0 : outputVolumeRef.current, startAt + fadeSeconds);
     return null;
-  }, []);
+  }, [rampLiveOutput]);
 
   const quarantineWebRtcOutput = useCallback(
     (session, status = "Recovering synchronization") => {
       if (!session || session.closed) return;
       clearTimeout(session.volumeTimer);
       clearTimeout(session.joinTimer);
+      clearTimeout(session.fadeTimer);
       clearInterval(session.countdownTimer);
       session.volumeTimer = null;
       session.joinTimer = null;
@@ -489,7 +518,7 @@ export default function App() {
         violationCount: session.timelineGuard?.violationCount || 0,
         recoveryCount: 0
       };
-      rampLiveOutput(0, 0.04);
+      rampLiveOutput(0, ROOM_SYNC_POLICY.quarantineFadeSeconds);
       setReadyStatus(status);
       reportStatusSoon();
     },
@@ -497,16 +526,19 @@ export default function App() {
   );
 
   const scheduleWebRtcOutputAt = useCallback(
-    (session, targetLocalMs, label = "WebRTC starts") => {
+    (session, targetLocalMs, label = "WebRTC starts", fadeSeconds = ROOM_SYNC_POLICY.startFadeSeconds) => {
       if (!session || session.closed || !session.outputReady || session.startScheduled) return false;
       if (!Number.isFinite(targetLocalMs) || targetLocalMs <= Date.now() + 80) return false;
 
+      const outputFadeSeconds = clamp(Number(fadeSeconds) || 0, 0.02, 2);
       clearTimeout(session.volumeTimer);
       clearTimeout(session.joinTimer);
+      clearTimeout(session.fadeTimer);
       clearInterval(session.countdownTimer);
       session.startScheduled = true;
       session.unmuteAtLocalMs = targetLocalMs;
-      session.volumeTimer = scheduleLiveOutputAt(targetLocalMs);
+      session.outputFadeSeconds = outputFadeSeconds;
+      session.volumeTimer = scheduleLiveOutputAt(targetLocalMs, outputFadeSeconds);
 
       const updateCountdown = () => {
         if (liveSessionRef.current !== session || session.closed) return;
@@ -519,12 +551,13 @@ export default function App() {
           );
           return;
         }
+        if (!session.startScheduled) return;
 
         clearInterval(session.countdownTimer);
         session.countdownTimer = null;
+        clearTimeout(session.joinTimer);
+        session.joinTimer = null;
         session.startScheduled = false;
-        session.rejoining = false;
-        restoreLiveOutput(0.04);
         const usesContextOutput = liveOutputModeRef.current.endsWith("source");
         const outputBlocked = usesContextOutput
           ? audioContextRef.current?.state !== "running"
@@ -535,7 +568,20 @@ export default function App() {
           setReadyStatus("Tap to resume audio");
         } else {
           session.audible = !remoteMutedRef.current;
-          setReadyStatus(remoteMutedRef.current ? "Stopped by controller" : "Receiving WebRTC audio");
+          if (session.rejoining && !remoteMutedRef.current) {
+            setReadyStatus("Fading into synchronized playback");
+            clearTimeout(session.fadeTimer);
+            session.fadeTimer = setTimeout(() => {
+              if (liveSessionRef.current !== session || session.closed) return;
+              session.fadeTimer = null;
+              session.rejoining = false;
+              setReadyStatus(remoteMutedRef.current ? "Stopped by controller" : "Receiving WebRTC audio");
+              reportStatusSoon();
+            }, outputFadeSeconds * 1000);
+          } else {
+            session.rejoining = false;
+            setReadyStatus(remoteMutedRef.current ? "Stopped by controller" : "Receiving WebRTC audio");
+          }
         }
         reportStatusSoon();
       };
@@ -545,7 +591,7 @@ export default function App() {
       session.joinTimer = setTimeout(updateCountdown, Math.max(0, targetLocalMs - Date.now()) + 80);
       return true;
     },
-    [reportStatusSoon, restoreLiveOutput, scheduleLiveOutputAt]
+    [reportStatusSoon, scheduleLiveOutputAt]
   );
 
   const lockWebRtcPostDelay = useCallback(
@@ -679,6 +725,8 @@ export default function App() {
       clearTimeout(session.seekTimer);
       clearTimeout(session.joinTimer);
       clearTimeout(session.volumeTimer);
+      clearTimeout(session.disconnectTimer);
+      clearTimeout(session.fadeTimer);
       clearInterval(session.countdownTimer);
       clearInterval(session.statsTimer);
       try {
@@ -689,6 +737,8 @@ export default function App() {
       } catch {}
       if (session.url) URL.revokeObjectURL(session.url);
     }
+    clearInterval(liveElementVolumeTimerRef.current);
+    liveElementVolumeTimerRef.current = null;
     liveSessionRef.current = null;
     syncErrorRef.current = null;
     rtcPlayoutDelayRef.current = null;
@@ -767,8 +817,13 @@ export default function App() {
         unmuteAtLocalMs: null,
         joinTimer: null,
         volumeTimer: null,
+        disconnectTimer: null,
+        fadeTimer: null,
         countdownTimer: null,
         statsTimer: null,
+        statsPending: false,
+        lastPostCorrectionAt: 0,
+        outputFadeSeconds: ROOM_SYNC_POLICY.startFadeSeconds,
         outputReady: false,
         timelineLocked: false,
         initialParticipant: false,
@@ -1161,6 +1216,8 @@ export default function App() {
       connection.addEventListener("connectionstatechange", () => {
         if (liveSessionRef.current !== session || session.closed) return;
         if (connection.connectionState === "connected") {
+          clearTimeout(session.disconnectTimer);
+          session.disconnectTimer = null;
           if (liveOutputModeRef.current === "html-media-element") {
             setReadyStatus("Fixed timeline unavailable");
           } else if (session.phase === "measuring" || session.phase === "locking") {
@@ -1184,16 +1241,32 @@ export default function App() {
               setReadyStatus(remoteMutedRef.current ? "Stopped by controller" : "Receiving WebRTC audio");
             }
           }
+        } else if (connection.connectionState === "disconnected") {
+          clearTimeout(session.disconnectTimer);
+          setReadyStatus("WebRTC connection interrupted");
+          session.disconnectTimer = setTimeout(() => {
+            if (
+              liveSessionRef.current === session &&
+              !session.closed &&
+              connection.connectionState === "disconnected"
+            ) {
+              quarantineWebRtcOutput(session, "Connection interrupted; recovering");
+            }
+          }, 1_000);
         } else if (connection.connectionState === "failed") {
-          setReadyStatus("WebRTC connection failed");
+          clearTimeout(session.disconnectTimer);
+          session.disconnectTimer = null;
+          quarantineWebRtcOutput(session, "WebRTC connection failed");
           setAudioIssueState("The direct audio path could not be established on this network.");
         }
       });
 
       session.statsTimer = setInterval(async () => {
-        if (liveSessionRef.current !== session || session.closed) return;
+        if (liveSessionRef.current !== session || session.closed || session.statsPending) return;
+        session.statsPending = true;
         try {
           const stats = await connection.getStats();
+          if (liveSessionRef.current !== session || session.closed) return;
           for (const report of stats.values()) {
             const mediaKind = report.kind || report.mediaType;
             if (report.type !== "inbound-rtp" || mediaKind !== "audio") continue;
@@ -1241,8 +1314,22 @@ export default function App() {
               postDelayMs: session.postDelayMs,
               deviceOffsetMs: deviceOffsetRef.current
             }));
+            const rawSyncErrorMs = Math.round(fixedTimelineErrorMs({
+              roomTargetMs: session.roomTargetMs,
+              playoutDelayMs: delaySample.actualDelayMs,
+              outputLatencyMs: outputLatencyRef.current,
+              postDelayMs: session.postDelayMs,
+              deviceOffsetMs: deviceOffsetRef.current
+            }));
             syncErrorRef.current = syncErrorMs;
             setDriftState(syncErrorMs);
+
+            if (session.rejoining && Math.abs(syncErrorMs) > ROOM_SYNC_POLICY.recoverySyncErrorMs) {
+              setLastCorrectionState(`Rejoin canceled ${syncErrorMs >= 0 ? "+" : ""}${syncErrorMs} ms`);
+              quarantineWebRtcOutput(session, "Timeline moved; extending recovery");
+              reportStatusSoon();
+              continue;
+            }
 
             if (session.phase === "locking") {
               setLastCorrectionState(
@@ -1264,39 +1351,47 @@ export default function App() {
                   remoteMutedRef.current ||
                   !session.audible
                 );
-                postCorrection = nextPostDelayCorrection({
-                  currentPostDelayMs: session.postDelayMs,
-                  syncErrorMs,
-                  maximumStepMs: silentRepair
-                    ? ROOM_SYNC_POLICY.quarantinedCorrectionStepMs
-                    : ROOM_SYNC_POLICY.softCorrectionStepMs
+                const correctionNow = Date.now();
+                const correctionPlan = roomCorrectionPlan({
+                  silent: silentRepair,
+                  now: correctionNow,
+                  lastCorrectionAt: session.lastPostCorrectionAt
                 });
-                correctionApplied = Math.abs(postCorrection?.adjustmentMs || 0) >= 0.05;
-                correctionBlocked =
-                  Math.abs(syncErrorMs) > ROOM_SYNC_POLICY.recoverySyncErrorMs &&
-                  !correctionApplied &&
-                  Boolean(postCorrection?.saturated);
-                if (correctionApplied) {
-                  if (silentRepair) {
-                    setLivePostDelay(postCorrection.delayMs, session);
-                  } else {
-                    rampLivePostDelay(
-                      postCorrection.delayMs,
-                      ROOM_SYNC_POLICY.softCorrectionRampSeconds,
-                      session
-                    );
+                if (correctionPlan.due) {
+                  session.lastPostCorrectionAt = correctionNow;
+                  postCorrection = nextPostDelayCorrection({
+                    currentPostDelayMs: session.postDelayMs,
+                    syncErrorMs,
+                    maximumStepMs: correctionPlan.maximumStepMs
+                  });
+                  correctionApplied = Math.abs(postCorrection?.adjustmentMs || 0) >= 0.05;
+                  correctionBlocked =
+                    Math.abs(syncErrorMs) > ROOM_SYNC_POLICY.recoverySyncErrorMs &&
+                    !correctionApplied &&
+                    Boolean(postCorrection?.saturated);
+                  if (correctionApplied) {
+                    if (silentRepair) {
+                      setLivePostDelay(postCorrection.delayMs, session);
+                    } else {
+                      rampLivePostDelay(
+                        postCorrection.delayMs,
+                        ROOM_SYNC_POLICY.softCorrectionRampSeconds,
+                        session
+                      );
+                    }
+                    correctionCountRef.current += 1;
+                    setCorrectionCountState(correctionCountRef.current);
                   }
-                  correctionCountRef.current += 1;
-                  setCorrectionCountState(correctionCountRef.current);
                 }
               }
 
-              const nextGuard = nextFixedTimelineGuard(session.timelineGuard, syncErrorMs);
+              const guardErrorMs = roomGuardError({ smoothedErrorMs: syncErrorMs, rawErrorMs: rawSyncErrorMs });
+              const nextGuard = nextFixedTimelineGuard(session.timelineGuard, guardErrorMs);
               session.timelineGuard = nextGuard;
               if (nextGuard.action === "quarantine") {
                 correctionCountRef.current += 1;
                 setCorrectionCountState(correctionCountRef.current);
-                setLastCorrectionState(`Output isolated ${syncErrorMs >= 0 ? "+" : ""}${syncErrorMs} ms`);
+                setLastCorrectionState(`Output isolated ${guardErrorMs >= 0 ? "+" : ""}${guardErrorMs} ms`);
                 quarantineWebRtcOutput(session);
               } else if (nextGuard.action === "rejoin") {
                 session.initialParticipant = true;
@@ -1305,9 +1400,14 @@ export default function App() {
                 const rejoinAtLocalMs =
                   session.phase === "armed" && sharedStartLocalMs > Date.now() + 80
                     ? sharedStartLocalMs
-                    : Date.now() + 1200;
-                setLastCorrectionState("Timeline recovered; rejoining");
-                if (!scheduleWebRtcOutputAt(session, rejoinAtLocalMs, "Rejoining")) {
+                    : Date.now() + ROOM_SYNC_POLICY.rejoinLeadMs;
+                setLastCorrectionState("Timeline stable; preparing fade in");
+                if (!scheduleWebRtcOutputAt(
+                  session,
+                  rejoinAtLocalMs,
+                  "Rejoining",
+                  ROOM_SYNC_POLICY.rejoinFadeSeconds
+                )) {
                   quarantineWebRtcOutput(session);
                 }
               } else if (nextGuard.quarantined) {
@@ -1333,8 +1433,10 @@ export default function App() {
             }
             reportStatusSoon();
           }
-        } catch {}
-      }, 2000);
+        } catch {} finally {
+          session.statsPending = false;
+        }
+      }, ROOM_SYNC_POLICY.monitorIntervalMs);
 
       return connection;
     },
@@ -2067,7 +2169,10 @@ export default function App() {
     if (liveSession) {
       if (liveSession.startScheduled && liveSession.unmuteAtLocalMs > Date.now()) {
         clearTimeout(liveSession.volumeTimer);
-        liveSession.volumeTimer = scheduleLiveOutputAt(liveSession.unmuteAtLocalMs);
+        liveSession.volumeTimer = scheduleLiveOutputAt(
+          liveSession.unmuteAtLocalMs,
+          liveSession.outputFadeSeconds || ROOM_SYNC_POLICY.startFadeSeconds
+        );
       } else if (liveSession.audible && !liveSession.timelineGuard?.quarantined) {
         rampLiveOutput(remoteMutedRef.current ? 0 : nextVolume, 0.06);
       }
@@ -2132,7 +2237,10 @@ export default function App() {
       }
       if (liveSession.unmuteAtLocalMs && liveSession.unmuteAtLocalMs > Date.now()) {
         clearTimeout(liveSession.volumeTimer);
-        liveSession.volumeTimer = scheduleLiveOutputAt(liveSession.unmuteAtLocalMs);
+        liveSession.volumeTimer = scheduleLiveOutputAt(
+          liveSession.unmuteAtLocalMs,
+          liveSession.outputFadeSeconds || ROOM_SYNC_POLICY.startFadeSeconds
+        );
         setReadyStatus(`WebRTC starts in ${Math.max(1, Math.ceil((liveSession.unmuteAtLocalMs - Date.now()) / 1000))}`);
       } else {
         restoreLiveOutput(0.04);
