@@ -840,6 +840,7 @@ export default function App() {
       clearTimeout(session.volumeTimer);
       clearTimeout(session.disconnectTimer);
       clearTimeout(session.fadeTimer);
+      clearTimeout(session.reconnectTimer);
       clearInterval(session.countdownTimer);
       clearInterval(session.statsTimer);
       try {
@@ -2511,10 +2512,30 @@ export default function App() {
       return;
     }
     if (message.action === "reconnect") {
-      setReadyStatus("Reconnecting by controller");
-      try {
-        socketRef.current?.close(4001, "controller reconnect");
-      } catch {}
+      const socket = socketRef.current;
+      const session = liveSessionRef.current;
+      const reconnectLabel = message.automatic
+        ? `Automatic reconnect ${message.attempt || 1}/${message.maximumAttempts || ROOM_SYNC_POLICY.automaticReconnectMaximumAttempts}`
+        : "Reconnecting by controller";
+      const closeSocket = () => {
+        if (socketRef.current !== socket) return;
+        try {
+          socket?.close(4001, message.automatic ? "automatic recovery" : "controller reconnect");
+        } catch {}
+      };
+
+      setReadyStatus(reconnectLabel);
+      if (session && !session.closed && session.transport === "webrtc") {
+        clearTimeout(session.reconnectTimer);
+        quarantineWebRtcOutput(session, reconnectLabel);
+        session.reconnectTimer = setTimeout(
+          closeSocket,
+          ROOM_SYNC_POLICY.quarantineFadeSeconds * 1000 + 50
+        );
+      } else {
+        rampLiveOutput(0, ROOM_SYNC_POLICY.quarantineFadeSeconds);
+        setTimeout(closeSocket, ROOM_SYNC_POLICY.quarantineFadeSeconds * 1000 + 50);
+      }
     }
   }
   deviceCommandRef.current = handleDeviceCommand;
@@ -3449,6 +3470,10 @@ function DeviceHealthMonitor({ devices, roomDiagnostic, incidents }) {
         {!devices.length && <div className="device-health-empty">Waiting for device telemetry...</div>}
         {devices.map((device) => {
           const diagnostic = device.diagnostic;
+          const automaticReconnectAttempts = Number(device.automaticReconnectAttempts) || 0;
+          const automaticReconnectLabel = automaticReconnectAttempts > 0
+            ? `Automatic retry ${automaticReconnectAttempts}/${device.automaticReconnectMaximumAttempts || ROOM_SYNC_POLICY.automaticReconnectMaximumAttempts}`
+            : null;
           return (
             <div className="device-health-row" role="row" key={`${device.role}-${device.id}`}>
               <div className="device-health-name" role="cell">
@@ -3459,7 +3484,7 @@ function DeviceHealthMonitor({ devices, roomDiagnostic, incidents }) {
               <HealthLayerCell layer={diagnostic?.audio} fallback="Waiting" />
               <HealthLayerCell layer={diagnostic?.sync} fallback="Idle" />
               <div className="device-health-action" role="cell">
-                <strong>{diagnostic?.overall?.action || "Collecting"}</strong>
+                <strong>{automaticReconnectLabel || diagnostic?.overall?.action || "Collecting"}</strong>
                 <span>{diagnostic?.overall?.reason || device.status || "Waiting for telemetry"}</span>
               </div>
             </div>
@@ -3525,15 +3550,21 @@ function PeerCard({ peer, layers, onTest, onToggle, onReconnect, onOffset, onVol
   const diagnosticStatus = ["warning", "critical", "repairing"].includes(diagnosticState)
     ? peer.diagnostic.overall.label
     : null;
+  const automaticReconnectAttempts = Number(peer.automaticReconnectAttempts) || 0;
+  const automaticReconnectStatus = automaticReconnectAttempts > 0
+    ? `Auto retry ${automaticReconnectAttempts}/${peer.automaticReconnectMaximumAttempts || ROOM_SYNC_POLICY.automaticReconnectMaximumAttempts}`
+    : null;
   const displayStatus = refreshRequired
     ? "Refresh"
-    : diagnosticStatus
-      ? diagnosticStatus
-      : recovering
-        ? "Recovering"
-        : measuring
-          ? "Measuring"
-          : status;
+    : automaticReconnectStatus
+      ? automaticReconnectStatus
+      : diagnosticStatus
+        ? diagnosticStatus
+        : recovering
+          ? "Recovering"
+          : measuring
+            ? "Measuring"
+            : status;
   return (
     <div className={`peer-card ${peer.muted ? "is-muted" : ""} ${hasIssue ? "has-issue" : ""}`}>
       <div className="peer-head">

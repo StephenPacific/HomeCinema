@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   appendRoomTimingSample,
+  automaticReconnectPlan,
   fixedPostDelayMs,
   fixedRoomTargetMs,
   fixedTimelineErrorMs,
@@ -65,16 +66,17 @@ test("room sync version rejects stale speaker pages", () => {
   assert.equal(supportsRoomSyncVersion(5), false);
   assert.equal(supportsRoomSyncVersion(6), false);
   assert.equal(supportsRoomSyncVersion(7), false);
-  assert.equal(supportsRoomSyncVersion(8), true);
+  assert.equal(supportsRoomSyncVersion(8), false);
+  assert.equal(supportsRoomSyncVersion(9), true);
 });
 
 test("room candidates reject old engines and keep only the newest connection per device", () => {
   const candidates = latestEligibleRoomSpeakers([
-    { id: 1, role: "speaker", deviceKey: "living-room", syncEngineVersion: 8, unlocked: true, muted: false },
-    { id: 2, role: "speaker", deviceKey: "living-room", syncEngineVersion: 8, unlocked: true, muted: false },
+    { id: 1, role: "speaker", deviceKey: "living-room", syncEngineVersion: 9, unlocked: true, muted: false },
+    { id: 2, role: "speaker", deviceKey: "living-room", syncEngineVersion: 9, unlocked: true, muted: false },
     { id: 3, role: "speaker", deviceKey: "old-page", syncEngineVersion: 3, unlocked: true, muted: false },
-    { id: 4, role: "speaker", deviceKey: "muted", syncEngineVersion: 8, unlocked: true, muted: true },
-    { id: 5, role: "controller", deviceKey: "controller", syncEngineVersion: 8, unlocked: true, muted: false }
+    { id: 4, role: "speaker", deviceKey: "muted", syncEngineVersion: 9, unlocked: true, muted: true },
+    { id: 5, role: "controller", deviceKey: "controller", syncEngineVersion: 9, unlocked: true, muted: false }
   ]);
   assert.deepEqual(candidates.map((client) => client.id), [2]);
 });
@@ -242,6 +244,53 @@ test("the stable majority excludes one slow speaker from the room target", () =>
     roomTimingCohort([{ delayMs: 140 }, { delayMs: 390 }]),
     { includedIndexes: [0, 1], excludedIndexes: [], medianDelayMs: 265 }
   );
+});
+
+test("automatic reconnect waits, backs off, and never bypasses a local audio tap", () => {
+  const base = {
+    timelineState: "recovering",
+    connectionState: "connected",
+    audioContextState: "running",
+    unlocked: true,
+    recoverySince: 1_000,
+    now: 7_000
+  };
+  assert.deepEqual(automaticReconnectPlan(base), {
+    shouldReconnect: false,
+    waitMs: 2_000,
+    nextAttempt: 1,
+    reason: "recovery-timeout"
+  });
+  assert.deepEqual(automaticReconnectPlan({ ...base, now: 9_000 }), {
+    shouldReconnect: true,
+    waitMs: 0,
+    nextAttempt: 1,
+    reason: "recovery-timeout"
+  });
+  assert.equal(
+    automaticReconnectPlan({ ...base, attempts: 1, lastAttemptAt: 9_000, now: 20_000 }).waitMs,
+    5_000
+  );
+  assert.equal(
+    automaticReconnectPlan({ ...base, audioContextState: "suspended", now: 20_000 }).reason,
+    "audio-action-required"
+  );
+  assert.equal(
+    automaticReconnectPlan({ ...base, attempts: 3, lastAttemptAt: 20_000, now: 60_000 }).reason,
+    "attempts-exhausted"
+  );
+  assert.deepEqual(automaticReconnectPlan({
+    ...base,
+    timelineState: "locked",
+    connectionState: "failed",
+    recoverySince: 10_000,
+    now: 12_000
+  }), {
+    shouldReconnect: true,
+    waitMs: 0,
+    nextAttempt: 1,
+    reason: "transport-failed"
+  });
 });
 
 test("an emergency timeline jump is isolated on the first monitor sample", () => {

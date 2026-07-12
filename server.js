@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   appendRoomTimingSample,
+  automaticReconnectPlan,
   fixedRoomTargetMs,
   latestEligibleRoomSpeakers,
   ROOM_SYNC_ENGINE_VERSION,
@@ -40,6 +41,7 @@ const webRtcBufferMs = clamp(Number(process.env.WEBRTC_BUFFER_MS || 120), 60, 10
 
 const clients = new Set();
 const speakerVolumes = new Map();
+const deviceRecoveryStates = new Map();
 const deviceIncidents = [];
 let nextClientId = 1;
 let nextIncidentId = 1;
@@ -190,6 +192,7 @@ server.on("upgrade", (req, socket) => {
     controllerOutputLatencyDeltaMs: 0,
     diagnostic: null,
     diagnosticKey: "",
+    autoReconnectRequested: false,
     hasIdentified: false,
     timingSamples: [],
     timingStable: false,
@@ -248,6 +251,7 @@ setInterval(() => {
 setInterval(() => {
   if (state.live) {
     evaluateLiveRuntimeRelock();
+    evaluateAutomaticSpeakerRecovery();
     broadcastPeers();
   }
 }, 500);
@@ -809,6 +813,7 @@ function startLive(client, message) {
     ? { liveId: state.live.id, phaseStartedAt: now, candidateKeys }
     : null;
   runtimeRelockState = { violationCount: 0, lastRelockAt: 0 };
+  deviceRecoveryStates.clear();
   clearTimeout(livePhaseTimer);
   livePhaseTimer = null;
   for (const peer of clients) {
@@ -1119,12 +1124,88 @@ function beginRuntimeRelock(candidates, roomTargetMs, now = Date.now(), initiall
   return true;
 }
 
+function evaluateAutomaticSpeakerRecovery(now = Date.now()) {
+  if (!state.live || state.live.transport !== "webrtc" || state.live.phase !== "playing") return;
+  const speakers = latestVisibleClients().filter((client) => isCompatibleSpeaker(client));
+  for (const client of speakers) {
+    const key = speakerIdentity(client);
+    if (client.muted) {
+      deviceRecoveryStates.delete(key);
+      continue;
+    }
+    if (client.timelineState === "locked" && client.health === "ready") {
+      deviceRecoveryStates.delete(key);
+      continue;
+    }
+    const needsRecovery =
+      client.timelineState === "recovering" ||
+      ["failed", "disconnected", "closed"].includes(client.rtcConnectionState);
+    if (!needsRecovery) continue;
+
+    const recovery = deviceRecoveryStates.get(key) || {
+      recoverySince: now,
+      lastAttemptAt: null,
+      attempts: 0,
+      exhaustedLogged: false
+    };
+    const plan = automaticReconnectPlan({
+      timelineState: client.timelineState,
+      connectionState: client.rtcConnectionState,
+      audioContextState: client.audioContextState,
+      unlocked: client.unlocked,
+      muted: client.muted,
+      recoverySince: recovery.recoverySince,
+      lastAttemptAt: recovery.lastAttemptAt,
+      attempts: recovery.attempts,
+      now
+    });
+
+    if (plan.reason === "attempts-exhausted" && !recovery.exhaustedLogged) {
+      recovery.exhaustedLogged = true;
+      addIncident({
+        deviceId: client.id,
+        deviceName: client.name,
+        state: "critical",
+        layer: "connection",
+        reason: "AUTO_RECONNECT_EXHAUSTED",
+        label: "Automatic reconnect stopped after 3 attempts",
+        action: "Inspect device"
+      });
+    }
+    if (plan.shouldReconnect) {
+      recovery.attempts += 1;
+      recovery.lastAttemptAt = now;
+      recovery.recoverySince = now;
+      recovery.exhaustedLogged = false;
+      client.autoReconnectRequested = true;
+      addIncident({
+        deviceId: client.id,
+        deviceName: client.name,
+        state: "repairing",
+        layer: "connection",
+        reason: "AUTO_RECONNECT",
+        label: `Automatic reconnect ${recovery.attempts}/${ROOM_SYNC_POLICY.automaticReconnectMaximumAttempts}`,
+        action: "Reconnect transport"
+      });
+      send(client, {
+        type: "deviceCommand",
+        action: "reconnect",
+        automatic: true,
+        attempt: recovery.attempts,
+        maximumAttempts: ROOM_SYNC_POLICY.automaticReconnectMaximumAttempts
+      });
+    }
+    deviceRecoveryStates.set(key, recovery);
+  }
+}
+
 function stopLive(reason) {
   if (!state.live) return;
   clearTimeout(livePhaseTimer);
   livePhaseTimer = null;
   livePreflight = null;
   runtimeRelockState = { violationCount: 0, lastRelockAt: 0 };
+  deviceRecoveryStates.clear();
   state.live = null;
   state.updatedAt = Date.now();
   liveOwnerClientId = null;
@@ -1311,7 +1392,12 @@ function removeClient(client) {
     const owner = [...clients].find((item) => item.id === liveOwnerClientId);
     if (owner) send(owner, { type: "webrtcPeerLeave", peerId: client.id });
   }
-  if (!client.hidden && client.hasIdentified && ["speaker", "capture"].includes(client.role)) {
+  if (
+    !client.hidden &&
+    client.hasIdentified &&
+    ["speaker", "capture"].includes(client.role) &&
+    !client.autoReconnectRequested
+  ) {
     addIncident({
       deviceId: client.id,
       deviceName: client.name,
@@ -1464,8 +1550,10 @@ function displayDeviceName(client) {
 
 function peerList() {
   return latestVisibleClients().map((client) => {
-
     const compatible = client.role !== "speaker" || isCompatibleSpeaker(client);
+    const recovery = client.role === "speaker"
+      ? deviceRecoveryStates.get(speakerIdentity(client))
+      : null;
     return {
       id: client.id,
       name: client.name,
@@ -1509,6 +1597,8 @@ function peerList() {
       outputLatencyDeltaMs: client.outputLatencyDeltaMs,
       fastFuseReason: client.fastFuseReason,
       diagnostic: compatible ? client.diagnostic : null,
+      automaticReconnectAttempts: recovery?.attempts || 0,
+      automaticReconnectMaximumAttempts: ROOM_SYNC_POLICY.automaticReconnectMaximumAttempts,
       timingStable: compatible && client.timingStable,
       timingSpreadMs: client.timingSpreadMs,
       timelineState: compatible ? client.timelineState : "idle",

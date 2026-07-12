@@ -1,4 +1,4 @@
-export const ROOM_SYNC_ENGINE_VERSION = 8;
+export const ROOM_SYNC_ENGINE_VERSION = 9;
 
 export const ROOM_SYNC_POLICY = Object.freeze({
   sampleWindow: 3,
@@ -24,6 +24,10 @@ export const ROOM_SYNC_POLICY = Object.freeze({
   runtimeRelockCooldownMs: 15_000,
   runtimeRelockMinimumIncreaseMs: 12,
   speakerOutlierThresholdMs: 45,
+  automaticReconnectBaseDelayMs: 8_000,
+  automaticReconnectTransportDelayMs: 2_000,
+  automaticReconnectMaximumDelayMs: 32_000,
+  automaticReconnectMaximumAttempts: 3,
   softCorrectionGain: 0.25,
   softCorrectionStepMs: 3,
   quarantinedCorrectionStepMs: 3,
@@ -236,6 +240,50 @@ export function roomTimingCohort(entries, policy = ROOM_SYNC_POLICY) {
     includedIndexes: accepted.map((entry) => entry.index),
     excludedIndexes: usable.filter((entry) => !acceptedIndexes.has(entry.index)).map((entry) => entry.index),
     medianDelayMs
+  };
+}
+
+export function automaticReconnectPlan({
+  timelineState,
+  connectionState,
+  audioContextState,
+  unlocked = true,
+  muted = false,
+  recoverySince = null,
+  lastAttemptAt = null,
+  attempts = 0,
+  now = Date.now()
+}, policy = ROOM_SYNC_POLICY) {
+  const attemptCount = Math.max(0, Number(attempts) || 0);
+  if (muted || !unlocked || String(audioContextState || "").toLowerCase() !== "running") {
+    return { shouldReconnect: false, waitMs: null, nextAttempt: attemptCount + 1, reason: "audio-action-required" };
+  }
+  if (attemptCount >= policy.automaticReconnectMaximumAttempts) {
+    return { shouldReconnect: false, waitMs: null, nextAttempt: attemptCount + 1, reason: "attempts-exhausted" };
+  }
+  const transportFailed = ["failed", "disconnected", "closed"].includes(
+    String(connectionState || "").toLowerCase()
+  );
+  const recovering = String(timelineState || "").toLowerCase() === "recovering";
+  if (!transportFailed && !recovering) {
+    return { shouldReconnect: false, waitMs: null, nextAttempt: attemptCount + 1, reason: "healthy" };
+  }
+  const startedAt = Number(lastAttemptAt || recoverySince);
+  if (!Number.isFinite(startedAt) || startedAt <= 0) {
+    return { shouldReconnect: false, waitMs: null, nextAttempt: attemptCount + 1, reason: "observing" };
+  }
+  const delayMs = transportFailed
+    ? policy.automaticReconnectTransportDelayMs
+    : Math.min(
+        policy.automaticReconnectMaximumDelayMs,
+        policy.automaticReconnectBaseDelayMs * 2 ** attemptCount
+      );
+  const waitMs = Math.max(0, delayMs - (Number(now) - startedAt));
+  return {
+    shouldReconnect: waitMs === 0,
+    waitMs,
+    nextAttempt: attemptCount + 1,
+    reason: transportFailed ? "transport-failed" : "recovery-timeout"
   };
 }
 
