@@ -12,6 +12,7 @@ import {
   ROOM_SYNC_ENGINE_VERSION,
   ROOM_SYNC_POLICY,
   roomLockTimeoutAction,
+  roomTimingCohort,
   runtimeRoomRelockPlan,
   roomTimingSample,
   stableRoomTiming,
@@ -886,12 +887,13 @@ function evaluateLivePreflight() {
   state.updatedAt = now;
 
   if (state.live.phase === "locking") {
+    const initiallyExcluded = Math.max(0, Number(livePreflight.excludedCount || 0));
     const lockedCandidates = stableCandidates.filter((client) => {
       const timing = stableRoomTiming(client.timingSamples, now);
       return timing.stable && Math.abs(timing.delayMs - state.live.roomTargetMs) <= ROOM_SYNC_POLICY.lockToleranceMs;
     });
     state.live.stableSpeakers = lockedCandidates.length;
-    state.live.excludedSpeakers = Math.max(0, candidates.length - lockedCandidates.length);
+    state.live.excludedSpeakers = initiallyExcluded + Math.max(0, candidates.length - lockedCandidates.length);
     const lockTimedOut = now - livePreflight.phaseStartedAt >= ROOM_SYNC_POLICY.lockTimeoutMs;
     updateLivePhaseProgress(candidates, lockedCandidates, now, ROOM_SYNC_POLICY.lockTimeoutMs);
     const timeoutAction = roomLockTimeoutAction({
@@ -929,13 +931,20 @@ function stableLiveCandidates(candidates) {
 
 function lockLiveRoom(stableCandidates, candidates) {
   if (!state.live || state.live.phase !== "measuring") return;
-  const timings = stableCandidates.map((client) => stableRoomTiming(client.timingSamples));
+  const stableEntries = stableCandidates.map((client) => ({
+    client,
+    timing: stableRoomTiming(client.timingSamples)
+  }));
+  const cohort = roomTimingCohort(stableEntries.map(({ timing }) => ({ delayMs: timing.delayMs })));
+  const acceptedCandidates = cohort.includedIndexes.map((index) => stableEntries[index].client);
+  const timings = cohort.includedIndexes.map((index) => stableEntries[index].timing);
+  if (!acceptedCandidates.length) return;
   const roomTargetMs = fixedRoomTargetMs(timings, state.live.bufferMs);
   state.live.phase = "locking";
   state.live.roomTargetMs = roomTargetMs;
   state.live.stableSpeakers = 0;
-  state.live.requiredSpeakers = stableCandidates.length;
-  state.live.excludedSpeakers = Math.max(0, candidates.length - stableCandidates.length);
+  state.live.requiredSpeakers = acceptedCandidates.length;
+  state.live.excludedSpeakers = Math.max(0, candidates.length - acceptedCandidates.length);
   state.live.phaseProgress = 0;
   state.live.phaseSampleCount = 0;
   state.live.phaseElapsedMs = 0;
@@ -943,14 +952,15 @@ function lockLiveRoom(stableCandidates, candidates) {
   state.live.phaseBlocked = false;
   state.live.lockAttempt = 1;
   state.live.maximumLockAttempts = ROOM_SYNC_POLICY.maximumLockAttempts;
-  state.live.participantIds = stableCandidates.map((client) => client.id);
+  state.live.participantIds = acceptedCandidates.map((client) => client.id);
   state.updatedAt = Date.now();
   livePreflight = {
     liveId: state.live.id,
     phaseStartedAt: Date.now(),
-    candidateKeys: new Set(stableCandidates.map(speakerIdentity))
+    candidateKeys: new Set(acceptedCandidates.map(speakerIdentity)),
+    excludedCount: Math.max(0, candidates.length - acceptedCandidates.length)
   };
-  for (const client of stableCandidates) {
+  for (const client of acceptedCandidates) {
     client.timingSamples = [];
     client.timingStable = false;
     client.timingSpreadMs = null;
@@ -960,6 +970,7 @@ function lockLiveRoom(stableCandidates, candidates) {
 
 function retryLiveRoomLock(candidates, stableCandidates, { resetAttempts = false } = {}) {
   if (!state.live || state.live.phase !== "locking" || !livePreflight || !candidates.length) return false;
+  const initiallyExcluded = Math.max(0, Number(livePreflight.excludedCount || 0));
   const stableTimings = stableCandidates
     .map((client) => stableRoomTiming(client.timingSamples))
     .filter((timing) =>
@@ -978,7 +989,7 @@ function retryLiveRoomLock(candidates, stableCandidates, { resetAttempts = false
   state.live.maximumLockAttempts = ROOM_SYNC_POLICY.maximumLockAttempts;
   state.live.stableSpeakers = 0;
   state.live.requiredSpeakers = candidates.length;
-  state.live.excludedSpeakers = candidates.length;
+  state.live.excludedSpeakers = initiallyExcluded + candidates.length;
   state.live.phaseProgress = 0;
   state.live.phaseSampleCount = 0;
   state.live.phaseElapsedMs = 0;
@@ -988,7 +999,8 @@ function retryLiveRoomLock(candidates, stableCandidates, { resetAttempts = false
   livePreflight = {
     liveId: state.live.id,
     phaseStartedAt: Date.now(),
-    candidateKeys: new Set(candidates.map(speakerIdentity))
+    candidateKeys: new Set(candidates.map(speakerIdentity)),
+    excludedCount: initiallyExcluded
   };
   for (const client of candidates) {
     client.timingSamples = [];
@@ -1024,7 +1036,9 @@ function armLiveRoom(stableCandidates, candidates) {
   state.live.roomTargetMs = roomTargetMs;
   state.live.stableSpeakers = stableCandidates.length;
   state.live.requiredSpeakers = candidates.length;
-  state.live.excludedSpeakers = Math.max(0, candidates.length - stableCandidates.length);
+  state.live.excludedSpeakers =
+    Math.max(0, Number(livePreflight?.excludedCount || 0)) +
+    Math.max(0, candidates.length - stableCandidates.length);
   state.live.participantIds = stableCandidates.map((client) => client.id);
   state.live.phaseProgress = 100;
   state.live.phaseSampleCount = ROOM_SYNC_POLICY.sampleWindow;
@@ -1057,10 +1071,16 @@ function evaluateLiveRuntimeRelock(now = Date.now()) {
   }
   runtimeRelockState.violationCount += 1;
   if (runtimeRelockState.violationCount < ROOM_SYNC_POLICY.runtimeRelockSamples) return;
-  beginRuntimeRelock(candidates, plan.roomTargetMs, now);
+  const acceptedCandidates = plan.includedIndexes.map((index) => candidates[index]).filter(Boolean);
+  beginRuntimeRelock(
+    acceptedCandidates,
+    plan.roomTargetMs,
+    now,
+    Math.max(0, candidates.length - acceptedCandidates.length)
+  );
 }
 
-function beginRuntimeRelock(candidates, roomTargetMs, now = Date.now()) {
+function beginRuntimeRelock(candidates, roomTargetMs, now = Date.now(), initiallyExcluded = 0) {
   if (!state.live || state.live.phase !== "playing" || !candidates.length) return false;
   clearTimeout(livePhaseTimer);
   livePhaseTimer = null;
@@ -1070,7 +1090,7 @@ function beginRuntimeRelock(candidates, roomTargetMs, now = Date.now()) {
   state.live.runtimeRelock = true;
   state.live.stableSpeakers = 0;
   state.live.requiredSpeakers = candidates.length;
-  state.live.excludedSpeakers = candidates.length;
+  state.live.excludedSpeakers = initiallyExcluded + candidates.length;
   state.live.phaseProgress = 0;
   state.live.phaseSampleCount = 0;
   state.live.phaseElapsedMs = 0;
@@ -1083,7 +1103,8 @@ function beginRuntimeRelock(candidates, roomTargetMs, now = Date.now()) {
   livePreflight = {
     liveId: state.live.id,
     phaseStartedAt: now,
-    candidateKeys: new Set(candidates.map(speakerIdentity))
+    candidateKeys: new Set(candidates.map(speakerIdentity)),
+    excludedCount: initiallyExcluded
   };
   runtimeRelockState = { violationCount: 0, lastRelockAt: now };
   for (const client of candidates) {

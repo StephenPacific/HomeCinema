@@ -10,6 +10,7 @@ import {
   nextPostDelayCorrection,
   roomCorrectionPlan,
   roomGuardError,
+  roomTimingCohort,
   runtimeRoomRelockPlan,
   roomLockTimeoutAction,
   roomTimingSample,
@@ -63,16 +64,17 @@ test("room sync version rejects stale speaker pages", () => {
   assert.equal(supportsRoomSyncVersion(4), false);
   assert.equal(supportsRoomSyncVersion(5), false);
   assert.equal(supportsRoomSyncVersion(6), false);
-  assert.equal(supportsRoomSyncVersion(7), true);
+  assert.equal(supportsRoomSyncVersion(7), false);
+  assert.equal(supportsRoomSyncVersion(8), true);
 });
 
 test("room candidates reject old engines and keep only the newest connection per device", () => {
   const candidates = latestEligibleRoomSpeakers([
-    { id: 1, role: "speaker", deviceKey: "living-room", syncEngineVersion: 7, unlocked: true, muted: false },
-    { id: 2, role: "speaker", deviceKey: "living-room", syncEngineVersion: 7, unlocked: true, muted: false },
+    { id: 1, role: "speaker", deviceKey: "living-room", syncEngineVersion: 8, unlocked: true, muted: false },
+    { id: 2, role: "speaker", deviceKey: "living-room", syncEngineVersion: 8, unlocked: true, muted: false },
     { id: 3, role: "speaker", deviceKey: "old-page", syncEngineVersion: 3, unlocked: true, muted: false },
-    { id: 4, role: "speaker", deviceKey: "muted", syncEngineVersion: 7, unlocked: true, muted: true },
-    { id: 5, role: "controller", deviceKey: "controller", syncEngineVersion: 7, unlocked: true, muted: false }
+    { id: 4, role: "speaker", deviceKey: "muted", syncEngineVersion: 8, unlocked: true, muted: true },
+    { id: 5, role: "controller", deviceKey: "controller", syncEngineVersion: 8, unlocked: true, muted: false }
   ]);
   assert.deepEqual(candidates.map((client) => client.id), [2]);
 });
@@ -214,7 +216,14 @@ test("a shared positive drift requests a larger room target", () => {
     { syncErrorMs: 163, playoutDelayMs: 367, outputLatencyMs: 12, postDelayMs: 0 },
     { syncErrorMs: 177, playoutDelayMs: 396, outputLatencyMs: 13, postDelayMs: 0 }
   ], 232);
-  assert.deepEqual(plan, { shouldRelock: true, roomTargetMs: 417, lateCount: 3, requiredCount: 2 });
+  assert.deepEqual(plan, {
+    shouldRelock: true,
+    roomTargetMs: 417,
+    lateCount: 3,
+    requiredCount: 2,
+    includedIndexes: [0, 1, 2],
+    excludedIndexes: []
+  });
 
   const isolated = runtimeRoomRelockPlan([
     { syncErrorMs: 60, playoutDelayMs: 260, outputLatencyMs: 20, postDelayMs: 0 },
@@ -222,6 +231,17 @@ test("a shared positive drift requests a larger room target", () => {
     { syncErrorMs: 1, playoutDelayMs: 198, outputLatencyMs: 20, postDelayMs: 12 }
   ], 230);
   assert.equal(isolated.shouldRelock, false);
+});
+
+test("the stable majority excludes one slow speaker from the room target", () => {
+  assert.deepEqual(
+    roomTimingCohort([{ delayMs: 140 }, { delayMs: 146 }, { delayMs: 390 }]),
+    { includedIndexes: [0, 1], excludedIndexes: [2], medianDelayMs: 146 }
+  );
+  assert.deepEqual(
+    roomTimingCohort([{ delayMs: 140 }, { delayMs: 390 }]),
+    { includedIndexes: [0, 1], excludedIndexes: [], medianDelayMs: 265 }
+  );
 });
 
 test("an emergency timeline jump is isolated on the first monitor sample", () => {

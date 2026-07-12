@@ -1,4 +1,4 @@
-export const ROOM_SYNC_ENGINE_VERSION = 7;
+export const ROOM_SYNC_ENGINE_VERSION = 8;
 
 export const ROOM_SYNC_POLICY = Object.freeze({
   sampleWindow: 3,
@@ -23,6 +23,7 @@ export const ROOM_SYNC_POLICY = Object.freeze({
   runtimeRelockSamples: 6,
   runtimeRelockCooldownMs: 15_000,
   runtimeRelockMinimumIncreaseMs: 12,
+  speakerOutlierThresholdMs: 45,
   softCorrectionGain: 0.25,
   softCorrectionStepMs: 3,
   quarantinedCorrectionStepMs: 3,
@@ -214,28 +215,64 @@ export function fixedRoomTargetMs(stableTimings, fallbackMs = 120, policy = ROOM
   );
 }
 
+export function roomTimingCohort(entries, policy = ROOM_SYNC_POLICY) {
+  const usable = (entries || [])
+    .map((entry, index) => ({ index, delayMs: Number(entry?.delayMs) }))
+    .filter((entry) => Number.isFinite(entry.delayMs));
+  if (usable.length < 3) {
+    return {
+      includedIndexes: usable.map((entry) => entry.index),
+      excludedIndexes: [],
+      medianDelayMs: usable.length ? median(usable.map((entry) => entry.delayMs)) : null
+    };
+  }
+  const medianDelayMs = median(usable.map((entry) => entry.delayMs));
+  const maximumIncludedDelayMs = medianDelayMs + policy.speakerOutlierThresholdMs;
+  const included = usable.filter((entry) => entry.delayMs <= maximumIncludedDelayMs);
+  const minimumCohortSize = Math.ceil((usable.length * 2) / 3);
+  const accepted = included.length >= minimumCohortSize ? included : usable;
+  const acceptedIndexes = new Set(accepted.map((entry) => entry.index));
+  return {
+    includedIndexes: accepted.map((entry) => entry.index),
+    excludedIndexes: usable.filter((entry) => !acceptedIndexes.has(entry.index)).map((entry) => entry.index),
+    medianDelayMs
+  };
+}
+
 export function runtimeRoomRelockPlan(devices, currentTargetMs, policy = ROOM_SYNC_POLICY) {
   const candidates = (devices || []).filter((device) =>
     Number.isFinite(Number(device?.syncErrorMs)) &&
     Number.isFinite(Number(device?.playoutDelayMs)) &&
     Number.isFinite(Number(device?.outputLatencyMs))
   );
-  if (!candidates.length) return { shouldRelock: false, roomTargetMs: null, lateCount: 0, requiredCount: 0 };
+  if (!candidates.length) {
+    return {
+      shouldRelock: false,
+      roomTargetMs: null,
+      lateCount: 0,
+      requiredCount: 0,
+      includedIndexes: [],
+      excludedIndexes: []
+    };
+  }
 
   const requiredCount = Math.max(1, Math.ceil((candidates.length * 2) / 3));
   const late = candidates.filter((device) =>
     Number(device.syncErrorMs) >= policy.runtimeRelockErrorMs &&
     Number(device.postDelayMs || 0) <= policy.runtimeRelockPostDelayHeadroomMs
   );
-  const observedDelays = candidates.map((device) =>
-    Number(device.playoutDelayMs) +
-    Number(device.outputLatencyMs) +
-    Number(device.postDelayMs || 0) -
-    Number(device.deviceOffsetMs || 0)
-  );
+  const observedDelays = candidates.map((device) => ({
+    delayMs:
+      Number(device.playoutDelayMs) +
+      Number(device.outputLatencyMs) +
+      Number(device.postDelayMs || 0) -
+      Number(device.deviceOffsetMs || 0)
+  }));
+  const cohort = roomTimingCohort(observedDelays, policy);
+  const includedDelays = cohort.includedIndexes.map((index) => observedDelays[index].delayMs);
   const currentTarget = Number(currentTargetMs);
   const roomTargetMs = Math.round(clamp(
-    Math.max(...observedDelays) + policy.roomSafetyMarginMs,
+    Math.max(...includedDelays) + policy.roomSafetyMarginMs,
     policy.minimumRoomTargetMs,
     policy.maximumRoomTargetMs
   ));
@@ -243,7 +280,14 @@ export function runtimeRoomRelockPlan(devices, currentTargetMs, policy = ROOM_SY
     late.length >= requiredCount &&
     Number.isFinite(currentTarget) &&
     roomTargetMs >= currentTarget + policy.runtimeRelockMinimumIncreaseMs;
-  return { shouldRelock, roomTargetMs, lateCount: late.length, requiredCount };
+  return {
+    shouldRelock,
+    roomTargetMs,
+    lateCount: late.length,
+    requiredCount,
+    includedIndexes: cohort.includedIndexes,
+    excludedIndexes: cohort.excludedIndexes
+  };
 }
 
 export function nextFixedTimelineGuard(state, syncErrorMs, policy = ROOM_SYNC_POLICY) {
