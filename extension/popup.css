@@ -74,6 +74,22 @@ label {
   font-weight: 700;
 }
 
+.service-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.service-heading button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #86bfff;
+  font-size: 11px;
+  font-weight: 700;
+}
+
 input {
   width: 100%;
   min-width: 0;

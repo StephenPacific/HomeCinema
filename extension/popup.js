@@ -13,6 +13,7 @@ const progressDetail = document.querySelector("#progressDetail");
 const startButton = document.querySelector("#startButton");
 const stopButton = document.querySelector("#stopButton");
 const openButton = document.querySelector("#openButton");
+const localButton = document.querySelector("#localButton");
 
 let activeTab = null;
 let captureStatus = { phase: "idle", detail: "Ready to capture the active tab." };
@@ -52,6 +53,13 @@ openButton.addEventListener("click", async () => {
   }
 });
 
+localButton.addEventListener("click", async () => {
+  const localUrl = "http://127.0.0.1:4173";
+  serverUrlInput.value = localUrl;
+  await chrome.storage.local.set({ homeCinemaUrl: localUrl });
+  updateActionState();
+});
+
 serverUrlInput.addEventListener("change", () => {
   try {
     chrome.storage.local.set({ homeCinemaUrl: normalizeServerUrl(serverUrlInput.value) });
@@ -84,7 +92,7 @@ async function initialize() {
   const detectedTabUrl = serverUrlFromHomeCinemaTab(tab);
   const serverUrl = resolveServerUrl({ savedUrl: homeCinemaUrl, captureStatus: nextStatus, activeTab: tab });
   serverUrlInput.value = serverUrl;
-  if (detectedTabUrl && detectedTabUrl !== homeCinemaUrl) {
+  if (!homeCinemaUrl && detectedTabUrl) {
     await chrome.storage.local.set({ homeCinemaUrl: detectedTabUrl });
   }
   tabTitle.textContent = tab?.title || "No active tab";
@@ -120,8 +128,10 @@ function renderStatus(status) {
   const stableSpeakers = Math.max(0, Number(captureStatus.stableSpeakers || 0));
   const requiredSpeakers = Math.max(0, Number(captureStatus.requiredSpeakers || 0));
   const speakerLabel = captureStatus.stage === "locking" ? "locked" : "stable";
+  const lockAttempt = Math.max(0, Number(captureStatus.lockAttempt || 0));
+  const maximumLockAttempts = Math.max(1, Number(captureStatus.maximumLockAttempts || 3));
   progressDetail.textContent = requiredSpeakers
-    ? `${sampleCount}/${sampleTarget} samples · ${stableSpeakers}/${requiredSpeakers} speakers ${speakerLabel}`
+    ? `${sampleCount}/${sampleTarget} samples · ${stableSpeakers}/${requiredSpeakers} speakers ${speakerLabel}${captureStatus.stage === "locking" ? ` · attempt ${lockAttempt}/${maximumLockAttempts}` : ""}`
     : `${sampleCount}/${sampleTarget} samples · waiting for a speaker`;
   updateActionState();
 }

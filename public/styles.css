@@ -1111,10 +1111,55 @@ h2 {
   line-height: 1.35;
 }
 
+.phase-retry-button {
+  width: 100%;
+}
+
 .peers,
 .layer-choices {
   display: grid;
   gap: 8px;
+}
+
+.room-volume-row,
+.peer-volume-row {
+  display: grid;
+  grid-template-columns: 18px max-content minmax(90px, 1fr) 42px;
+  align-items: center;
+  gap: 9px;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.room-volume-row {
+  margin-bottom: 12px;
+  padding: 0 2px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.peer-volume-row {
+  padding-top: 9px;
+  border-top: 1px solid var(--line);
+}
+
+.room-volume-row svg,
+.peer-volume-row svg {
+  color: var(--accent);
+}
+
+.room-volume-row input,
+.peer-volume-row input {
+  width: 100%;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+.room-volume-row strong,
+.peer-volume-row strong {
+  color: var(--text);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
 .empty-state {

@@ -29,12 +29,11 @@ export function controllerPageUrl(value) {
 }
 
 export function resolveServerUrl({ savedUrl, captureStatus, activeTab }) {
-  const activeTabUrl = serverUrlFromHomeCinemaTab(activeTab);
-  if (activeTabUrl) return activeTabUrl;
-
   const captureUrl = normalizedOrEmpty(captureStatus?.serverUrl);
   if (["connecting", "capturing"].includes(captureStatus?.phase) && captureUrl) return captureUrl;
-  return normalizedOrEmpty(savedUrl) || captureUrl;
+  const configuredUrl = normalizedOrEmpty(savedUrl);
+  if (configuredUrl) return configuredUrl;
+  return serverUrlFromHomeCinemaTab(activeTab) || captureUrl;
 }
 
 function normalizedOrEmpty(value) {

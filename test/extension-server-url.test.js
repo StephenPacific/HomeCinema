@@ -22,7 +22,7 @@ test("extension server URL has no hard-coded loopback fallback", () => {
   );
 });
 
-test("active Home Cinema tab overrides a stale saved loopback address", () => {
+test("a configured Controller service is not replaced by the active Home Cinema tab", () => {
   const activeTab = {
     title: "Home Cinema LAN Sync",
     url: "http://192.168.20.8:4173/?mode=player"
@@ -34,7 +34,18 @@ test("active Home Cinema tab overrides a stale saved loopback address", () => {
       captureStatus: { phase: "idle" },
       activeTab
     }),
-    "http://192.168.20.8:4173"
+    "http://127.0.0.1:4173"
+  );
+});
+
+test("an active Home Cinema tab configures an otherwise empty extension", () => {
+  assert.equal(
+    resolveServerUrl({
+      savedUrl: "",
+      captureStatus: { phase: "idle" },
+      activeTab: { title: "Home Cinema LAN Sync", url: "http://192.168.20.37:4173/?mode=controller" }
+    }),
+    "http://192.168.20.37:4173"
   );
 });
 

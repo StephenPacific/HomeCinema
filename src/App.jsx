@@ -25,6 +25,7 @@ const EMPTY_STATE = {
   track: null,
   layers: [],
   live: null,
+  roomVolume: 1,
   playing: false,
   position: 0,
   startedAt: null,
@@ -113,6 +114,7 @@ export default function App() {
   const unlockedRef = useRef(unlockedState);
   const readyStatusRef = useRef(readyStatus);
   const remoteMutedRef = useRef(false);
+  const outputVolumeRef = useRef(1);
   const audioReadyRef = useRef(audioReadyState);
   const audioContextRef = useRef(null);
   const gainRef = useRef(null);
@@ -167,12 +169,15 @@ export default function App() {
   const stableSpeakerCount = Number(serverState.live?.stableSpeakers || 0);
   const requiredSpeakerCount = Number(serverState.live?.requiredSpeakers || 0);
   const roomTargetMs = Number(serverState.live?.roomTargetMs || 0);
+  const roomVolume = clamp(Number(serverState.roomVolume ?? 1), 0, 1);
   const livePhaseProgress = clamp(Number(serverState.live?.phaseProgress || 0), 0, 100);
   const livePhaseSampleCount = Number(serverState.live?.phaseSampleCount || 0);
   const livePhaseSampleTarget = Number(serverState.live?.phaseSampleTarget || ROOM_SYNC_POLICY.sampleWindow);
   const livePhaseElapsedMs = Number(serverState.live?.phaseElapsedMs || 0);
   const livePhaseTimeoutMs = Number(serverState.live?.phaseTimeoutMs || 0);
   const livePhaseBlocked = Boolean(serverState.live?.phaseBlocked);
+  const liveLockAttempt = Number(serverState.live?.lockAttempt || 0);
+  const maximumLiveLockAttempts = Number(serverState.live?.maximumLockAttempts || ROOM_SYNC_POLICY.maximumLockAttempts);
   const livePhaseLabel = {
     measuring: "Measuring",
     locking: "Locking",
@@ -433,7 +438,7 @@ export default function App() {
 
   const restoreLiveOutput = useCallback(
     (durationSeconds = 0.025) => {
-      rampLiveOutput(remoteMutedRef.current ? 0 : 1, durationSeconds);
+      rampLiveOutput(remoteMutedRef.current ? 0 : outputVolumeRef.current, durationSeconds);
     },
     [rampLiveOutput]
   );
@@ -449,7 +454,7 @@ export default function App() {
       return setTimeout(() => {
         const muted = remoteMutedRef.current;
         liveAudio.muted = muted;
-        liveAudio.volume = muted ? 0 : 1;
+        liveAudio.volume = muted ? 0 : outputVolumeRef.current;
         if (!muted && liveAudio.paused) {
           const playPromise = liveAudio.play();
           if (playPromise?.catch) playPromise.catch(() => {});
@@ -463,7 +468,7 @@ export default function App() {
     parameter.cancelScheduledValues(now);
     parameter.setValueAtTime(0, now);
     parameter.setValueAtTime(0, startAt);
-    parameter.linearRampToValueAtTime(remoteMutedRef.current ? 0 : 1, startAt + fadeSeconds);
+    parameter.linearRampToValueAtTime(remoteMutedRef.current ? 0 : outputVolumeRef.current, startAt + fadeSeconds);
     return null;
   }, []);
 
@@ -574,6 +579,11 @@ export default function App() {
       const session = liveSessionRef.current;
       if (!session || session.closed || session.transport !== "webrtc" || session.id !== live?.id) return;
       const phase = live.phase || (Number.isFinite(Number(live.playAt)) ? "armed" : "measuring");
+      const nextLockAttempt = Number(live.lockAttempt || 0);
+      if (phase === "locking" && nextLockAttempt !== Number(session.lockAttempt || 0)) {
+        session.lockAttempt = nextLockAttempt;
+        session.postDelayLocked = false;
+      }
       session.phase = phase;
       const playAt = Number(live.playAt);
       session.playAtServerMs = Number.isFinite(playAt) && playAt > 0 ? playAt : null;
@@ -751,6 +761,7 @@ export default function App() {
         localDescriptionSent: false,
         postDelayMs: 0,
         postDelayLocked: false,
+        lockAttempt: Number(live.lockAttempt || 0),
         measuredJitterDelayMs: null,
         lastInboundStats: null,
         unmuteAtLocalMs: null,
@@ -1377,7 +1388,7 @@ export default function App() {
         audioContextRef.current = new AudioApi();
       }
       gainRef.current = audioContextRef.current.createGain();
-      gainRef.current.gain.value = 1;
+      gainRef.current.gain.value = outputVolumeRef.current;
       gainRef.current.connect(audioContextRef.current.destination);
       setAudioContextState(audioContextRef.current.state || "unknown");
       audioContextRef.current.addEventListener?.("statechange", () => {
@@ -1479,6 +1490,7 @@ export default function App() {
           mediaPlaybackTimerRef.current = null;
           try {
             mediaAudio.muted = false;
+            mediaAudio.volume = outputVolumeRef.current;
             mediaAudio.playbackRate = 1;
             mediaAudio.currentTime = Math.max(0, offsetSeconds);
           } catch {}
@@ -1503,7 +1515,7 @@ export default function App() {
       const audioContext = audioContextRef.current;
       const audioBuffer = audioBufferRef.current;
       if (!audioContext || !audioBuffer) return;
-      if (gainRef.current) gainRef.current.gain.value = 1;
+      if (gainRef.current) gainRef.current.gain.value = outputVolumeRef.current;
 
       const nextSource = audioContext.createBufferSource();
       nextSource.buffer = audioBuffer;
@@ -2048,6 +2060,37 @@ export default function App() {
     if (stateRef.current?.playing) scheduleFromState(true);
   }
 
+  function setRemoteVolume(value) {
+    const nextVolume = clamp(Number(value) || 0, 0, 1);
+    outputVolumeRef.current = nextVolume;
+    const liveSession = liveSessionRef.current;
+    if (liveSession) {
+      if (liveSession.startScheduled && liveSession.unmuteAtLocalMs > Date.now()) {
+        clearTimeout(liveSession.volumeTimer);
+        liveSession.volumeTimer = scheduleLiveOutputAt(liveSession.unmuteAtLocalMs);
+      } else if (liveSession.audible && !liveSession.timelineGuard?.quarantined) {
+        rampLiveOutput(remoteMutedRef.current ? 0 : nextVolume, 0.06);
+      }
+      return;
+    }
+
+    const audioContext = audioContextRef.current;
+    const gain = gainRef.current;
+    if (audioContext && gain) {
+      const now = audioContext.currentTime;
+      const parameter = gain.gain;
+      if (typeof parameter.cancelAndHoldAtTime === "function") {
+        parameter.cancelAndHoldAtTime(now);
+      } else {
+        const currentValue = parameter.value;
+        parameter.cancelScheduledValues(now);
+        parameter.setValueAtTime(currentValue, now);
+      }
+      parameter.linearRampToValueAtTime(remoteMutedRef.current ? 0 : nextVolume, now + 0.06);
+    }
+    if (mediaAudioRef.current) mediaAudioRef.current.volume = remoteMutedRef.current ? 0 : nextVolume;
+  }
+
   function setRemoteMuted(nextMuted) {
     const muted = Boolean(nextMuted);
     remoteMutedRef.current = muted;
@@ -2117,6 +2160,10 @@ export default function App() {
       setDeviceOffset(message.value);
       return;
     }
+    if (message.action === "setVolume") {
+      setRemoteVolume(message.value);
+      return;
+    }
     if (message.action === "reconnect") {
       setReadyStatus("Reconnecting by controller");
       try {
@@ -2154,8 +2201,13 @@ export default function App() {
         configureMediaElement(liveAudio);
         if (hasActiveLiveStream) {
           const streamUsesWebAudio = liveOutputModeRef.current === "webrtc-stream-source";
+          const mediaUsesWebAudio = liveOutputModeRef.current === "media-element-source";
           liveAudio.muted = streamUsesWebAudio || remoteMutedRef.current;
-          liveAudio.volume = streamUsesWebAudio || remoteMutedRef.current ? 0 : 1;
+          liveAudio.volume = streamUsesWebAudio
+            ? 0
+            : mediaUsesWebAudio
+              ? 1
+              : remoteMutedRef.current ? 0 : outputVolumeRef.current;
         } else {
           if (!silentAudioUrlRef.current) silentAudioUrlRef.current = createSilentWavUrl();
           liveAudio.src = silentAudioUrlRef.current;
@@ -2171,7 +2223,7 @@ export default function App() {
       const layer = layerById(stateRef.current.layers || [], selectedLayerIdRef.current) || stateRef.current.layers?.[0];
       const audioContext = createAudioContext();
       let webAudioUnlocked = false;
-      if (gainRef.current) gainRef.current.gain.value = 1;
+      if (gainRef.current) gainRef.current.gain.value = outputVolumeRef.current;
       try {
         const primeDone = primeAudioHardware(audioContext, gainRef.current || audioContext.destination);
         if (audioContext.state !== "running") await withTimeout(audioContext.resume(), 450);
@@ -2278,7 +2330,7 @@ export default function App() {
 
     try {
       const audioContext = createAudioContext();
-      if (gainRef.current) gainRef.current.gain.value = 1;
+      if (gainRef.current) gainRef.current.gain.value = outputVolumeRef.current;
       const primeDone = primeAudioHardware(audioContext, gainRef.current || audioContext.destination, 0.16, 0.18);
       if (audioContext.state !== "running") await withTimeout(audioContext.resume(), 1200);
       await primeDone;
@@ -2453,7 +2505,7 @@ export default function App() {
       return;
     }
     await ensureAudioContext();
-    if (gainRef.current) gainRef.current.gain.value = 1;
+    if (gainRef.current) gainRef.current.gain.value = outputVolumeRef.current;
     const oscillator = audioContextRef.current.createOscillator();
     const toneGain = audioContextRef.current.createGain();
     const now = Date.now();
@@ -2641,7 +2693,16 @@ export default function App() {
               {liveActive ? (
                 <>
                   <div className="live-session-summary">
-                    <div><span>Phase</span><strong>{livePhaseBlocked ? `${livePhaseLabel} blocked` : livePhaseLabel}</strong></div>
+                    <div>
+                      <span>Phase</span>
+                      <strong>
+                        {livePhaseBlocked
+                          ? `${livePhaseLabel} blocked`
+                          : livePhase === "locking"
+                            ? `${livePhaseLabel} ${liveLockAttempt}/${maximumLiveLockAttempts}`
+                            : livePhaseLabel}
+                      </strong>
+                    </div>
                     <div><span>Transport</span><strong>WebRTC / Opus</strong></div>
                     <div><span>{livePlaying ? "Active outputs" : "Stable speakers"}</span><strong>{livePlaying ? activeSpeakerCount : stableSpeakerCount} / {requiredSpeakerCount || speakerCount}</strong></div>
                     <div><span>Room target</span><strong>{roomTargetMs ? `${roomTargetMs} ms` : "Measuring"}</strong></div>
@@ -2697,9 +2758,14 @@ export default function App() {
                       </div>
                       <span className="phase-progress-detail">
                         {livePhaseBlocked
-                          ? "Check the speaker Audio path and AudioContext state."
-                          : `${Math.ceil(livePhaseElapsedMs / 1000)}s elapsed · ${Math.max(0, Math.ceil((livePhaseTimeoutMs - livePhaseElapsedMs) / 1000))}s check window`}
+                          ? "Check the speaker Inbound, Audio path, and AudioContext state."
+                          : `${Math.ceil(livePhaseElapsedMs / 1000)}s elapsed · ${Math.max(0, Math.ceil((livePhaseTimeoutMs - livePhaseElapsedMs) / 1000))}s check window${livePhase === "locking" ? ` · attempt ${liveLockAttempt}/${maximumLiveLockAttempts}` : ""}`}
                       </span>
+                      {livePhaseBlocked && livePhase === "locking" && (
+                        <button className="text-button recovery-button phase-retry-button" type="button" onClick={() => send({ type: "roomCommand", action: "retryLock" })}>
+                          <RefreshCw size={15} /> Retry lock
+                        </button>
+                      )}
                     </div>
                   )}
                 </>
@@ -2792,6 +2858,21 @@ export default function App() {
                   </button>
                 </div>
               </div>
+              <div className="room-volume-row">
+                {roomVolume > 0.001 ? <Volume2 size={17} /> : <VolumeX size={17} />}
+                <label htmlFor="roomVolume">Room volume</label>
+                <input
+                  id="roomVolume"
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="5"
+                  value={Math.round(roomVolume * 100)}
+                  aria-valuetext={`${Math.round(roomVolume * 100)} percent`}
+                  onChange={(event) => send({ type: "roomCommand", action: "setVolume", value: Number(event.target.value) / 100 })}
+                />
+                <strong>{Math.round(roomVolume * 100)}%</strong>
+              </div>
               <div className="peers">
                 {!speakerPeers.length && <div className="empty-state">Waiting for speakers to join…</div>}
                 {speakerPeers.map((peer) => (
@@ -2803,6 +2884,7 @@ export default function App() {
                     onToggle={() => send({ type: "deviceCommand", targetId: peer.id, action: peer.muted ? "unmute" : "mute" })}
                     onReconnect={() => send({ type: "deviceCommand", targetId: peer.id, action: "reconnect" })}
                     onOffset={(value) => send({ type: "deviceCommand", targetId: peer.id, action: "setOffset", value })}
+                    onVolume={(value) => send({ type: "deviceCommand", targetId: peer.id, action: "setVolume", value })}
                   />
                 ))}
               </div>
@@ -2990,9 +3072,10 @@ function QrCode({ value }) {
   );
 }
 
-function PeerCard({ peer, layers, onTest, onToggle, onReconnect, onOffset }) {
+function PeerCard({ peer, layers, onTest, onToggle, onReconnect, onOffset, onVolume }) {
   const layer = layerById(layers, peer.layerId);
   const offset = Math.round(Number(peer.deviceOffsetMs) || 0);
+  const volume = clamp(Number(peer.volume ?? 1), 0, 1);
   const health = peer.muted ? "stopped" : peer.health || (peer.ready ? "ready" : peer.unlocked ? "connecting" : "locked");
   const hasIssue = health === "failed";
   const needsTap = health === "locked" || health === "needs-action";
@@ -3050,6 +3133,22 @@ function PeerCard({ peer, layers, onTest, onToggle, onReconnect, onOffset }) {
           <strong>{offset >= 0 ? "+" : ""}{offset} ms</strong>
           <button type="button" aria-label={`Delay ${peer.name} by 10 milliseconds`} onClick={() => onOffset(offset + 10)}>+</button>
         </div>
+      </div>
+      <div className="peer-volume-row">
+        {volume > 0.001 ? <Volume2 size={15} /> : <VolumeX size={15} />}
+        <label htmlFor={`peer-volume-${peer.id}`}>Volume</label>
+        <input
+          id={`peer-volume-${peer.id}`}
+          type="range"
+          min="0"
+          max="100"
+          step="5"
+          value={Math.round(volume * 100)}
+          aria-label={`Volume for ${peer.name}`}
+          aria-valuetext={`${Math.round(volume * 100)} percent`}
+          onChange={(event) => onVolume(Number(event.target.value) / 100)}
+        />
+        <strong>{Math.round(volume * 100)}%</strong>
       </div>
       <div className="peer-actions">
         <button className={`peer-toggle ${peer.muted ? "resume" : ""}`} type="button" onClick={onToggle}>

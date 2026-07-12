@@ -8,10 +8,34 @@ import {
   latestEligibleRoomSpeakers,
   nextFixedTimelineGuard,
   nextPostDelayCorrection,
+  roomLockTimeoutAction,
   roomTimingSample,
   stableRoomTiming,
   supportsRoomSyncVersion
 } from "../src/roomSync.js";
+
+test("timeline lock retries are bounded before the room is blocked", () => {
+  assert.equal(
+    roomLockTimeoutAction({ candidateCount: 1, lockedCount: 0, timedOut: true, lockAttempt: 1 }),
+    "retry"
+  );
+  assert.equal(
+    roomLockTimeoutAction({ candidateCount: 1, lockedCount: 0, timedOut: true, lockAttempt: 3 }),
+    "block"
+  );
+  assert.equal(
+    roomLockTimeoutAction({ candidateCount: 2, lockedCount: 1, timedOut: true, lockAttempt: 1 }),
+    "retry"
+  );
+  assert.equal(
+    roomLockTimeoutAction({ candidateCount: 2, lockedCount: 1, timedOut: true, lockAttempt: 3 }),
+    "block"
+  );
+  assert.equal(
+    roomLockTimeoutAction({ candidateCount: 2, lockedCount: 2, timedOut: true, lockAttempt: 3 }),
+    "wait"
+  );
+});
 
 test("preflight requires fresh consecutive RTP samples with stable delay", () => {
   const now = 10_000;

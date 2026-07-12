@@ -11,6 +11,7 @@ import {
   latestEligibleRoomSpeakers,
   ROOM_SYNC_ENGINE_VERSION,
   ROOM_SYNC_POLICY,
+  roomLockTimeoutAction,
   roomTimingSample,
   stableRoomTiming,
   supportsRoomSyncVersion
@@ -31,6 +32,7 @@ const liveStartLeadMs = clamp(Number(process.env.LIVE_START_LEAD_MS || 1800), 12
 const webRtcBufferMs = clamp(Number(process.env.WEBRTC_BUFFER_MS || 120), 60, 1000);
 
 const clients = new Set();
+const speakerVolumes = new Map();
 let nextClientId = 1;
 
 let state = {
@@ -38,6 +40,7 @@ let state = {
   layers: [],
   live: null,
   playing: false,
+  roomVolume: 1,
   position: 0,
   startedAt: null,
   updatedAt: Date.now()
@@ -135,6 +138,8 @@ server.on("upgrade", (req, socket) => {
     ready: false,
     unlocked: false,
     muted: false,
+    volume: state.roomVolume,
+    volumeAnnounced: false,
     health: "connecting",
     status: "Connecting",
     syncErrorMs: null,
@@ -383,6 +388,15 @@ function handleMessage(client, message) {
     client.name = String(message.name || client.name).slice(0, 40);
     client.deviceKey = String(message.deviceKey || client.deviceKey || "").slice(0, 120) || null;
     client.role = message.role === "controller" ? "controller" : message.role === "capture" ? "capture" : "speaker";
+    if (client.role === "speaker" && !client.volumeAnnounced) {
+      const savedVolume = client.deviceKey ? speakerVolumes.get(client.deviceKey) : null;
+      client.volume = Number.isFinite(savedVolume) ? savedVolume : state.roomVolume;
+      if (client.deviceKey) speakerVolumes.set(client.deviceKey, client.volume);
+      client.volumeAnnounced = true;
+      send(client, { type: "deviceCommand", action: "setVolume", value: client.volume });
+    } else if (client.role !== "speaker") {
+      client.volumeAnnounced = false;
+    }
     client.layerId = message.layerId || client.layerId;
     client.zone = normalizeZone(message.zone || client.zone);
     client.ready = Boolean(message.ready);
@@ -488,16 +502,20 @@ function handleMessage(client, message) {
     const targetId = Number(message.targetId || 0);
     const target = [...clients].find((item) => item.id === targetId && item.role === "speaker");
     const action = String(message.action || "");
-    if (!target || !["mute", "unmute", "reconnect", "setOffset"].includes(action)) return;
+    if (!target || !["mute", "unmute", "reconnect", "setOffset", "setVolume"].includes(action)) return;
 
     if (action === "mute" || action === "unmute") target.muted = action === "mute";
     if (action === "setOffset") {
       target.deviceOffsetMs = clamp(finiteNumber(message.value, target.deviceOffsetMs), -300, 300);
     }
+    if (action === "setVolume") {
+      target.volume = clamp(finiteNumber(message.value, target.volume), 0, 1);
+      if (target.deviceKey) speakerVolumes.set(target.deviceKey, target.volume);
+    }
     send(target, {
       type: "deviceCommand",
       action,
-      value: action === "setOffset" ? target.deviceOffsetMs : undefined,
+      value: action === "setOffset" ? target.deviceOffsetMs : action === "setVolume" ? target.volume : undefined,
       requestedBy: client.name
     });
     evaluateLivePreflight();
@@ -508,7 +526,29 @@ function handleMessage(client, message) {
   if (message.type === "roomCommand") {
     if (client.role !== "controller") return;
     const action = String(message.action || "");
-    if (!["muteSpeakers", "resumeSpeakers", "retryIssues"].includes(action)) return;
+    if (!["muteSpeakers", "resumeSpeakers", "retryIssues", "retryLock", "setVolume"].includes(action)) return;
+    if (action === "setVolume") {
+      state.roomVolume = clamp(finiteNumber(message.value, state.roomVolume), 0, 1);
+      state.updatedAt = Date.now();
+      for (const target of clients) {
+        if (target.role !== "speaker") continue;
+        target.volume = state.roomVolume;
+        if (target.deviceKey) speakerVolumes.set(target.deviceKey, target.volume);
+        send(target, { type: "deviceCommand", action: "setVolume", value: target.volume, requestedBy: client.name });
+      }
+      broadcast({ type: "sync", serverTime: Date.now(), state: publicState() });
+      broadcastPeers();
+      return;
+    }
+    if (action === "retryLock") {
+      if (!state.live?.phaseBlocked || state.live.phase !== "locking" || !livePreflight) return;
+      const candidates = eligibleRoomSpeakers().filter((target) =>
+        livePreflight.candidateKeys.has(speakerIdentity(target))
+      );
+      const stableCandidates = stableLiveCandidates(candidates);
+      retryLiveRoomLock(candidates, stableCandidates, { resetAttempts: true });
+      return;
+    }
     if (action === "retryIssues") {
       for (const target of clients) {
         if (target.role === "speaker" && target.health === "failed") {
@@ -665,6 +705,8 @@ function startLive(client, message) {
     phaseElapsedMs: 0,
     phaseTimeoutMs: ROOM_SYNC_POLICY.preflightTimeoutMs,
     phaseBlocked: false,
+    lockAttempt: 0,
+    maximumLockAttempts: ROOM_SYNC_POLICY.maximumLockAttempts,
     participantIds: []
   };
   state.updatedAt = Date.now();
@@ -743,12 +785,7 @@ function evaluateLivePreflight() {
   const candidates = eligibleRoomSpeakers().filter((client) =>
     livePreflight.candidateKeys.has(speakerIdentity(client))
   );
-  const stableCandidates = candidates.filter((client) =>
-    client.timingStable &&
-    (client.rtcEmittedCount > 0 || client.rtcBytesReceived > 0) &&
-    client.outputPath.endsWith("source") &&
-    client.audioContextState === "running"
-  );
+  const stableCandidates = stableLiveCandidates(candidates);
 
   state.live.requiredSpeakers = candidates.length;
   state.live.stableSpeakers = stableCandidates.length;
@@ -764,9 +801,18 @@ function evaluateLivePreflight() {
     state.live.excludedSpeakers = Math.max(0, candidates.length - lockedCandidates.length);
     const lockTimedOut = now - livePreflight.phaseStartedAt >= ROOM_SYNC_POLICY.lockTimeoutMs;
     updateLivePhaseProgress(candidates, lockedCandidates, now, ROOM_SYNC_POLICY.lockTimeoutMs);
-    state.live.phaseBlocked = candidates.length > 0 && lockTimedOut && !lockedCandidates.length;
-    if (!lockedCandidates.length) return;
-    if (lockedCandidates.length !== candidates.length && !lockTimedOut) return;
+    const timeoutAction = roomLockTimeoutAction({
+      candidateCount: candidates.length,
+      lockedCount: lockedCandidates.length,
+      timedOut: lockTimedOut,
+      lockAttempt: state.live.lockAttempt
+    });
+    if (timeoutAction === "retry") {
+      retryLiveRoomLock(candidates, stableCandidates);
+      return;
+    }
+    state.live.phaseBlocked = timeoutAction === "block";
+    if (state.live.phaseBlocked || lockedCandidates.length !== candidates.length) return;
     armLiveRoom(lockedCandidates, candidates);
     return;
   }
@@ -777,6 +823,15 @@ function evaluateLivePreflight() {
   if (!stableCandidates.length) return;
   if (stableCandidates.length !== candidates.length && !timedOut) return;
   lockLiveRoom(stableCandidates, candidates);
+}
+
+function stableLiveCandidates(candidates) {
+  return candidates.filter((client) =>
+    client.timingStable &&
+    (client.rtcEmittedCount > 0 || client.rtcBytesReceived > 0) &&
+    client.outputPath.endsWith("source") &&
+    client.audioContextState === "running"
+  );
 }
 
 function lockLiveRoom(stableCandidates, candidates) {
@@ -793,6 +848,8 @@ function lockLiveRoom(stableCandidates, candidates) {
   state.live.phaseElapsedMs = 0;
   state.live.phaseTimeoutMs = ROOM_SYNC_POLICY.lockTimeoutMs;
   state.live.phaseBlocked = false;
+  state.live.lockAttempt = 1;
+  state.live.maximumLockAttempts = ROOM_SYNC_POLICY.maximumLockAttempts;
   state.live.participantIds = stableCandidates.map((client) => client.id);
   state.updatedAt = Date.now();
   livePreflight = {
@@ -806,6 +863,49 @@ function lockLiveRoom(stableCandidates, candidates) {
     client.timingSpreadMs = null;
   }
   broadcast({ type: "liveLock", state: publicState() });
+}
+
+function retryLiveRoomLock(candidates, stableCandidates, { resetAttempts = false } = {}) {
+  if (!state.live || state.live.phase !== "locking" || !livePreflight || !candidates.length) return false;
+  const stableTimings = stableCandidates
+    .map((client) => stableRoomTiming(client.timingSamples))
+    .filter((timing) =>
+      timing.stable && timing.delayMs > state.live.roomTargetMs + ROOM_SYNC_POLICY.lockToleranceMs
+    );
+  if (stableTimings.length) {
+    state.live.roomTargetMs = Math.max(
+      state.live.roomTargetMs,
+      fixedRoomTargetMs(stableTimings, state.live.roomTargetMs)
+    );
+  }
+  state.live.lockAttempt = resetAttempts ? 1 : Math.min(
+    ROOM_SYNC_POLICY.maximumLockAttempts,
+    Number(state.live.lockAttempt || 1) + 1
+  );
+  state.live.maximumLockAttempts = ROOM_SYNC_POLICY.maximumLockAttempts;
+  state.live.stableSpeakers = 0;
+  state.live.requiredSpeakers = candidates.length;
+  state.live.excludedSpeakers = candidates.length;
+  state.live.phaseProgress = 0;
+  state.live.phaseSampleCount = 0;
+  state.live.phaseElapsedMs = 0;
+  state.live.phaseTimeoutMs = ROOM_SYNC_POLICY.lockTimeoutMs;
+  state.live.phaseBlocked = false;
+  state.updatedAt = Date.now();
+  livePreflight = {
+    liveId: state.live.id,
+    phaseStartedAt: Date.now(),
+    candidateKeys: new Set(candidates.map(speakerIdentity))
+  };
+  for (const client of candidates) {
+    client.timingSamples = [];
+    client.timingStable = false;
+    client.timingSpreadMs = null;
+    client.postDelayMs = 0;
+    client.timelineState = "locking";
+  }
+  broadcast({ type: "liveLock", state: publicState() });
+  return true;
 }
 
 function updateLivePhaseProgress(candidates, acceptedCandidates, now, timeoutMs) {
@@ -1074,6 +1174,7 @@ function peerList() {
       ready: compatible && client.ready,
       unlocked: client.unlocked,
       muted: client.muted,
+      volume: client.volume,
       health: compatible ? client.health : "needs-action",
       status: compatible ? client.status : `Refresh speaker page (sync engine v${ROOM_SYNC_ENGINE_VERSION})`,
       syncErrorMs: client.syncErrorMs,

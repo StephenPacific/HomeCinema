@@ -31,6 +31,8 @@ const state = {
   phaseElapsedMs: 0,
   phaseTimeoutMs: 0,
   phaseBlocked: false,
+  lockAttempt: 0,
+  maximumLockAttempts: 3,
   unmuteAt: 0,
   countdownTimer: null,
   reconnectTimer: null,
@@ -225,6 +227,8 @@ function scheduleCaptureReconnect(socket) {
   state.phaseProgress = 0;
   state.phaseSampleCount = 0;
   state.phaseBlocked = false;
+  state.lockAttempt = 0;
+  state.maximumLockAttempts = 3;
   muteLocalPlayback();
   if (state.stopping || !state.stream || state.reconnectTimer) return;
 
@@ -514,8 +518,8 @@ function updateCaptureStatus() {
     setStatus({
       phase: "connecting",
       detail: state.phaseBlocked
-        ? "Timeline lock blocked; open Home Cinema to inspect the speaker."
-        : `Locking the room at ${Math.round(state.roomTargetMs)} ms · ${state.phaseSampleCount}/${state.phaseSampleTarget} samples...`,
+        ? `Timeline lock blocked after ${state.maximumLockAttempts} attempts; inspect the speaker or retry from Controller.`
+        : `Locking attempt ${state.lockAttempt}/${state.maximumLockAttempts} at ${Math.round(state.roomTargetMs)} ms · ${state.phaseSampleCount}/${state.phaseSampleTarget} samples...`,
       serverUrl: state.serverUrl,
       title: state.tabTitle,
       ...liveProgressStatus()
@@ -558,6 +562,8 @@ function updateLiveProgress(live) {
   state.phaseElapsedMs = Math.max(0, Number(live?.phaseElapsedMs || 0));
   state.phaseTimeoutMs = Math.max(0, Number(live?.phaseTimeoutMs || 0));
   state.phaseBlocked = Boolean(live?.phaseBlocked);
+  state.lockAttempt = Math.max(0, Number(live?.lockAttempt || 0));
+  state.maximumLockAttempts = Math.max(1, Number(live?.maximumLockAttempts || 3));
 }
 
 function liveProgressStatus() {
@@ -570,7 +576,9 @@ function liveProgressStatus() {
     requiredSpeakers: state.requiredSpeakers,
     elapsedMs: state.phaseElapsedMs,
     timeoutMs: state.phaseTimeoutMs,
-    blocked: state.phaseBlocked
+    blocked: state.phaseBlocked,
+    lockAttempt: state.lockAttempt,
+    maximumLockAttempts: state.maximumLockAttempts
   };
 }
 
@@ -596,6 +604,8 @@ function finishCapture(status, notifyServer = true) {
   state.phaseElapsedMs = 0;
   state.phaseTimeoutMs = 0;
   state.phaseBlocked = false;
+  state.lockAttempt = 0;
+  state.maximumLockAttempts = 3;
   resetControllerAudioMonitor();
   for (const peerId of [...state.peers.keys()]) closeWebRtcPeer(peerId);
   if (socket && socket.readyState === WebSocket.OPEN && notifyServer) {

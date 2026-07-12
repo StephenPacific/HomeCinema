@@ -6,6 +6,7 @@ export const ROOM_SYNC_POLICY = Object.freeze({
   maximumStableSpreadMs: 12,
   preflightTimeoutMs: 12_000,
   lockTimeoutMs: 12_000,
+  maximumLockAttempts: 3,
   lockToleranceMs: 10,
   roomSafetyMarginMs: 8,
   minimumRoomTargetMs: 100,
@@ -19,6 +20,19 @@ export const ROOM_SYNC_POLICY = Object.freeze({
   violationSamples: 3,
   recoverySamples: 3
 });
+
+export function roomLockTimeoutAction({
+  candidateCount,
+  lockedCount,
+  timedOut,
+  lockAttempt,
+  policy = ROOM_SYNC_POLICY
+}) {
+  const candidates = Math.max(0, Number(candidateCount) || 0);
+  const locked = Math.max(0, Number(lockedCount) || 0);
+  if (!timedOut || candidates <= 0 || locked >= candidates) return "wait";
+  return Number(lockAttempt) < policy.maximumLockAttempts ? "retry" : "block";
+}
 
 export function supportsRoomSyncVersion(value, requiredVersion = ROOM_SYNC_ENGINE_VERSION) {
   const version = Number(value);
