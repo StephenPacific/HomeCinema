@@ -9,7 +9,10 @@
     "test": "node --test",
     "start": "npm run build && node server.js",
     "serve": "node server.js",
-    "dev": "npm run build && node server.js"
+    "dev": "npm run build && node server.js",
+    "plugin:signal": "node plugin-cloud/server.js",
+    "plugin:probe": "node scripts/probe-plugin-cloud.js",
+    "plugin:preview-room": "node scripts/hold-plugin-room.js"
   },
   "engines": {
     "node": ">=18"

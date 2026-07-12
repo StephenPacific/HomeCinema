@@ -1,200 +1,305 @@
-import {
-  canonicalControllerServiceUrl,
-  controllerPageUrl,
-  controllerProbeWebSocketUrl,
-  normalizeServerUrl,
-  resolveServerUrl
-} from "./server-url.js";
+import { DEFAULT_SIGNALING_ORIGIN, normalizeSignalingOrigin } from "./plugin-room.js";
+import { createQrMatrix } from "./qr.js";
 
-const serverUrlInput = document.querySelector("#serverUrl");
-const tabTitle = document.querySelector("#tabTitle");
-const statusText = document.querySelector("#statusText");
-const statusDot = document.querySelector("#statusDot");
-const progressPanel = document.querySelector("#progressPanel");
-const progressLabel = document.querySelector("#progressLabel");
-const progressValue = document.querySelector("#progressValue");
-const progressTrack = progressPanel.querySelector(".progress-track");
-const progressBar = document.querySelector("#progressBar");
-const progressDetail = document.querySelector("#progressDetail");
-const startButton = document.querySelector("#startButton");
-const stopButton = document.querySelector("#stopButton");
-const openButton = document.querySelector("#openButton");
-const localButton = document.querySelector("#localButton");
+const elements = {
+  emptyRoom: document.querySelector("#emptyRoom"),
+  roomPanel: document.querySelector("#roomPanel"),
+  createRoomButton: document.querySelector("#createRoomButton"),
+  roomCode: document.querySelector("#roomCode"),
+  roomConnection: document.querySelector("#roomConnection"),
+  roomQr: document.querySelector("#roomQr"),
+  speakerCount: document.querySelector("#speakerCount"),
+  speakerList: document.querySelector("#speakerList"),
+  copyLinkButton: document.querySelector("#copyLinkButton"),
+  endRoomButton: document.querySelector("#endRoomButton"),
+  tabTitle: document.querySelector("#tabTitle"),
+  statusText: document.querySelector("#statusText"),
+  statusDot: document.querySelector("#statusDot"),
+  progressPanel: document.querySelector("#progressPanel"),
+  progressLabel: document.querySelector("#progressLabel"),
+  progressValue: document.querySelector("#progressValue"),
+  progressTrack: document.querySelector("#progressTrack"),
+  progressBar: document.querySelector("#progressBar"),
+  progressDetail: document.querySelector("#progressDetail"),
+  volumeSlider: document.querySelector("#volumeSlider"),
+  volumeValue: document.querySelector("#volumeValue"),
+  startButton: document.querySelector("#startButton"),
+  stopButton: document.querySelector("#stopButton"),
+  signalingOrigin: document.querySelector("#signalingOrigin")
+};
 
 let activeTab = null;
-let captureStatus = { phase: "idle", detail: "Ready to capture the active tab." };
+let busy = false;
+let renderedQrValue = "";
+let volumeTimer = null;
+let roomStatus = idleRoomStatus();
+let captureStatus = idleCaptureStatus();
 
-initialize().catch((error) => renderStatus({ phase: "error", detail: error.message || "Could not open Home Cinema." }));
+initialize().catch((error) => {
+  renderCaptureStatus({ phase: "error", plugin: true, detail: error.message || "Could not open Home Cinema." });
+});
 
-startButton.addEventListener("click", async () => {
-  try {
-    const serverUrl = normalizeServerUrl(serverUrlInput.value);
-    if (!activeTab?.id) throw new Error("No active browser tab found.");
-    renderStatus({ phase: "connecting", detail: "Preparing tab audio..." });
+elements.createRoomButton.addEventListener("click", async () => {
+  await runBusy(async () => {
+    const signalingOrigin = normalizeSignalingOrigin(elements.signalingOrigin.value);
+    await ensureOriginPermission(signalingOrigin);
+    await chrome.storage.local.set({ pluginSignalingOrigin: signalingOrigin });
     const response = await sendMessage({
-      type: "start-capture",
-      tabId: activeTab.id,
-      tabTitle: activeTab.title || "Current Chrome tab",
-      serverUrl
+      type: "create-plugin-room",
+      signalingOrigin,
+      controllerName: await controllerName()
     });
-    if (!response?.ok) throw new Error(response?.error || "Could not start capture.");
-    await chrome.storage.local.set({ homeCinemaUrl: serverUrl });
-  } catch (error) {
-    renderStatus({ phase: "error", detail: error.message || "Could not start capture." });
-  }
+    if (!response?.ok) throw new Error(response?.error || "Could not create a room.");
+    renderRoomStatus(response.status);
+  });
 });
 
-stopButton.addEventListener("click", async () => {
-  await sendMessage({ type: "stop-capture" });
-  renderStatus({ phase: "idle", detail: "Stopping capture..." });
+elements.startButton.addEventListener("click", async () => {
+  await runBusy(async () => {
+    if (!activeTab?.id) throw new Error("No active browser tab found.");
+    renderCaptureStatus({ phase: "connecting", plugin: true, detail: "Preparing tab audio..." });
+    const response = await sendMessage({
+      type: "start-plugin-capture",
+      tabId: activeTab.id,
+      tabTitle: activeTab.title || "Current Chrome tab"
+    });
+    if (!response?.ok) throw new Error(response?.error || "Could not start tab audio.");
+  });
 });
 
-openButton.addEventListener("click", async () => {
+elements.stopButton.addEventListener("click", async () => {
+  await runBusy(async () => {
+    const response = await sendMessage({ type: "stop-plugin-capture" });
+    if (!response?.ok) throw new Error(response?.error || "Could not stop tab audio.");
+    renderCaptureStatus({ phase: "idle", plugin: true, detail: "Tab audio stopped. The room remains open." });
+  });
+});
+
+elements.endRoomButton.addEventListener("click", async () => {
+  await runBusy(async () => {
+    const response = await sendMessage({ type: "close-plugin-room" });
+    if (!response?.ok) throw new Error(response?.error || "Could not end this room.");
+    renderRoomStatus(response.status || idleRoomStatus());
+  });
+});
+
+elements.copyLinkButton.addEventListener("click", async () => {
+  if (!roomStatus.speakerUrl) return;
   try {
-    const serverUrl = normalizeServerUrl(serverUrlInput.value);
-    await chrome.storage.local.set({ homeCinemaUrl: serverUrl });
-    await chrome.tabs.create({ url: controllerPageUrl(serverUrl) });
-  } catch (error) {
-    renderStatus({ phase: "error", detail: error.message || "Invalid Home Cinema address." });
+    await navigator.clipboard.writeText(roomStatus.speakerUrl);
+    const original = elements.copyLinkButton.textContent;
+    elements.copyLinkButton.textContent = "Copied";
+    setTimeout(() => {
+      elements.copyLinkButton.textContent = original;
+    }, 1_200);
+  } catch {
+    renderCaptureStatus({ phase: "error", plugin: true, detail: "The Speaker invite could not be copied." });
   }
 });
 
-localButton.addEventListener("click", async () => {
-  const localUrl = "http://127.0.0.1:4173";
-  serverUrlInput.value = localUrl;
-  await chrome.storage.local.set({ homeCinemaUrl: localUrl });
-  updateActionState();
+elements.volumeSlider.addEventListener("input", () => {
+  const value = Number(elements.volumeSlider.value);
+  elements.volumeValue.textContent = `${value}%`;
+  clearTimeout(volumeTimer);
+  volumeTimer = setTimeout(() => {
+    sendMessage({ type: "set-plugin-volume", value: value / 100 }).catch(() => {});
+    chrome.storage.local.set({ pluginVolume: value / 100 });
+  }, 70);
 });
 
-serverUrlInput.addEventListener("change", () => {
+elements.signalingOrigin.addEventListener("change", () => {
   try {
-    chrome.storage.local.set({ homeCinemaUrl: normalizeServerUrl(serverUrlInput.value) });
-  } catch {}
-});
-
-serverUrlInput.addEventListener("input", updateActionState);
-
-chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== "local") return;
-  if (changes.homeCinemaUrl && document.activeElement !== serverUrlInput) {
-    serverUrlInput.value = changes.homeCinemaUrl.newValue || "";
-    updateActionState();
+    const value = normalizeSignalingOrigin(elements.signalingOrigin.value);
+    elements.signalingOrigin.value = value;
+    chrome.storage.local.set({ pluginSignalingOrigin: value });
+  } catch (error) {
+    renderCaptureStatus({ phase: "error", plugin: true, detail: error.message || "Invalid signaling address." });
   }
-  if (changes.captureStatus) renderStatus(changes.captureStatus.newValue);
 });
 
 chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === "capture-status") renderStatus(message.status);
+  if (message.type === "plugin-room-status") renderRoomStatus(message.status);
+  if (message.type === "capture-status" && message.status?.plugin) renderCaptureStatus(message.status);
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === "session" && changes.pluginRoomStatus) renderRoomStatus(changes.pluginRoomStatus.newValue);
+  if (areaName === "local" && changes.captureStatus?.newValue?.plugin) {
+    renderCaptureStatus(changes.captureStatus.newValue);
+  }
 });
 
 async function initialize() {
-  const [{ homeCinemaUrl }, tab, response] = await Promise.all([
-    chrome.storage.local.get("homeCinemaUrl"),
+  const [{ pluginSignalingOrigin, pluginVolume }, tab, roomResponse, captureResponse] = await Promise.all([
+    chrome.storage.local.get(["pluginSignalingOrigin", "pluginVolume"]),
     activeTabQuery(),
+    sendMessage({ type: "get-plugin-room-status" }),
     sendMessage({ type: "get-capture-status" })
   ]);
   activeTab = tab;
-  const nextStatus = response?.status || captureStatus;
-  const resolvedUrl = resolveServerUrl({ savedUrl: homeCinemaUrl, captureStatus: nextStatus, activeTab: tab });
-  const serverUrl = await canonicalizeControllerService(resolvedUrl);
-  serverUrlInput.value = serverUrl;
-  let savedUrl = "";
-  try {
-    savedUrl = normalizeServerUrl(homeCinemaUrl);
-  } catch {}
-  if (serverUrl && serverUrl !== savedUrl) {
-    await chrome.storage.local.set({ homeCinemaUrl: serverUrl });
-  }
-  tabTitle.textContent = tab?.title || "No active tab";
-  renderStatus(
-    serverUrl || nextStatus.phase !== "idle"
-      ? nextStatus
-      : { ...nextStatus, detail: "Enter the Home Cinema address, or open its Controller page and reopen this extension." }
-  );
-}
-
-async function canonicalizeControllerService(value) {
-  if (!value) return "";
-  const configuredUrl = normalizeServerUrl(value);
-  const hostname = new URL(configuredUrl).hostname;
-  if (["localhost", "127.0.0.1", "::1"].includes(hostname)) return configuredUrl;
-  try {
-    const hello = await probeControllerService(configuredUrl);
-    return canonicalControllerServiceUrl(configuredUrl, hello);
-  } catch {
-    return configuredUrl;
+  elements.tabTitle.textContent = tab?.title || "No active tab";
+  elements.signalingOrigin.value = pluginSignalingOrigin || DEFAULT_SIGNALING_ORIGIN;
+  const volume = Math.round(Math.max(0, Math.min(1, Number(pluginVolume ?? 1))) * 100);
+  elements.volumeSlider.value = String(volume);
+  elements.volumeValue.textContent = `${volume}%`;
+  renderRoomStatus(roomResponse?.status || idleRoomStatus());
+  renderCaptureStatus(captureResponse?.status?.plugin ? captureResponse.status : idleCaptureStatus());
+  if (roomStatus.exists && volume !== Math.round(Number(roomStatus.volume ?? 1) * 100)) {
+    sendMessage({ type: "set-plugin-volume", value: volume / 100 }).catch(() => {});
   }
 }
 
-function probeControllerService(value, timeoutMs = 900) {
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(controllerProbeWebSocketUrl(value));
-    let settled = false;
-    let timer = null;
-    const finish = (error, hello) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        socket.close();
-      } catch {}
-      if (error) reject(error);
-      else resolve(hello);
-    };
-    timer = setTimeout(() => finish(new Error("Controller service probe timed out.")), timeoutMs);
-    socket.addEventListener("message", (event) => {
-      if (typeof event.data !== "string") return;
-      try {
-        const message = JSON.parse(event.data);
-        if (message.type === "hello") finish(null, message);
-      } catch {}
-    });
-    socket.addEventListener("error", () => finish(new Error("Controller service probe failed.")));
-  });
+async function runBusy(action) {
+  if (busy) return;
+  busy = true;
+  updateActionState();
+  try {
+    await action();
+  } catch (error) {
+    renderCaptureStatus({ phase: "error", plugin: true, detail: error.message || "Home Cinema could not complete this action." });
+  } finally {
+    busy = false;
+    updateActionState();
+  }
+}
+
+function renderRoomStatus(status) {
+  roomStatus = { ...idleRoomStatus(), ...(status || {}) };
+  const exists = Boolean(roomStatus.exists);
+  elements.emptyRoom.hidden = exists;
+  elements.roomPanel.hidden = !exists;
+  elements.roomCode.textContent = roomStatus.roomId || "------";
+  const count = Math.max(0, Number(roomStatus.speakerCount || 0));
+  elements.speakerCount.textContent = `${count} Speaker${count === 1 ? "" : "s"}`;
+  elements.roomConnection.textContent = connectionLabel(roomStatus.connection);
+  elements.roomConnection.className = `connection-badge ${roomStatus.connection || "offline"}`;
+  elements.statusDot.classList.toggle("active", roomStatus.connection === "online");
+  renderSpeakers(roomStatus.speakers || []);
+  renderQr(roomStatus.speakerUrl || "");
+  if (document.activeElement !== elements.volumeSlider && Number.isFinite(Number(roomStatus.volume))) {
+    const volume = Math.round(Number(roomStatus.volume) * 100);
+    elements.volumeSlider.value = String(volume);
+    elements.volumeValue.textContent = `${volume}%`;
+  }
+  if (exists && captureStatus.phase === "idle") {
+    elements.statusText.textContent = count
+      ? `${count} Speaker${count === 1 ? " is" : "s are"} ready for the current tab.`
+      : "Room ready; waiting for a Speaker.";
+  }
+  updateActionState();
+}
+
+function renderSpeakers(speakers) {
+  elements.speakerList.replaceChildren();
+  if (!speakers.length) {
+    const empty = document.createElement("div");
+    empty.className = "speaker-empty";
+    empty.textContent = "No Speakers joined";
+    elements.speakerList.append(empty);
+    return;
+  }
+  for (const speaker of speakers.slice(0, 6)) {
+    const item = document.createElement("div");
+    item.className = "speaker-item";
+    const name = document.createElement("span");
+    name.textContent = speaker.name || "Speaker";
+    const stateLabel = document.createElement("span");
+    stateLabel.textContent = "Joined";
+    item.append(name, stateLabel);
+    elements.speakerList.append(item);
+  }
+}
+
+function renderCaptureStatus(status) {
+  captureStatus = status?.plugin ? status : idleCaptureStatus();
+  elements.statusText.textContent = captureStatus.detail || "Ready.";
+  elements.statusText.classList.toggle("error", captureStatus.phase === "error");
+  const progress = Math.max(0, Math.min(100, Number(captureStatus.progress || 0)));
+  const showProgress = ["measuring", "armed"].includes(captureStatus.stage);
+  elements.progressPanel.hidden = !showProgress;
+  elements.progressPanel.classList.toggle("blocked", Boolean(captureStatus.blocked));
+  elements.progressLabel.textContent = captureStatus.blocked
+    ? "Waiting"
+    : captureStatus.stage === "armed" ? "Starting" : "Measuring";
+  elements.progressValue.textContent = `${Math.round(progress)}%`;
+  elements.progressBar.style.width = `${progress}%`;
+  elements.progressTrack.setAttribute("aria-valuenow", String(Math.round(progress)));
+  const samples = Math.max(0, Number(captureStatus.sampleCount || 0));
+  const sampleTarget = Math.max(1, Number(captureStatus.sampleTarget || 3));
+  const stable = Math.max(0, Number(captureStatus.stableSpeakers || 0));
+  const required = Math.max(0, Number(captureStatus.requiredSpeakers || 0));
+  elements.progressDetail.textContent = captureStatus.stage === "armed"
+    ? `${stable}/${required} Speakers locked`
+    : `${samples}/${sampleTarget} samples · ${stable}/${required} Speakers stable`;
+  updateActionState();
+}
+
+function updateActionState() {
+  const active = ["connecting", "capturing"].includes(captureStatus.phase);
+  const roomReady = roomStatus.exists && roomStatus.connection === "online";
+  const hasSpeaker = Number(roomStatus.speakerCount || 0) > 0;
+  elements.createRoomButton.disabled = busy;
+  elements.startButton.disabled = busy || active || !roomReady || !hasSpeaker || !activeTab?.id;
+  elements.stopButton.disabled = busy || !active;
+  elements.copyLinkButton.disabled = busy || !roomStatus.speakerUrl;
+  elements.endRoomButton.disabled = busy || !roomStatus.exists;
+  elements.volumeSlider.disabled = !roomStatus.exists;
+}
+
+function renderQr(value) {
+  if (!value || value === renderedQrValue) return;
+  renderedQrValue = value;
+  const matrix = createQrMatrix(value);
+  const quietZone = 4;
+  const cellCount = matrix.length + quietZone * 2;
+  const scale = 4;
+  const canvas = elements.roomQr;
+  canvas.width = cellCount * scale;
+  canvas.height = cellCount * scale;
+  const context = canvas.getContext("2d");
+  context.imageSmoothingEnabled = false;
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = "#080a0b";
+  for (let y = 0; y < matrix.length; y += 1) {
+    for (let x = 0; x < matrix.length; x += 1) {
+      if (matrix[y][x]) context.fillRect((x + quietZone) * scale, (y + quietZone) * scale, scale, scale);
+    }
+  }
+}
+
+async function ensureOriginPermission(origin) {
+  if (!chrome.permissions) return;
+  const url = new URL(origin);
+  const pattern = `${url.protocol}//${url.host}/*`;
+  const granted = await chrome.permissions.request({ origins: [pattern] });
+  if (!granted) throw new Error("Home Cinema needs access to the selected signaling service.");
 }
 
 function activeTabQuery() {
   return chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(([tab]) => tab);
 }
 
-function renderStatus(status) {
-  captureStatus = status || captureStatus;
-  statusText.textContent = captureStatus.detail || "Ready to capture the active tab.";
-  const active = captureStatus.phase === "capturing" || captureStatus.phase === "connecting";
-  statusDot.classList.toggle("active", active);
-  statusText.classList.toggle("error", captureStatus.phase === "error");
-  const progress = Math.max(0, Math.min(100, Number(captureStatus.progress || 0)));
-  const showProgress = ["measuring", "locking", "armed"].includes(captureStatus.stage);
-  progressPanel.hidden = !showProgress;
-  progressPanel.classList.toggle("blocked", Boolean(captureStatus.blocked));
-  progressLabel.textContent = captureStatus.blocked
-    ? "Blocked"
-    : { measuring: "Measuring", locking: "Locking", armed: "Armed" }[captureStatus.stage] || "Preparing";
-  progressValue.textContent = `${Math.round(progress)}%`;
-  progressBar.style.width = `${progress}%`;
-  progressTrack.setAttribute("aria-valuenow", String(Math.round(progress)));
-  const sampleCount = Math.max(0, Number(captureStatus.sampleCount || 0));
-  const sampleTarget = Math.max(1, Number(captureStatus.sampleTarget || 3));
-  const stableSpeakers = Math.max(0, Number(captureStatus.stableSpeakers || 0));
-  const requiredSpeakers = Math.max(0, Number(captureStatus.requiredSpeakers || 0));
-  const speakerLabel = captureStatus.stage === "locking" ? "locked" : "stable";
-  const lockAttempt = Math.max(0, Number(captureStatus.lockAttempt || 0));
-  const maximumLockAttempts = Math.max(1, Number(captureStatus.maximumLockAttempts || 3));
-  progressDetail.textContent = requiredSpeakers
-    ? `${sampleCount}/${sampleTarget} samples · ${stableSpeakers}/${requiredSpeakers} speakers ${speakerLabel}${captureStatus.stage === "locking" ? ` · attempt ${lockAttempt}/${maximumLockAttempts}` : ""}`
-    : `${sampleCount}/${sampleTarget} samples · waiting for a speaker`;
-  updateActionState();
+async function controllerName() {
+  try {
+    const info = await chrome.runtime.getPlatformInfo();
+    return `${platformLabel(info.os)} Chrome`;
+  } catch {
+    return "Chrome Controller";
+  }
 }
 
-function updateActionState() {
-  const active = captureStatus.phase === "capturing" || captureStatus.phase === "connecting";
-  let configured = false;
-  try {
-    configured = Boolean(normalizeServerUrl(serverUrlInput.value));
-  } catch {}
-  startButton.disabled = active || !configured;
-  stopButton.disabled = !active;
-  openButton.disabled = !configured;
+function platformLabel(os) {
+  return { mac: "Mac", win: "Windows", android: "Android", cros: "ChromeOS", linux: "Linux" }[os] || "Chrome";
+}
+
+function connectionLabel(connection) {
+  return {
+    online: "Room online",
+    connecting: "Connecting",
+    reconnecting: "Reconnecting",
+    offline: "Offline"
+  }[connection] || "Offline";
 }
 
 function sendMessage(message) {
@@ -208,4 +313,21 @@ function sendMessage(message) {
       resolve(response);
     });
   });
+}
+
+function idleRoomStatus() {
+  return {
+    exists: false,
+    roomId: "",
+    speakerUrl: "",
+    speakerCount: 0,
+    speakers: [],
+    connection: "offline",
+    capturePhase: "idle",
+    volume: 1
+  };
+}
+
+function idleCaptureStatus() {
+  return { phase: "idle", plugin: true, detail: "Create a room to begin." };
 }

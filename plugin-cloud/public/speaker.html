@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0b0d0f" />
+    <title>Home Cinema Speaker</title>
+    <link rel="stylesheet" href="/speaker.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">HC</span>
+        <div>
+          <strong>Home Cinema</strong>
+          <span>Room <b id="roomCode">------</b></span>
+        </div>
+      </div>
+      <span id="connectionState" class="connection-state">Connecting</span>
+    </header>
+
+    <main>
+      <section class="speaker-stage" aria-labelledby="speakerTitle">
+        <p class="eyebrow">THIS DEVICE</p>
+        <h1 id="speakerTitle">Join as a speaker</h1>
+        <p id="sessionTitle" class="session-title">Waiting for the Controller</p>
+
+        <div id="statusBanner" class="status-banner" role="status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <div>
+            <strong id="statusTitle">Connecting to room</strong>
+            <span id="statusDetail">Checking the invitation and Controller status.</span>
+          </div>
+        </div>
+
+        <button id="enableButton" class="primary-action" type="button">
+          <span aria-hidden="true">◖</span>
+          Enable speaker
+        </button>
+
+        <div class="speaker-metrics" aria-label="Speaker timing status">
+          <div><span>Network</span><strong id="networkMetric">--</strong></div>
+          <div><span>Output</span><strong id="outputMetric">--</strong></div>
+          <div><span>Room delay</span><strong id="targetMetric">120 ms</strong></div>
+        </div>
+      </section>
+
+      <section class="device-settings" aria-labelledby="deviceHeading">
+        <div>
+          <h2 id="deviceHeading">Device</h2>
+          <span id="controllerName">Waiting for Controller</span>
+        </div>
+        <label for="deviceName">Device name</label>
+        <input id="deviceName" type="text" maxlength="40" autocomplete="off" />
+      </section>
+
+      <details class="diagnostics">
+        <summary>
+          <span>Connection details</span>
+          <span id="diagnosticState">Waiting</span>
+        </summary>
+        <dl>
+          <div><dt>WebRTC</dt><dd id="rtcState">New</dd></div>
+          <div><dt>Audio engine</dt><dd id="audioState">Locked</dd></div>
+          <div><dt>Playout</dt><dd id="playoutMetric">--</dd></div>
+          <div><dt>Compensation</dt><dd id="compensationMetric">--</dd></div>
+          <div><dt>Clock offset</dt><dd id="clockMetric">--</dd></div>
+          <div><dt>Protocol</dt><dd>Plugin v1</dd></div>
+        </dl>
+      </details>
+    </main>
+
+    <audio id="fallbackAudio" playsinline preload="auto"></audio>
+    <script type="module" src="/speaker.js"></script>
+  </body>
+</html>

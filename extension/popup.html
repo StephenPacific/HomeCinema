@@ -8,44 +8,81 @@
   </head>
   <body>
     <main>
-      <header>
-        <span class="mark">HC</span>
-        <div>
+      <header class="app-header">
+        <span class="mark" aria-hidden="true">HC</span>
+        <div class="brand-copy">
           <strong>Home Cinema</strong>
-          <span>WebRTC tab audio</span>
+          <span>Browser speaker room</span>
         </div>
         <span id="statusDot" class="dot" aria-hidden="true"></span>
       </header>
 
-      <div class="service-heading">
-        <label for="serverUrl">Controller service</label>
-        <button id="localButton" type="button">Use this computer</button>
-      </div>
-      <input id="serverUrl" type="url" inputmode="url" autocomplete="url" spellcheck="false" placeholder="http://192.168.x.x:4173" />
+      <section id="emptyRoom" class="empty-room">
+        <div>
+          <span class="eyebrow">CONTROLLER</span>
+          <h1>Create a room</h1>
+        </div>
+        <button id="createRoomButton" class="primary" type="button">Create room</button>
+      </section>
 
-      <section class="tab-card" aria-label="Current browser tab">
+      <section id="roomPanel" class="room-panel" hidden>
+        <div class="room-heading">
+          <div>
+            <span>Room</span>
+            <strong id="roomCode">------</strong>
+          </div>
+          <span id="roomConnection" class="connection-badge">Connecting</span>
+        </div>
+
+        <div class="invite-row">
+          <div class="qr-shell">
+            <canvas id="roomQr" width="180" height="180" aria-label="Speaker room QR code"></canvas>
+          </div>
+          <div class="invite-actions">
+            <span id="speakerCount" class="speaker-count">0 Speakers</span>
+            <button id="copyLinkButton" class="secondary compact" type="button">Copy invite</button>
+            <button id="endRoomButton" class="danger compact" type="button">End room</button>
+          </div>
+        </div>
+
+        <div id="speakerList" class="speaker-list" aria-label="Joined Speakers"></div>
+      </section>
+
+      <section class="tab-row" aria-label="Current browser tab">
         <span>Current tab</span>
         <strong id="tabTitle">Loading...</strong>
       </section>
 
-      <p id="statusText" class="status" role="status">Ready to capture the active tab.</p>
-
-      <section id="progressPanel" class="progress-panel" aria-label="Room initialization progress" hidden>
-        <div>
-          <span id="progressLabel">Measuring</span>
-          <strong id="progressValue">0%</strong>
+      <section class="playback-status" aria-live="polite">
+        <p id="statusText">Create a room to begin.</p>
+        <div id="progressPanel" class="progress-panel" hidden>
+          <div>
+            <span id="progressLabel">Measuring</span>
+            <strong id="progressValue">0%</strong>
+          </div>
+          <span id="progressTrack" class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <span id="progressBar"></span>
+          </span>
+          <small id="progressDetail">Waiting for timing samples</small>
         </div>
-        <span class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-          <span id="progressBar"></span>
-        </span>
-        <small id="progressDetail">Waiting for timing samples</small>
       </section>
+
+      <label class="volume-control" for="volumeSlider">
+        <span>Room volume</span>
+        <input id="volumeSlider" type="range" min="0" max="100" step="1" value="100" />
+        <strong id="volumeValue">100%</strong>
+      </label>
 
       <div class="actions">
         <button id="startButton" class="primary" type="button">Start audio</button>
         <button id="stopButton" class="secondary" type="button">Stop</button>
       </div>
-      <button id="openButton" class="link-button" type="button">Open Controller</button>
+
+      <details class="developer-settings">
+        <summary>Development server</summary>
+        <label for="signalingOrigin">Signaling address</label>
+        <input id="signalingOrigin" type="url" inputmode="url" autocomplete="url" spellcheck="false" />
+      </details>
     </main>
     <script type="module" src="popup.js"></script>
   </body>

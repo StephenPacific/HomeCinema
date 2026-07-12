@@ -1,0 +1,390 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0d0f;
+  --surface: #14181b;
+  --surface-soft: #1c2226;
+  --line: rgba(255, 255, 255, 0.12);
+  --text: #f5f4ef;
+  --muted: #9ca5ac;
+  --faint: #707a82;
+  --accent: #ffad55;
+  --green: #78d69d;
+  --red: #ff7979;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.app-header,
+main {
+  width: min(100% - 24px, 680px);
+  margin-inline: auto;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 72px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.brand-mark {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--accent);
+  font-weight: 850;
+}
+
+.brand > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.brand strong {
+  font-size: 0.9rem;
+}
+
+.brand span,
+.connection-state {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.brand b {
+  color: var(--text);
+  letter-spacing: 0.08em;
+}
+
+.connection-state {
+  flex: 0 0 auto;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+}
+
+.connection-state.online {
+  color: var(--green);
+}
+
+.connection-state.error {
+  color: var(--red);
+}
+
+main {
+  display: grid;
+  gap: 12px;
+  padding-bottom: 24px;
+}
+
+.speaker-stage,
+.device-settings,
+.diagnostics {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.speaker-stage {
+  display: grid;
+  gap: 16px;
+  padding: 28px;
+}
+
+.eyebrow {
+  margin: 0;
+  color: var(--accent);
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+h1,
+h2,
+p {
+  overflow-wrap: anywhere;
+}
+
+h1 {
+  margin: -8px 0 0;
+  font-size: clamp(1.8rem, 7vw, 2.8rem);
+  line-height: 1.04;
+  letter-spacing: 0;
+}
+
+.session-title {
+  margin: -6px 0 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.status-banner {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(255, 173, 85, 0.24);
+  border-radius: 7px;
+  background: rgba(255, 173, 85, 0.07);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.status-banner.ready {
+  border-color: rgba(120, 214, 157, 0.26);
+  background: rgba(120, 214, 157, 0.07);
+}
+
+.status-banner.ready .status-dot {
+  background: var(--green);
+}
+
+.status-banner.error {
+  border-color: rgba(255, 121, 121, 0.3);
+  background: rgba(255, 121, 121, 0.07);
+}
+
+.status-banner.error .status-dot {
+  background: var(--red);
+}
+
+.status-banner > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.status-banner strong {
+  font-size: 0.8rem;
+}
+
+.status-banner span:last-child {
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.4;
+}
+
+.primary-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  min-height: 48px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #17110a;
+  font-weight: 820;
+  cursor: pointer;
+}
+
+.primary-action:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.speaker-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--line);
+}
+
+.speaker-metrics > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 10px;
+  background: var(--surface-soft);
+}
+
+.speaker-metrics span,
+.device-settings label,
+.diagnostics dt {
+  color: var(--faint);
+  font-size: 0.64rem;
+}
+
+.speaker-metrics strong {
+  min-width: 0;
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.device-settings {
+  display: grid;
+  gap: 12px;
+  padding: 18px;
+}
+
+.device-settings > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.device-settings h2 {
+  margin: 0;
+  font-size: 0.92rem;
+}
+
+.device-settings > div span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.7rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-settings label {
+  margin-bottom: -6px;
+  font-weight: 700;
+}
+
+.device-settings input {
+  width: 100%;
+  min-height: 40px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.diagnostics {
+  overflow: hidden;
+}
+
+.diagnostics summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 52px;
+  padding: 0 18px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 730;
+  cursor: pointer;
+  list-style: none;
+}
+
+.diagnostics summary::-webkit-details-marker {
+  display: none;
+}
+
+.diagnostics summary span:last-child {
+  color: var(--accent);
+}
+
+.diagnostics[open] summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.diagnostics dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0;
+  background: var(--line);
+}
+
+.diagnostics dl > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 11px 18px;
+  background: var(--surface);
+}
+
+.diagnostics dd {
+  min-width: 0;
+  margin: 0;
+  font-size: 0.74rem;
+  overflow-wrap: anywhere;
+}
+
+#fallbackAudio {
+  display: none;
+}
+
+@media (max-width: 520px) {
+  .app-header,
+  main {
+    width: min(100% - 16px, 680px);
+  }
+
+  .app-header {
+    min-height: 64px;
+  }
+
+  .connection-state {
+    max-width: 110px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .speaker-stage {
+    gap: 14px;
+    padding: 20px 16px;
+  }
+
+  .speaker-metrics > div {
+    padding: 9px 7px;
+  }
+
+  .diagnostics dl {
+    grid-template-columns: 1fr;
+  }
+}
