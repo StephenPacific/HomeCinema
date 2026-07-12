@@ -30,6 +30,49 @@ export function lanAddressCandidates(networkInterfaces, port) {
   }));
 }
 
+export function speakerJoinAddressCandidates({
+  advertised = [],
+  currentOrigin = "",
+  loopback = false
+} = {}) {
+  const currentUrl = normalizedOrigin(currentOrigin);
+  const seen = new Set();
+  const candidates = [];
+
+  for (const candidate of advertised || []) {
+    const url = normalizedOrigin(candidate?.url);
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    candidates.push({
+      ...candidate,
+      url,
+      current: Boolean(currentUrl && url === currentUrl)
+    });
+  }
+
+  candidates.sort((left, right) => Number(Boolean(right.recommended)) - Number(Boolean(left.recommended)));
+  if (!candidates.length && currentUrl) {
+    candidates.push({
+      url: currentUrl,
+      interfaceName: "Current connection",
+      current: true,
+      recommended: true
+    });
+  } else if (!loopback && currentUrl && !seen.has(currentUrl)) {
+    candidates.push({
+      url: currentUrl,
+      interfaceName: "Current connection",
+      current: true,
+      recommended: false
+    });
+  }
+
+  return candidates.map((candidate, index) => ({
+    ...candidate,
+    recommended: index === 0
+  }));
+}
+
 function isUsableIpv4(entry) {
   if (!entry || (entry.family !== "IPv4" && entry.family !== 4) || entry.internal) return false;
   const address = String(entry.address || "");
@@ -50,4 +93,12 @@ function isPrivateIpv4(address) {
   const parts = String(address).split(".").map(Number);
   if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
   return parts[0] === 10 || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) || (parts[0] === 192 && parts[1] === 168);
+}
+
+function normalizedOrigin(value) {
+  try {
+    return new URL(String(value || "")).origin;
+  } catch {
+    return "";
+  }
 }

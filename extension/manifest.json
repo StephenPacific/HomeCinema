@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Home Cinema Tab Audio",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "description": "Send the current Chrome tab's audio to Home Cinema speakers over WebRTC.",
   "minimum_chrome_version": "116",
   "permissions": ["activeTab", "offscreen", "storage", "tabCapture"],

@@ -10,6 +10,7 @@ import {
   webRtcPlayoutDelaySample
 } from "./liveSync.js";
 import { createQrMatrix } from "./qr.js";
+import { speakerJoinAddressCandidates } from "./networkAddresses.js";
 import {
   fixedPostDelayMs,
   fixedTimelineErrorMs,
@@ -2116,20 +2117,21 @@ export default function App() {
           recommended: index === 0
         }));
     const currentOrigin = location.origin;
-    const candidates = isLoopbackHost(location.hostname)
-      ? advertised
-      : [
-          { url: currentOrigin, interfaceName: "Current connection", recommended: true },
-          ...advertised.filter((candidate) => candidate.url !== currentOrigin)
-        ];
-    const options = (candidates.length ? candidates : [{ url: currentOrigin, interfaceName: "Current connection", recommended: true }])
+    const candidates = speakerJoinAddressCandidates({
+      advertised,
+      currentOrigin,
+      loopback: isLoopbackHost(location.hostname)
+    });
+    const options = candidates
       .map((candidate, index) => ({
         url: playerJoinUrl(candidate.url),
         label: candidate.interfaceName || `Network ${index + 1}`,
-        recommended: index === 0
+        recommended: Boolean(candidate.recommended),
+        current: Boolean(candidate.current)
       }));
     setJoinOptions(options);
-    setSelectedJoinUrl((current) => options.some((option) => option.url === current) ? current : options[0]?.url || "");
+    const preferredUrl = options.find((option) => option.recommended)?.url || options[0]?.url || "";
+    setSelectedJoinUrl((current) => options.some((option) => option.url === current) ? current : preferredUrl);
     return config;
   }
 
@@ -2925,7 +2927,7 @@ export default function App() {
                       >
                         {joinOptions.map((option) => (
                           <option key={option.url} value={option.url}>
-                            {option.recommended ? "Recommended · " : ""}{option.label} · {formatJoinAddress(option.url)}
+                            {option.recommended ? "Recommended · " : option.current ? "Current · " : ""}{option.label} · {formatJoinAddress(option.url)}
                           </option>
                         ))}
                       </select>
