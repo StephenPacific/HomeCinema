@@ -1,3 +1,5 @@
+import { normalizeServerUrl } from "./server-url.js";
+
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
