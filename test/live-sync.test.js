@@ -4,6 +4,7 @@ import {
   expectedLivePositionSeconds,
   liveDriftCorrection,
   liveStartLocalMs,
+  setWebRtcJitterBufferTarget,
   shouldStartLiveBuffer,
   webRtcPlayoutDelaySample
 } from "../src/liveSync.js";
@@ -81,4 +82,13 @@ test("WebRTC playout delay uses recent counter deltas instead of lifetime averag
   assert.equal(sample.targetDelayMs, 120);
   assert.equal(sample.minimumDelayMs, 50);
   assert.equal(webRtcPlayoutDelaySample({ jitterBufferEmittedCount: 200, jitterBufferDelay: 26 }, null), null);
+});
+
+test("supported receivers receive a bounded jitter-buffer target", () => {
+  const receiver = { jitterBufferTarget: null };
+  assert.equal(setWebRtcJitterBufferTarget(receiver, 120), true);
+  assert.equal(receiver.jitterBufferTarget, 120);
+  assert.equal(setWebRtcJitterBufferTarget(receiver, 5000), true);
+  assert.equal(receiver.jitterBufferTarget, 4000);
+  assert.equal(setWebRtcJitterBufferTarget({}, 120), false);
 });

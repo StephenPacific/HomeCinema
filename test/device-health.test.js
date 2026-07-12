@@ -59,7 +59,9 @@ test("three or more devices use the room median to identify an outlier", () => {
   assert.deepEqual(context, {
     medianSyncErrorMs: 2,
     participantCount: 3,
-    commonTimelineShift: false
+    commonTimelineShift: false,
+    speakerTimelineShift: false,
+    controllerSyncErrorMs: null
   });
 
   const diagnostic = classifyDeviceHealth(
@@ -82,9 +84,10 @@ test("three or more devices use the room median to identify an outlier", () => {
 
 test("a majority timeline shift is attributed to the common timeline", () => {
   const context = roomHealthContext([
-    { active: true, syncErrorMs: 7 },
-    { active: true, syncErrorMs: 8 },
-    { active: true, syncErrorMs: 9 }
+    { role: "speaker", active: true, syncErrorMs: 7 },
+    { role: "speaker", active: true, syncErrorMs: 8 },
+    { role: "speaker", active: true, syncErrorMs: 9 },
+    { role: "capture", active: true, syncErrorMs: 8 }
   ]);
   assert.equal(context.commonTimelineShift, true);
 
@@ -104,6 +107,30 @@ test("a majority timeline shift is attributed to the common timeline", () => {
   );
   assert.equal(diagnostic.sync.reason, "COMMON_TIMELINE_SHIFT");
   assert.equal(summarizeRoomHealth([{ id: 1, name: "Speaker", diagnostic }], context).reason, "COMMON_TIMELINE_SHIFT");
+});
+
+test("a speaker-only group shift is not blamed on Controller output", () => {
+  const context = roomHealthContext([
+    { role: "speaker", active: true, syncErrorMs: 160 },
+    { role: "speaker", active: true, syncErrorMs: 170 },
+    { role: "speaker", active: true, syncErrorMs: 175 },
+    { role: "capture", active: true, syncErrorMs: 16 }
+  ]);
+  assert.equal(context.commonTimelineShift, false);
+  assert.equal(context.speakerTimelineShift, true);
+  assert.equal(summarizeRoomHealth([], context).reason, "SPEAKER_TIMELINE_SHIFT");
+
+  const controller = classifyDeviceHealth({
+    role: "capture",
+    active: true,
+    online: true,
+    connectionState: "connected",
+    audioContextState: "running",
+    syncErrorMs: 16,
+    timelineState: "locked"
+  }, context);
+  assert.equal(controller.sync.reason, "CONTROLLER_SYNC_DRIFT");
+  assert.equal(controller.overall.action, "Adjust local delay");
 });
 
 test("the three layers keep audio and connection causes separate", () => {

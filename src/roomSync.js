@@ -1,4 +1,4 @@
-export const ROOM_SYNC_ENGINE_VERSION = 6;
+export const ROOM_SYNC_ENGINE_VERSION = 7;
 
 export const ROOM_SYNC_POLICY = Object.freeze({
   sampleWindow: 3,
@@ -18,6 +18,11 @@ export const ROOM_SYNC_POLICY = Object.freeze({
   emergencySyncErrorMs: 80,
   recoverySyncErrorMs: 8,
   recoveryGraceErrorMs: 16,
+  runtimeRelockErrorMs: 40,
+  runtimeRelockPostDelayHeadroomMs: 2,
+  runtimeRelockSamples: 6,
+  runtimeRelockCooldownMs: 15_000,
+  runtimeRelockMinimumIncreaseMs: 12,
   softCorrectionGain: 0.25,
   softCorrectionStepMs: 3,
   quarantinedCorrectionStepMs: 3,
@@ -207,6 +212,38 @@ export function fixedRoomTargetMs(stableTimings, fallbackMs = 120, policy = ROOM
       policy.maximumRoomTargetMs
     )
   );
+}
+
+export function runtimeRoomRelockPlan(devices, currentTargetMs, policy = ROOM_SYNC_POLICY) {
+  const candidates = (devices || []).filter((device) =>
+    Number.isFinite(Number(device?.syncErrorMs)) &&
+    Number.isFinite(Number(device?.playoutDelayMs)) &&
+    Number.isFinite(Number(device?.outputLatencyMs))
+  );
+  if (!candidates.length) return { shouldRelock: false, roomTargetMs: null, lateCount: 0, requiredCount: 0 };
+
+  const requiredCount = Math.max(1, Math.ceil((candidates.length * 2) / 3));
+  const late = candidates.filter((device) =>
+    Number(device.syncErrorMs) >= policy.runtimeRelockErrorMs &&
+    Number(device.postDelayMs || 0) <= policy.runtimeRelockPostDelayHeadroomMs
+  );
+  const observedDelays = candidates.map((device) =>
+    Number(device.playoutDelayMs) +
+    Number(device.outputLatencyMs) +
+    Number(device.postDelayMs || 0) -
+    Number(device.deviceOffsetMs || 0)
+  );
+  const currentTarget = Number(currentTargetMs);
+  const roomTargetMs = Math.round(clamp(
+    Math.max(...observedDelays) + policy.roomSafetyMarginMs,
+    policy.minimumRoomTargetMs,
+    policy.maximumRoomTargetMs
+  ));
+  const shouldRelock =
+    late.length >= requiredCount &&
+    Number.isFinite(currentTarget) &&
+    roomTargetMs >= currentTarget + policy.runtimeRelockMinimumIncreaseMs;
+  return { shouldRelock, roomTargetMs, lateCount: late.length, requiredCount };
 }
 
 export function nextFixedTimelineGuard(state, syncErrorMs, policy = ROOM_SYNC_POLICY) {

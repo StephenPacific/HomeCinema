@@ -12,6 +12,7 @@ import {
   LIVE_SYNC_POLICY,
   liveDriftCorrection,
   liveStartLocalMs,
+  setWebRtcJitterBufferTarget,
   shouldStartLiveBuffer,
   WEBRTC_SYNC_POLICY,
   webRtcPlayoutDelaySample
@@ -677,6 +678,7 @@ export default function App() {
         !Number.isFinite(session.roomTargetMs) ||
         !Number.isFinite(session.measuredJitterDelayMs)
       ) return false;
+      if (session.runtimeRelock && Date.now() < Number(session.relockDelayReadyAt || 0)) return false;
 
       const postDelayMs = fixedPostDelayMs({
         roomTargetMs: session.roomTargetMs,
@@ -698,12 +700,22 @@ export default function App() {
       const session = liveSessionRef.current;
       if (!session || session.closed || session.transport !== "webrtc" || session.id !== live?.id) return;
       const phase = live.phase || (Number.isFinite(Number(live.playAt)) ? "armed" : "measuring");
+      const previousPhase = session.phase;
       const nextLockAttempt = Number(live.lockAttempt || 0);
       if (phase === "locking" && nextLockAttempt !== Number(session.lockAttempt || 0)) {
         session.lockAttempt = nextLockAttempt;
         session.postDelayLocked = false;
       }
       session.phase = phase;
+      if (
+        phase === "locking" &&
+        !session.runtimeRelock &&
+        session.timelineLocked &&
+        (live.runtimeRelock || previousPhase === "playing")
+      ) {
+        session.runtimeRelock = true;
+        session.relockDelayReadyAt = Date.now() + ROOM_SYNC_POLICY.quarantineFadeSeconds * 1000;
+      }
       const playAt = Number(live.playAt);
       session.playAtServerMs = Number.isFinite(playAt) && playAt > 0 ? playAt : null;
 
@@ -713,7 +725,7 @@ export default function App() {
       }
 
       if (phase === "measuring" && !session.postDelayLocked) setLivePostDelay(0, session);
-      if (phase === "locking") lockWebRtcPostDelay(session);
+      if (phase === "locking" && !session.runtimeRelock) lockWebRtcPostDelay(session);
 
       if (session.outputReady && liveOutputModeRef.current === "html-media-element") {
         rampLiveOutput(0, 0);
@@ -723,14 +735,40 @@ export default function App() {
       }
 
       if (phase === "measuring" || phase === "locking") {
-        rampLiveOutput(0, 0);
+        if (phase === "locking" && session.runtimeRelock) {
+          if (!session.timelineGuard?.quarantined) {
+            quarantineWebRtcOutput(session, "Room timing shifted; relocking");
+          }
+        } else {
+          rampLiveOutput(0, 0);
+        }
         setReadyStatus(
           session.outputReady
-            ? phase === "locking" ? "Locking fixed room timeline" : "Measuring room timing"
+            ? phase === "locking"
+              ? session.runtimeRelock ? "Room timing shifted; relocking" : "Locking fixed room timeline"
+              : "Measuring room timing"
             : "Connecting WebRTC audio"
         );
         reportStatusSoon();
         return;
+      }
+
+      if (session.runtimeRelock && ["armed", "playing"].includes(phase)) {
+        const participants = Array.isArray(live.participantIds) ? live.participantIds : [];
+        session.initialParticipant = participants.length ? participants.includes(clientIdRef.current) : true;
+        session.timelineGuard = {
+          quarantined: !session.initialParticipant,
+          violationCount: 0,
+          recoveryCount: 0
+        };
+        session.runtimeRelock = false;
+        session.relockDelayReadyAt = null;
+        session.rejoining = false;
+        session.audible = false;
+        session.startScheduled = false;
+        session.fastFuseReason = null;
+        fastFuseReasonRef.current = "";
+        session.nextStartFadeSeconds = ROOM_SYNC_POLICY.rejoinFadeSeconds;
       }
 
       if (!session.timelineLocked) {
@@ -753,7 +791,9 @@ export default function App() {
       if (!session.initialParticipant || session.timelineGuard?.quarantined) return;
       if (session.audible || session.startScheduled || !session.outputReady) return;
       const targetLocalMs = session.playAtServerMs - serverOffsetRef.current;
-      if (!scheduleWebRtcOutputAt(session, targetLocalMs)) {
+      const startFadeSeconds = session.nextStartFadeSeconds || ROOM_SYNC_POLICY.startFadeSeconds;
+      session.nextStartFadeSeconds = null;
+      if (!scheduleWebRtcOutputAt(session, targetLocalMs, "WebRTC starts", startFadeSeconds)) {
         quarantineWebRtcOutput(session, "Missed start; synchronizing before join");
       }
     },
@@ -912,6 +952,8 @@ export default function App() {
         statsPending: false,
         lastPostCorrectionAt: 0,
         outputFadeSeconds: ROOM_SYNC_POLICY.startFadeSeconds,
+        nextStartFadeSeconds: null,
+        relockDelayReadyAt: null,
         outputReady: false,
         timelineLocked: false,
         initialParticipant: false,
@@ -1248,6 +1290,10 @@ export default function App() {
       connection.addEventListener("track", async (event) => {
         if (liveSessionRef.current !== session || session.closed) return;
         session.receiver = event.receiver;
+        session.jitterBufferTargetSupported = setWebRtcJitterBufferTarget(
+          event.receiver,
+          session.bufferMs || WEBRTC_SYNC_POLICY.receiverBufferTargetMs
+        );
 
         const liveAudio = liveAudioRef.current;
         if (!liveAudio) return;

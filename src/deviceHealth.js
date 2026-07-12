@@ -12,7 +12,8 @@ export const DEVICE_HEALTH_POLICY = Object.freeze({
   healthySyncErrorMs: 2,
   warningSyncErrorMs: 4,
   outlierSyncErrorMs: 8,
-  commonTimelineShiftMs: 4
+  commonTimelineShiftMs: 4,
+  commonTimelineAlignmentMs: 12
 });
 
 const SEVERITY = Object.freeze({
@@ -102,21 +103,35 @@ export function fastFuseReason(metrics = {}, policy = DEVICE_HEALTH_POLICY) {
 }
 
 export function roomHealthContext(devices = [], policy = DEVICE_HEALTH_POLICY) {
-  const values = devices
-    .filter((device) => device?.active && !device?.muted && Number.isFinite(Number(device?.syncErrorMs)))
+  const active = devices.filter((device) =>
+    device?.active && !device?.muted && Number.isFinite(Number(device?.syncErrorMs))
+  );
+  const values = active
+    .filter((device) => device.role !== "capture")
+    .map((device) => Number(device.syncErrorMs));
+  const controllerValues = active
+    .filter((device) => device.role === "capture")
     .map((device) => Number(device.syncErrorMs));
   const medianSyncErrorMs = values.length ? median(values) : null;
+  const controllerSyncErrorMs = controllerValues.length ? median(controllerValues) : null;
   const sameDirectionCount = !Number.isFinite(medianSyncErrorMs) || medianSyncErrorMs === 0
     ? 0
     : values.filter((value) => Math.sign(value) === Math.sign(medianSyncErrorMs) && Math.abs(value) >= policy.commonTimelineShiftMs).length;
-  const commonTimelineShift =
+  const groupShift =
     values.length >= 2 &&
     Math.abs(medianSyncErrorMs) >= policy.commonTimelineShiftMs &&
-    sameDirectionCount >= Math.ceil(values.length * 0.67);
+    sameDirectionCount >= Math.ceil((values.length * 2) / 3);
+  const commonTimelineShift = Boolean(
+    groupShift &&
+    Number.isFinite(controllerSyncErrorMs) &&
+    Math.abs(controllerSyncErrorMs - medianSyncErrorMs) <= policy.commonTimelineAlignmentMs
+  );
   return {
     medianSyncErrorMs,
     participantCount: values.length,
-    commonTimelineShift
+    commonTimelineShift,
+    speakerTimelineShift: groupShift && !commonTimelineShift,
+    controllerSyncErrorMs
   };
 }
 
@@ -150,6 +165,13 @@ export function classifyDeviceHealth(metrics = {}, context = {}, policy = DEVICE
 }
 
 export function summarizeRoomHealth(devices = [], context = {}) {
+  if (context.speakerTimelineShift) {
+    return {
+      state: "warning",
+      label: `Speaker playout shifted ${signedMs(context.medianSyncErrorMs)}`,
+      reason: "SPEAKER_TIMELINE_SHIFT"
+    };
+  }
   if (context.commonTimelineShift) {
     return {
       state: "warning",
@@ -243,6 +265,18 @@ function classifySync(metrics, context, active, muted, policy) {
   }
   const syncErrorMs = finiteOrNull(metrics.syncErrorMs);
   if (syncErrorMs === null) return layer("measuring", "Measuring", "SYNC_MEASURING");
+  if (metrics.role === "capture") {
+    if (Math.abs(syncErrorMs) >= policy.warningSyncErrorMs) {
+      return layer("warning", `Local ${signedMs(syncErrorMs)}`, "CONTROLLER_SYNC_DRIFT");
+    }
+    if (Math.abs(syncErrorMs) > policy.healthySyncErrorMs) {
+      return layer("watching", `Watching ${signedMs(syncErrorMs)}`, "SYNC_WATCHING");
+    }
+    return layer("healthy", `Locked ${signedMs(syncErrorMs)}`, "SYNC_LOCKED");
+  }
+  if (context.speakerTimelineShift) {
+    return layer("warning", `Group ${signedMs(syncErrorMs)}`, "SPEAKER_TIMELINE_SHIFT");
+  }
   if (context.commonTimelineShift) {
     return layer("warning", `Common ${signedMs(syncErrorMs)}`, "COMMON_TIMELINE_SHIFT");
   }
@@ -271,6 +305,8 @@ function suggestedAction(reason) {
   if (reason === "TELEMETRY_LATE") return "Watch telemetry";
   if (["AUDIO_ENGINE_STOPPED", "AUDIO_NEEDS_TAP"].includes(reason)) return "Restore audio";
   if (["OUTPUT_LATENCY_JUMP", "OUTPUT_LATENCY_CHANGING"].includes(reason)) return "Remeasure output";
+  if (reason === "CONTROLLER_SYNC_DRIFT") return "Adjust local delay";
+  if (reason === "SPEAKER_TIMELINE_SHIFT") return "Relock room";
   if (["SYNC_JUMP", "SYNC_OUTLIER", "SYNC_DRIFT", "SYNC_REPAIRING"].includes(reason)) return "Relock silently";
   if (["PACKET_LOSS_BURST", "CONCEALMENT_BURST", "PACKET_LOSS", "NETWORK_JITTER"].includes(reason)) return "Watch network";
   if (reason === "COMMON_TIMELINE_SHIFT") return "Inspect Controller";

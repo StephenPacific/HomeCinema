@@ -240,6 +240,15 @@ test("capture output stays muted through locking, then arms once at Controller v
   });
   vm.runInContext(source, context, { filename: "extension/offscreen.js" });
 
+  const correction = context.controllerDelayCorrection({
+    currentDelayMs: 226.7,
+    totalOutputLatencyMs: 21.3,
+    roomTargetMs: 232
+  });
+  assert.ok(Math.abs(correction.errorMs - 16) < 0.000001);
+  assert.equal(correction.adjustmentMs, -3);
+  assert.ok(Math.abs(correction.delayMs - 223.7) < 0.000001);
+
   runtimeListener(
     {
       type: "begin-capture-in-offscreen",

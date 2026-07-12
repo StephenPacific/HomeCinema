@@ -12,6 +12,7 @@ import {
   ROOM_SYNC_ENGINE_VERSION,
   ROOM_SYNC_POLICY,
   roomLockTimeoutAction,
+  runtimeRoomRelockPlan,
   roomTimingSample,
   stableRoomTiming,
   supportsRoomSyncVersion
@@ -57,6 +58,7 @@ let liveOwnerClientId = null;
 let liveBootstrapChunk = null;
 let livePreflight = null;
 let livePhaseTimer = null;
+let runtimeRelockState = { violationCount: 0, lastRelockAt: 0 };
 
 await fsp.mkdir(mediaDir, { recursive: true });
 await fsp.mkdir(layersDir, { recursive: true });
@@ -243,7 +245,10 @@ setInterval(() => {
 }, 1000);
 
 setInterval(() => {
-  if (state.live) broadcastPeers();
+  if (state.live) {
+    evaluateLiveRuntimeRelock();
+    broadcastPeers();
+  }
 }, 500);
 
 async function loadTrackMeta() {
@@ -802,6 +807,7 @@ function startLive(client, message) {
   livePreflight = transport === "webrtc"
     ? { liveId: state.live.id, phaseStartedAt: now, candidateKeys }
     : null;
+  runtimeRelockState = { violationCount: 0, lastRelockAt: 0 };
   clearTimeout(livePhaseTimer);
   livePhaseTimer = null;
   for (const peer of clients) {
@@ -1031,9 +1037,65 @@ function armLiveRoom(stableCandidates, candidates) {
   livePhaseTimer = setTimeout(() => {
     if (!state.live || state.live.id !== liveId || state.live.phase !== "armed") return;
     state.live.phase = "playing";
+    state.live.runtimeRelock = false;
     state.updatedAt = Date.now();
     broadcast({ type: "sync", serverTime: Date.now(), state: publicState() });
   }, Math.max(0, playAt - Date.now()) + 80);
+}
+
+function evaluateLiveRuntimeRelock(now = Date.now()) {
+  if (!state.live || state.live.transport !== "webrtc" || state.live.phase !== "playing") {
+    runtimeRelockState.violationCount = 0;
+    return;
+  }
+  if (now - runtimeRelockState.lastRelockAt < ROOM_SYNC_POLICY.runtimeRelockCooldownMs) return;
+  const candidates = eligibleRoomSpeakers();
+  const plan = runtimeRoomRelockPlan(candidates, state.live.roomTargetMs);
+  if (!plan.shouldRelock) {
+    runtimeRelockState.violationCount = 0;
+    return;
+  }
+  runtimeRelockState.violationCount += 1;
+  if (runtimeRelockState.violationCount < ROOM_SYNC_POLICY.runtimeRelockSamples) return;
+  beginRuntimeRelock(candidates, plan.roomTargetMs, now);
+}
+
+function beginRuntimeRelock(candidates, roomTargetMs, now = Date.now()) {
+  if (!state.live || state.live.phase !== "playing" || !candidates.length) return false;
+  clearTimeout(livePhaseTimer);
+  livePhaseTimer = null;
+  state.live.phase = "locking";
+  state.live.playAt = null;
+  state.live.roomTargetMs = roomTargetMs;
+  state.live.runtimeRelock = true;
+  state.live.stableSpeakers = 0;
+  state.live.requiredSpeakers = candidates.length;
+  state.live.excludedSpeakers = candidates.length;
+  state.live.phaseProgress = 0;
+  state.live.phaseSampleCount = 0;
+  state.live.phaseElapsedMs = 0;
+  state.live.phaseTimeoutMs = ROOM_SYNC_POLICY.lockTimeoutMs;
+  state.live.phaseBlocked = false;
+  state.live.lockAttempt = 1;
+  state.live.maximumLockAttempts = ROOM_SYNC_POLICY.maximumLockAttempts;
+  state.live.participantIds = candidates.map((client) => client.id);
+  state.updatedAt = now;
+  livePreflight = {
+    liveId: state.live.id,
+    phaseStartedAt: now,
+    candidateKeys: new Set(candidates.map(speakerIdentity))
+  };
+  runtimeRelockState = { violationCount: 0, lastRelockAt: now };
+  for (const client of candidates) {
+    client.timingSamples = [];
+    client.timingStable = false;
+    client.timingSpreadMs = null;
+    client.postDelayMs = 0;
+    client.timelineState = "locking";
+  }
+  console.log(`[Room relock] Raising target to ${roomTargetMs} ms for ${candidates.length} speaker(s)`);
+  broadcast({ type: "liveLock", state: publicState() });
+  return true;
 }
 
 function stopLive(reason) {
@@ -1041,6 +1103,7 @@ function stopLive(reason) {
   clearTimeout(livePhaseTimer);
   livePhaseTimer = null;
   livePreflight = null;
+  runtimeRelockState = { violationCount: 0, lastRelockAt: 0 };
   state.live = null;
   state.updatedAt = Date.now();
   liveOwnerClientId = null;

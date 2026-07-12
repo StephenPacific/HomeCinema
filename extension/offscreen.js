@@ -4,6 +4,10 @@ const WEBRTC_TARGET_BUFFER_MS = 120;
 const CONTROLLER_AUDIO_SAMPLE_INTERVAL_MS = 500;
 const CONTROLLER_AUDIO_REPORT_INTERVAL_MS = 500;
 const CONTROLLER_AUDIO_WINDOW_MS = 30_000;
+const CONTROLLER_DELAY_CORRECTION_INTERVAL_MS = 2000;
+const CONTROLLER_DELAY_CORRECTION_RAMP_SECONDS = 1.8;
+const ROOM_RELOCK_FADE_OUT_SECONDS = 0.45;
+const ROOM_RELOCK_FADE_IN_SECONDS = 1.2;
 
 const state = {
   audioContext: null,
@@ -16,6 +20,7 @@ const state = {
   controllerAudioSamples: [],
   initialControllerOutputLatencyMs: null,
   lastControllerMetricsSentAt: 0,
+  lastControllerDelayCorrectionAt: 0,
   socket: null,
   stream: null,
   stopping: false,
@@ -36,6 +41,7 @@ const state = {
   phaseBlocked: false,
   lockAttempt: 0,
   maximumLockAttempts: 3,
+  runtimeRelock: false,
   unmuteAt: 0,
   countdownTimer: null,
   reconnectTimer: null,
@@ -157,6 +163,7 @@ function connectCaptureSocket() {
       return;
     }
     if (message.type === "liveStart" && message.state?.live?.transport === "webrtc") {
+      state.runtimeRelock = false;
       state.livePhase = message.state.live.phase || "measuring";
       state.roomTargetMs = Number(message.state.live.roomTargetMs || message.state.live.bufferMs || WEBRTC_TARGET_BUFFER_MS);
       updateLiveProgress(message.state.live);
@@ -170,10 +177,15 @@ function connectCaptureSocket() {
       return;
     }
     if (message.type === "liveLock" && message.state?.live?.transport === "webrtc") {
+      state.runtimeRelock = Boolean(message.state.live.runtimeRelock || state.livePhase === "playing");
       state.livePhase = "locking";
       state.roomTargetMs = Number(message.state.live.roomTargetMs || WEBRTC_TARGET_BUFFER_MS);
       updateLiveProgress(message.state.live);
-      prepareLocalPlayback(state.stream, state.roomTargetMs).catch((error) => {
+      prepareLocalPlayback(
+        state.stream,
+        state.roomTargetMs,
+        state.runtimeRelock ? ROOM_RELOCK_FADE_OUT_SECONDS : 0
+      ).catch((error) => {
         finishCapture({ phase: "error", detail: error.message || "Could not lock local audio timing." });
       });
       updateCaptureStatus();
@@ -343,10 +355,16 @@ function closeWebRtcPeer(peerId) {
   } catch {}
 }
 
-async function prepareLocalPlayback(stream, delayMs = WEBRTC_TARGET_BUFFER_MS) {
+async function prepareLocalPlayback(stream, delayMs = WEBRTC_TARGET_BUFFER_MS, fadeOutSeconds = 0) {
   if (state.audioContext) {
-    setLocalDelay(delayMs);
-    muteLocalPlayback();
+    muteLocalPlayback(fadeOutSeconds);
+    if (fadeOutSeconds > 0) {
+      setTimeout(() => {
+        if (state.audioContext && state.localDelay) setLocalDelay(delayMs);
+      }, fadeOutSeconds * 1000);
+    } else {
+      setLocalDelay(delayMs);
+    }
     startControllerAudioMonitor();
     return;
   }
@@ -390,17 +408,64 @@ async function armLocalPlayback(stream, delayMs, startDelayMs) {
   gain.gain.cancelScheduledValues(now);
   gain.gain.setValueAtTime(0, now);
   gain.gain.setValueAtTime(0, unmuteAt);
-  gain.gain.linearRampToValueAtTime(state.localVolume, unmuteAt + 0.04);
+  gain.gain.linearRampToValueAtTime(
+    state.localVolume,
+    unmuteAt + (state.runtimeRelock ? ROOM_RELOCK_FADE_IN_SECONDS : 0.04)
+  );
 }
 
 function setLocalDelay(delayMs) {
   if (!state.audioContext || !state.localDelay) return;
+  state.localOutputLatencySeconds = currentOutputLatencySeconds(state.audioContext);
   const delaySeconds = Math.max(
     0,
     Math.min(1, Number(delayMs || 0) / 1000 - Number(state.localOutputLatencySeconds || 0))
   );
   state.localDelayMs = delaySeconds * 1000;
   state.localDelay.delayTime.setValueAtTime(delaySeconds, state.audioContext.currentTime);
+}
+
+function currentOutputLatencySeconds(audioContext) {
+  return Math.max(
+    0,
+    Number(audioContext?.baseLatency || 0) + Number(audioContext?.outputLatency || 0)
+  );
+}
+
+function rampLocalDelay(delayMs, rampSeconds = CONTROLLER_DELAY_CORRECTION_RAMP_SECONDS) {
+  const audioContext = state.audioContext;
+  const parameter = state.localDelay?.delayTime;
+  if (!audioContext || !parameter) return;
+  const now = audioContext.currentTime;
+  const delaySeconds = Math.max(0, Math.min(1, Number(delayMs || 0) / 1000));
+  if (typeof parameter.cancelAndHoldAtTime === "function") {
+    parameter.cancelAndHoldAtTime(now);
+  } else {
+    const currentValue = Number.isFinite(parameter.value) ? parameter.value : state.localDelayMs / 1000;
+    parameter.cancelScheduledValues(now);
+    parameter.setValueAtTime(currentValue, now);
+  }
+  parameter.linearRampToValueAtTime(delaySeconds, now + Math.max(0.05, Number(rampSeconds) || 0));
+  state.localDelayMs = delaySeconds * 1000;
+}
+
+function controllerDelayCorrection({
+  currentDelayMs,
+  totalOutputLatencyMs,
+  roomTargetMs,
+  deadbandMs = 2,
+  maximumStepMs = 3
+}) {
+  const values = [currentDelayMs, totalOutputLatencyMs, roomTargetMs, deadbandMs, maximumStepMs].map(Number);
+  if (!values.every(Number.isFinite)) return null;
+  const [current, output, target, deadband, maximumStep] = values;
+  const errorMs = current + output - target;
+  if (Math.abs(errorMs) <= Math.max(0, deadband)) {
+    return { delayMs: current, adjustmentMs: 0, errorMs };
+  }
+  const adjustmentMs = Math.max(-maximumStep, Math.min(maximumStep, -errorMs * 0.25));
+  const delayMs = Math.max(0, Math.min(1000, current + adjustmentMs));
+  return { delayMs, adjustmentMs: delayMs - current, errorMs };
 }
 
 function startControllerAudioMonitor() {
@@ -418,6 +483,9 @@ function sampleControllerAudioOutput(forceReport = false) {
   const outputLatencyMs = Math.max(0, Number(audioContext.outputLatency || 0) * 1000);
   const totalOutputLatencyMs = baseLatencyMs + outputLatencyMs;
   if (!Number.isFinite(totalOutputLatencyMs)) return;
+  state.localOutputLatencySeconds = totalOutputLatencyMs / 1000;
+  const observedLocalDelayMs = Number(state.localDelay?.delayTime?.value) * 1000;
+  if (Number.isFinite(observedLocalDelayMs)) state.localDelayMs = observedLocalDelayMs;
 
   let outputContextTime = null;
   let outputPerformanceTime = null;
@@ -469,6 +537,21 @@ function sampleControllerAudioOutput(forceReport = false) {
   };
 
   if (
+    state.livePhase === "playing" &&
+    observedAt - state.lastControllerDelayCorrectionAt >= CONTROLLER_DELAY_CORRECTION_INTERVAL_MS
+  ) {
+    state.lastControllerDelayCorrectionAt = observedAt;
+    const correction = controllerDelayCorrection({
+      currentDelayMs: state.localDelayMs,
+      totalOutputLatencyMs,
+      roomTargetMs: state.roomTargetMs
+    });
+    if (Math.abs(correction?.adjustmentMs || 0) >= 0.05) {
+      rampLocalDelay(correction.delayMs);
+    }
+  }
+
+  if (
     state.socket?.readyState === WebSocket.OPEN &&
     (forceReport || observedAt - state.lastControllerMetricsSentAt >= CONTROLLER_AUDIO_REPORT_INTERVAL_MS)
   ) {
@@ -505,14 +588,23 @@ function resetControllerAudioMonitor() {
   state.controllerAudioSamples = [];
   state.initialControllerOutputLatencyMs = null;
   state.lastControllerMetricsSentAt = 0;
+  state.lastControllerDelayCorrectionAt = 0;
   state.localDelayMs = 0;
 }
 
-function muteLocalPlayback() {
+function muteLocalPlayback(fadeSeconds = 0) {
   if (!state.audioContext || !state.localGain) return;
   const now = state.audioContext.currentTime;
-  state.localGain.gain.cancelScheduledValues(now);
-  state.localGain.gain.setValueAtTime(0, now);
+  const parameter = state.localGain.gain;
+  if (typeof parameter.cancelAndHoldAtTime === "function") {
+    parameter.cancelAndHoldAtTime(now);
+  } else {
+    const currentValue = Number.isFinite(parameter.value) ? parameter.value : state.localVolume;
+    parameter.cancelScheduledValues(now);
+    parameter.setValueAtTime(currentValue, now);
+  }
+  if (fadeSeconds > 0) parameter.linearRampToValueAtTime(0, now + fadeSeconds);
+  else parameter.setValueAtTime(0, now);
 }
 
 function setLocalVolume(value) {
@@ -530,7 +622,10 @@ function setLocalVolume(value) {
     gain.gain.cancelScheduledValues(now);
     gain.gain.setValueAtTime(0, now);
     gain.gain.setValueAtTime(0, unmuteAt);
-    gain.gain.linearRampToValueAtTime(state.localVolume, unmuteAt + 0.04);
+    gain.gain.linearRampToValueAtTime(
+      state.localVolume,
+      unmuteAt + (state.runtimeRelock ? ROOM_RELOCK_FADE_IN_SECONDS : 0.04)
+    );
     return;
   }
   if (state.livePhase !== "playing") return;
@@ -590,6 +685,7 @@ function updateCaptureStatus() {
   }
   state.unmuteAt = 0;
   state.livePhase = "playing";
+  state.runtimeRelock = false;
   const connectedPeers = [...state.peers.values()].filter(
     ({ connection }) => connection.connectionState === "connected"
   ).length;
@@ -653,6 +749,7 @@ function finishCapture(status, notifyServer = true) {
   state.phaseBlocked = false;
   state.lockAttempt = 0;
   state.maximumLockAttempts = 3;
+  state.runtimeRelock = false;
   state.localVolume = 1;
   resetControllerAudioMonitor();
   for (const peerId of [...state.peers.keys()]) closeWebRtcPeer(peerId);

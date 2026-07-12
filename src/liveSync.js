@@ -11,8 +11,21 @@ export const LIVE_SYNC_POLICY = Object.freeze({
 });
 
 export const WEBRTC_SYNC_POLICY = Object.freeze({
-  measurementSmoothing: 0.35
+  measurementSmoothing: 0.35,
+  receiverBufferTargetMs: 120
 });
+
+export function setWebRtcJitterBufferTarget(receiver, targetMs = WEBRTC_SYNC_POLICY.receiverBufferTargetMs) {
+  if (!receiver || !("jitterBufferTarget" in receiver)) return false;
+  const target = Number(targetMs);
+  if (!Number.isFinite(target)) return false;
+  try {
+    receiver.jitterBufferTarget = clamp(target, 0, 4000);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function shouldStartLiveBuffer(bufferedSeconds, waitedMs, policy = LIVE_SYNC_POLICY) {
   return (

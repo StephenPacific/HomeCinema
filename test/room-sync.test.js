@@ -10,6 +10,7 @@ import {
   nextPostDelayCorrection,
   roomCorrectionPlan,
   roomGuardError,
+  runtimeRoomRelockPlan,
   roomLockTimeoutAction,
   roomTimingSample,
   ROOM_SYNC_POLICY,
@@ -61,16 +62,17 @@ test("room sync version rejects stale speaker pages", () => {
   assert.equal(supportsRoomSyncVersion(3), false);
   assert.equal(supportsRoomSyncVersion(4), false);
   assert.equal(supportsRoomSyncVersion(5), false);
-  assert.equal(supportsRoomSyncVersion(6), true);
+  assert.equal(supportsRoomSyncVersion(6), false);
+  assert.equal(supportsRoomSyncVersion(7), true);
 });
 
 test("room candidates reject old engines and keep only the newest connection per device", () => {
   const candidates = latestEligibleRoomSpeakers([
-    { id: 1, role: "speaker", deviceKey: "living-room", syncEngineVersion: 6, unlocked: true, muted: false },
-    { id: 2, role: "speaker", deviceKey: "living-room", syncEngineVersion: 6, unlocked: true, muted: false },
+    { id: 1, role: "speaker", deviceKey: "living-room", syncEngineVersion: 7, unlocked: true, muted: false },
+    { id: 2, role: "speaker", deviceKey: "living-room", syncEngineVersion: 7, unlocked: true, muted: false },
     { id: 3, role: "speaker", deviceKey: "old-page", syncEngineVersion: 3, unlocked: true, muted: false },
-    { id: 4, role: "speaker", deviceKey: "muted", syncEngineVersion: 6, unlocked: true, muted: true },
-    { id: 5, role: "controller", deviceKey: "controller", syncEngineVersion: 6, unlocked: true, muted: false }
+    { id: 4, role: "speaker", deviceKey: "muted", syncEngineVersion: 7, unlocked: true, muted: true },
+    { id: 5, role: "controller", deviceKey: "controller", syncEngineVersion: 7, unlocked: true, muted: false }
   ]);
   assert.deepEqual(candidates.map((client) => client.id), [2]);
 });
@@ -204,6 +206,22 @@ test("recovery tolerates a noisy near-lock sample without starting over", () => 
   assert.equal(guard.recoveryCount, 2);
   for (const error of [6, 7, 5, 8]) guard = nextFixedTimelineGuard(guard, error);
   assert.equal(guard.action, "rejoin");
+});
+
+test("a shared positive drift requests a larger room target", () => {
+  const plan = runtimeRoomRelockPlan([
+    { syncErrorMs: 168, playoutDelayMs: 373, outputLatencyMs: 27, postDelayMs: 0 },
+    { syncErrorMs: 163, playoutDelayMs: 367, outputLatencyMs: 12, postDelayMs: 0 },
+    { syncErrorMs: 177, playoutDelayMs: 396, outputLatencyMs: 13, postDelayMs: 0 }
+  ], 232);
+  assert.deepEqual(plan, { shouldRelock: true, roomTargetMs: 417, lateCount: 3, requiredCount: 2 });
+
+  const isolated = runtimeRoomRelockPlan([
+    { syncErrorMs: 60, playoutDelayMs: 260, outputLatencyMs: 20, postDelayMs: 0 },
+    { syncErrorMs: 2, playoutDelayMs: 200, outputLatencyMs: 20, postDelayMs: 10 },
+    { syncErrorMs: 1, playoutDelayMs: 198, outputLatencyMs: 20, postDelayMs: 12 }
+  ], 230);
+  assert.equal(isolated.shouldRelock, false);
 });
 
 test("an emergency timeline jump is isolated on the first monitor sample", () => {
