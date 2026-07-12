@@ -1,4 +1,4 @@
-export const ROOM_SYNC_ENGINE_VERSION = 5;
+export const ROOM_SYNC_ENGINE_VERSION = 6;
 
 export const ROOM_SYNC_POLICY = Object.freeze({
   sampleWindow: 3,
@@ -17,6 +17,7 @@ export const ROOM_SYNC_POLICY = Object.freeze({
   hardSyncErrorMs: 25,
   emergencySyncErrorMs: 80,
   recoverySyncErrorMs: 8,
+  recoveryGraceErrorMs: 16,
   softCorrectionGain: 0.25,
   softCorrectionStepMs: 3,
   quarantinedCorrectionStepMs: 3,
@@ -26,7 +27,7 @@ export const ROOM_SYNC_POLICY = Object.freeze({
   rejoinLeadMs: 1_200,
   rejoinFadeSeconds: 0.65,
   violationSamples: 3,
-  recoverySamples: 12
+  recoverySamples: 6
 });
 
 export function roomLockTimeoutAction({
@@ -233,7 +234,11 @@ export function nextFixedTimelineGuard(state, syncErrorMs, policy = ROOM_SYNC_PO
     return { quarantined: false, violationCount, recoveryCount: 0, action: "none" };
   }
 
-  const recoveryCount = error <= policy.recoverySyncErrorMs ? previous.recoveryCount + 1 : 0;
+  const recoveryCount = error <= policy.recoverySyncErrorMs
+    ? previous.recoveryCount + 1
+    : error <= policy.recoveryGraceErrorMs
+      ? Math.max(0, previous.recoveryCount - 1)
+      : 0;
   if (recoveryCount >= policy.recoverySamples) {
     return { quarantined: false, violationCount: 0, recoveryCount, action: "rejoin" };
   }

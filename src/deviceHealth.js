@@ -98,24 +98,6 @@ export function fastFuseReason(metrics = {}, policy = DEVICE_HEALTH_POLICY) {
   if (metricAtLeast(metrics.rtpStallMs, policy.fastFuseRtpStallMs)) {
     return fault("connection", "RTP_STALLED", "RTP audio stopped advancing");
   }
-  if (Math.abs(Number(metrics.outputLatencyDeltaMs)) >= policy.fastFuseOutputLatencyDeltaMs) {
-    return fault("audio", "OUTPUT_LATENCY_JUMP", "Output latency changed suddenly");
-  }
-  if (Math.abs(Number(metrics.rawSyncErrorMs)) >= policy.fastFuseSyncErrorMs) {
-    return fault("sync", "SYNC_JUMP", "Timeline jumped out of range");
-  }
-  if (
-    Number(metrics.totalSamplesDelta) > 0 &&
-    metricAtLeast(metrics.concealmentRate, policy.fastFuseConcealmentRate)
-  ) {
-    return fault("connection", "CONCEALMENT_BURST", "Audio concealment burst detected");
-  }
-  if (
-    Number(metrics.packetSampleCount) >= 4 &&
-    metricAtLeast(metrics.packetLossRate, policy.fastFusePacketLossRate)
-  ) {
-    return fault("connection", "PACKET_LOSS_BURST", "Packet-loss burst detected");
-  }
   return null;
 }
 

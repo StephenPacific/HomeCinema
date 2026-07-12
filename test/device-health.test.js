@@ -40,14 +40,13 @@ test("RTC windows expose recent loss, concealment, and stalls", () => {
   assert.equal(stalled.rtpStallMs, 900);
 });
 
-test("Fast Fuse reacts to a serious fault on the first health window", () => {
-  assert.equal(fastFuseReason({ active: true, rawSyncErrorMs: 21 })?.code, "SYNC_JUMP");
+test("Fast Fuse only reacts immediately to deterministic local faults", () => {
   assert.equal(fastFuseReason({ active: true, rtpStallMs: 800 })?.code, "RTP_STALLED");
-  assert.equal(
-    fastFuseReason({ active: true, packetLossRate: 0.09, packetSampleCount: 10 })?.code,
-    "PACKET_LOSS_BURST"
-  );
-  assert.equal(fastFuseReason({ active: true, rawSyncErrorMs: 19 }), null);
+  assert.equal(fastFuseReason({ active: true, connectionState: "failed" })?.code, "WEBRTC_FAILED");
+  assert.equal(fastFuseReason({ active: true, audioContextState: "suspended" })?.code, "AUDIO_ENGINE_STOPPED");
+  assert.equal(fastFuseReason({ active: true, outputLatencyDeltaMs: 30 }), null);
+  assert.equal(fastFuseReason({ active: true, rawSyncErrorMs: 40 }), null);
+  assert.equal(fastFuseReason({ active: true, packetLossRate: 0.2, packetSampleCount: 20 }), null);
 });
 
 test("three or more devices use the room median to identify an outlier", () => {

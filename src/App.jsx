@@ -263,7 +263,20 @@ export default function App() {
     if (socketRef.current?.readyState !== WebSocket.OPEN) return;
     const state = stateRef.current;
     const layer = layerById(state.layers || [], selectedLayerIdRef.current) || state.layers?.[0] || null;
-    const health = deriveDeviceHealth({
+    const liveAudio = liveAudioRef.current;
+    const liveSession = liveSessionRef.current;
+    const audioContextState = audioContextRef.current?.state || "none";
+    const liveOutputMode = liveOutputModeRef.current;
+    const speakerNeedsTap = Boolean(
+      roleRef.current === "speaker" &&
+      liveSession?.phase === "playing" &&
+      rtcBytesReceivedRef.current > 0 &&
+      (
+        (liveOutputMode.endsWith("source") && audioContextState !== "running") ||
+        (liveOutputMode === "none" && ["suspended", "interrupted", "closed"].includes(audioContextState))
+      )
+    );
+    const health = speakerNeedsTap ? "needs-action" : deriveDeviceHealth({
       role: roleRef.current,
       status: readyStatusRef.current,
       muted: remoteMutedRef.current,
@@ -273,8 +286,6 @@ export default function App() {
       audioReady: audioReadyRef.current
     });
     outputLatencyRef.current = Math.round(estimateOutputLatencySeconds(audioContextRef.current) * 1000);
-    const liveAudio = liveAudioRef.current;
-    const liveSession = liveSessionRef.current;
     const timelineState = !liveSession
       ? "idle"
       : liveSession.timelineGuard?.quarantined || liveSession.rejoining
@@ -290,17 +301,17 @@ export default function App() {
       layerId: selectedLayerIdRef.current,
       zone: selectedZoneRef.current,
       ready: roleRef.current === "controller" || health === "ready",
-      unlocked: roleRef.current === "controller" || unlockedRef.current,
+      unlocked: roleRef.current === "controller" || (!speakerNeedsTap && unlockedRef.current),
       muted: remoteMutedRef.current,
       health,
-      status: readyStatusRef.current,
+      status: speakerNeedsTap ? "Tap Enable speaker on this device" : readyStatusRef.current,
       syncErrorMs: syncErrorRef.current,
       playoutDelayMs: rtcPlayoutDelayRef.current,
       postDelayMs: rtcPostDelayRef.current,
       latencyMs: Math.round(latencyRef.current || 0),
       outputLatencyMs: outputLatencyRef.current,
       deviceOffsetMs: deviceOffsetRef.current,
-      audioContextState: audioContextRef.current?.state || "none",
+      audioContextState,
       audioSessionType: audioSessionInfoRef.current.type,
       audioSessionState: audioSessionInfoRef.current.state,
       outputPath: liveOutputModeRef.current,
@@ -2222,8 +2233,13 @@ export default function App() {
       if (socketState !== WebSocket.OPEN && socketState !== WebSocket.CONNECTING) connect();
       else calibrateClock(6);
 
-      const contextCarriesLiveAudio = liveOutputModeRef.current.endsWith("source") && liveSessionRef.current;
-      if (contextCarriesLiveAudio && audioContextRef.current?.state !== "running") {
+      const hasLiveFrames = Boolean(liveSessionRef.current && rtcBytesReceivedRef.current > 0);
+      const audioContextUnavailable = Boolean(
+        audioContextRef.current &&
+        audioContextRef.current.state !== "running" &&
+        (liveOutputModeRef.current.endsWith("source") || liveOutputModeRef.current === "none")
+      );
+      if (hasLiveFrames && audioContextUnavailable) {
         unlockedRef.current = false;
         setUnlockedState(false);
         setReadyStatus("Tap to resume audio");
