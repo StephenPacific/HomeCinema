@@ -1,5 +1,6 @@
 import { Copy, Pause, Play, Radio, RefreshCw, RotateCw, Square, Upload, Volume2, VolumeX } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { configurePlaybackAudioSession, readAudioSession } from "./audioSession.js";
 import {
   expectedLivePositionSeconds,
   LIVE_SYNC_POLICY,
@@ -77,6 +78,7 @@ export default function App() {
   const [unlockedState, setUnlockedState] = useState(false);
   const [remoteMutedState, setRemoteMutedState] = useState(false);
   const [audioContextState, setAudioContextState] = useState("none");
+  const [audioSessionInfoState, setAudioSessionInfoState] = useState(readAudioSession);
   const [playbackEngineState, setPlaybackEngineState] = useState("Web Audio");
   const [audioIssueState, setAudioIssueState] = useState("");
   const [webAudioTestState, setWebAudioTestState] = useState("Not tested");
@@ -120,6 +122,7 @@ export default function App() {
   const outputVolumeRef = useRef(1);
   const audioReadyRef = useRef(audioReadyState);
   const audioContextRef = useRef(null);
+  const audioSessionInfoRef = useRef(audioSessionInfoState);
   const gainRef = useRef(null);
   const liveMediaSourceNodeRef = useRef(null);
   const liveStreamSourceNodeRef = useRef(null);
@@ -219,6 +222,13 @@ export default function App() {
     document.body.dataset.role = roleState;
   }, [roleState]);
 
+  const applyPlaybackAudioSession = useCallback(() => {
+    const nextInfo = configurePlaybackAudioSession();
+    audioSessionInfoRef.current = nextInfo;
+    setAudioSessionInfoState(nextInfo);
+    return nextInfo;
+  }, []);
+
   const send = useCallback((message) => {
     if (socketRef.current?.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify(message));
@@ -267,6 +277,8 @@ export default function App() {
       outputLatencyMs: outputLatencyRef.current,
       deviceOffsetMs: deviceOffsetRef.current,
       audioContextState: audioContextRef.current?.state || "none",
+      audioSessionType: audioSessionInfoRef.current.type,
+      audioSessionState: audioSessionInfoRef.current.state,
       outputPath: liveOutputModeRef.current,
       livePaused: Boolean(liveAudio?.paused),
       liveMuted: Boolean(liveAudio?.muted),
@@ -283,6 +295,19 @@ export default function App() {
     clearTimeout(statusTimerRef.current);
     statusTimerRef.current = setTimeout(reportStatusNow, 120);
   }, [reportStatusNow]);
+
+  useEffect(() => {
+    if (!isPlayerView) return undefined;
+    const audioSession = globalThis.navigator?.audioSession;
+    const updateAudioSession = () => {
+      applyPlaybackAudioSession();
+      reportStatusSoon();
+    };
+
+    updateAudioSession();
+    audioSession?.addEventListener?.("statechange", updateAudioSession);
+    return () => audioSession?.removeEventListener?.("statechange", updateAudioSession);
+  }, [applyPlaybackAudioSession, isPlayerView, reportStatusSoon]);
 
   useEffect(() => {
     readyStatusRef.current = readyStatus;
@@ -1482,6 +1507,7 @@ export default function App() {
   );
 
   const createAudioContext = useCallback(() => {
+    if (roleRef.current === "speaker") applyPlaybackAudioSession();
     if (!audioContextRef.current) {
       const AudioApi = window.AudioContext || window.webkitAudioContext;
       if (!AudioApi) throw new Error("Web Audio is not supported on this browser");
@@ -1533,7 +1559,7 @@ export default function App() {
     outputLatencyRef.current = outputLatencyMs;
     setOutputLatencyState(outputLatencyMs);
     return audioContextRef.current;
-  }, [rampLiveOutput, reportStatusSoon, restoreLiveOutput]);
+  }, [applyPlaybackAudioSession, rampLiveOutput, reportStatusSoon, restoreLiveOutput]);
 
   const ensureAudioContext = useCallback(async ({ resume = true } = {}) => {
     const audioContext = createAudioContext();
@@ -2047,6 +2073,7 @@ export default function App() {
     const timer = setInterval(sampleClock, 2000);
     const restoreForegroundSession = () => {
       if (document.visibilityState !== "visible") return;
+      if (roleRef.current === "speaker") applyPlaybackAudioSession();
       shuttingDownRef.current = false;
       const socketState = socketRef.current?.readyState;
       if (socketState !== WebSocket.OPEN && socketState !== WebSocket.CONNECTING) connect();
@@ -2068,7 +2095,7 @@ export default function App() {
       document.removeEventListener("visibilitychange", restoreForegroundSession);
       window.removeEventListener("pageshow", restoreForegroundSession);
     };
-  }, [calibrateClock, connect, reportStatusSoon, send]);
+  }, [applyPlaybackAudioSession, calibrateClock, connect, reportStatusSoon, send]);
 
   useEffect(() => {
     const onBeforeUnload = () => closeSocket();
@@ -2301,6 +2328,7 @@ export default function App() {
     unlockingRef.current = true;
     setAudioIssueState("");
     setReadyStatus("Unlocking");
+    applyPlaybackAudioSession();
 
     try {
       const liveAudio = liveAudioRef.current;
@@ -3066,6 +3094,7 @@ export default function App() {
                 <div className="diagnostic-grid">
                   <Stat label="Audio engine" value={playbackEngineState} />
                   <Stat label="AudioContext" value={audioContextState} />
+                  <Stat label="Audio session" value={formatAudioSession(audioSessionInfoState)} />
                   <Stat label="Live output" value={liveOutputPathState} />
                   <Stat label="Output estimate" value={outputLatencyState === null ? "-- ms" : `${outputLatencyState} ms`} />
                   <Stat label="Browser" value={`${deviceInfo.browser} / ${deviceInfo.engine}`} />
@@ -3221,6 +3250,8 @@ function PeerCard({ peer, layers, onTest, onToggle, onReconnect, onOffset, onVol
         <strong>{Number.isFinite(peer.postDelayMs) ? `${Math.round(peer.postDelayMs)} ms` : "--"}</strong>
         <span>Audio path</span>
         <strong>{formatPeerOutput(peer)}</strong>
+        <span>Audio session</span>
+        <strong>{formatPeerAudioSession(peer)}</strong>
         <span>Inbound</span>
         <strong>{peer.rtcBytesReceived > 0 ? "Receiving frames" : "--"}</strong>
         <span>Timing</span>
@@ -3305,6 +3336,16 @@ function formatPeerOutput(peer) {
   }
   if (peer.outputPath === "html-media-element" && peer.livePaused) return `${output} / paused`;
   return output;
+}
+
+function formatAudioSession(info) {
+  if (!info?.supported) return "Browser default";
+  return `${info.type} / ${info.state}`;
+}
+
+function formatPeerAudioSession(peer) {
+  if (!peer.audioSessionType || peer.audioSessionType === "unavailable") return "Browser default";
+  return `${peer.audioSessionType} / ${peer.audioSessionState || "unknown"}`;
 }
 
 function buildSyncLabel({ layers, selectedLayer, state, audioReady, audioLoading, countdown }) {

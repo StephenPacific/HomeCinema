@@ -153,6 +153,8 @@ server.on("upgrade", (req, socket) => {
     outputLatencyMs: 0,
     deviceOffsetMs: 0,
     audioContextState: "none",
+    audioSessionType: "unavailable",
+    audioSessionState: "unavailable",
     outputPath: "none",
     controllerAudioMetrics: null,
     lastControllerMetricsLogAt: 0,
@@ -431,6 +433,12 @@ function handleMessage(client, message) {
     client.deviceOffsetMs = finiteNumber(message.deviceOffsetMs, client.deviceOffsetMs);
     if (message.audioContextState !== undefined) {
       client.audioContextState = String(message.audioContextState || "none").slice(0, 24);
+    }
+    if (message.audioSessionType !== undefined) {
+      client.audioSessionType = String(message.audioSessionType || "unavailable").slice(0, 24);
+    }
+    if (message.audioSessionState !== undefined) {
+      client.audioSessionState = String(message.audioSessionState || "unavailable").slice(0, 24);
     }
     if (message.outputPath !== undefined) client.outputPath = String(message.outputPath || "none").slice(0, 40);
     if (message.livePaused !== undefined) client.livePaused = Boolean(message.livePaused);
@@ -1194,6 +1202,8 @@ function peerList() {
       outputLatencyMs: client.outputLatencyMs,
       deviceOffsetMs: client.deviceOffsetMs,
       audioContextState: client.audioContextState,
+      audioSessionType: client.audioSessionType,
+      audioSessionState: client.audioSessionState,
       outputPath: client.outputPath,
       controllerAudioMetrics: client.controllerAudioMetrics,
       livePaused: client.livePaused,
