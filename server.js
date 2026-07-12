@@ -16,7 +16,7 @@ import {
   stableRoomTiming,
   supportsRoomSyncVersion
 } from "./src/roomSync.js";
-import { lanAddressCandidates } from "./src/networkAddresses.js";
+import { isLocalClientAddress, lanAddressCandidates } from "./src/networkAddresses.js";
 import { sanitizeControllerAudioMetrics } from "./src/controllerMetrics.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -126,10 +126,13 @@ server.on("upgrade", (req, socket) => {
     ].join("\r\n")
   );
 
+  const requestUrl = new URL(req.url || "/", "http://localhost");
+  const networkInterfaces = os.networkInterfaces();
   const client = {
     id: nextClientId++,
     socket,
     remoteAddress: socket.remoteAddress,
+    hidden: requestUrl.searchParams.get("probe") === "controller-address",
     userAgent: req.headers["user-agent"] || "",
     buffer: Buffer.alloc(0),
     role: "speaker",
@@ -184,6 +187,8 @@ server.on("upgrade", (req, socket) => {
   send(client, {
     type: "hello",
     id: client.id,
+    localConnection: isLocalClientAddress(client.remoteAddress, networkInterfaces),
+    localControllerUrl: `http://127.0.0.1:${port}`,
     state: publicState(),
     peers: peerList()
   });
@@ -1139,7 +1144,7 @@ function broadcastBinary(payload, sender, bootstrapId = null) {
 
 function removeClient(client) {
   if (!clients.has(client)) return;
-  if (liveOwnerClientId && liveOwnerClientId !== client.id) {
+  if (!client.hidden && liveOwnerClientId && liveOwnerClientId !== client.id) {
     const owner = [...clients].find((item) => item.id === liveOwnerClientId);
     if (owner) send(owner, { type: "webrtcPeerLeave", peerId: client.id });
   }
@@ -1159,6 +1164,7 @@ function broadcastPeers() {
 function peerList() {
   const latestByDevice = new Map();
   for (const client of clients) {
+    if (client.hidden) continue;
     const key = `${client.role}:${client.deviceKey || `socket-${client.id}`}`;
     const existing = latestByDevice.get(key);
     if (!existing || client.id > existing.id) {

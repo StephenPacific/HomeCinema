@@ -1,3 +1,5 @@
+import { canonicalControllerServiceUrl } from "./server-url.js";
+
 const WEBRTC_TARGET_BUFFER_MS = 120;
 const CONTROLLER_AUDIO_SAMPLE_INTERVAL_MS = 500;
 const CONTROLLER_AUDIO_REPORT_INTERVAL_MS = 2000;
@@ -130,6 +132,14 @@ function connectCaptureSocket() {
       return;
     }
 
+    if (message.type === "hello") {
+      const canonicalUrl = canonicalControllerServiceUrl(state.serverUrl, message);
+      if (canonicalUrl !== state.serverUrl) {
+        state.serverUrl = canonicalUrl;
+        if (state.lastStatus) setStatus({ ...state.lastStatus, serverUrl: canonicalUrl });
+      }
+      return;
+    }
     if (message.type === "error") {
       setStatus({
         phase: "connecting",

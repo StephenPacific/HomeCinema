@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  canonicalControllerServiceUrl,
   controllerPageUrl,
+  controllerProbeWebSocketUrl,
   normalizeServerUrl,
   resolveServerUrl,
   serverUrlFromHomeCinemaTab
@@ -11,6 +13,27 @@ test("extension opens an explicit Controller page", () => {
   assert.equal(
     controllerPageUrl("http://127.0.0.1:4173"),
     "http://127.0.0.1:4173/?mode=controller"
+  );
+});
+
+test("a same-machine VMware service address migrates to loopback", () => {
+  assert.equal(
+    canonicalControllerServiceUrl("http://192.168.26.1:4173", {
+      localConnection: true,
+      localControllerUrl: "http://127.0.0.1:4173"
+    }),
+    "http://127.0.0.1:4173"
+  );
+  assert.equal(
+    canonicalControllerServiceUrl("http://192.168.20.8:4173", {
+      localConnection: false,
+      localControllerUrl: "http://127.0.0.1:4173"
+    }),
+    "http://192.168.20.8:4173"
+  );
+  assert.equal(
+    controllerProbeWebSocketUrl("http://192.168.26.1:4173"),
+    "ws://192.168.26.1:4173/?probe=controller-address"
   );
 });
 

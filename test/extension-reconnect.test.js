@@ -2,9 +2,15 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
+import { canonicalControllerServiceUrl } from "../extension/server-url.js";
+
+async function loadOffscreenSource() {
+  const source = await readFile(new URL("../extension/offscreen.js", import.meta.url), "utf8");
+  return source.replace(/^import .*?;\n\n/, "");
+}
 
 test("capture reconnect keeps the tab stream alive until the user stops it", async () => {
-  const source = await readFile(new URL("../extension/offscreen.js", import.meta.url), "utf8");
+  const source = await loadOffscreenSource();
   const sockets = [];
   const timers = new Map();
   let nextTimerId = 1;
@@ -72,6 +78,7 @@ test("capture reconnect keeps the tab stream alive until the user stops it", asy
     RTCPeerConnection: class {},
     WebSocket: FakeWebSocket,
     URL,
+    canonicalControllerServiceUrl,
     console,
     clearInterval() {},
     clearTimeout(timerId) {
@@ -94,7 +101,7 @@ test("capture reconnect keeps the tab stream alive until the user stops it", asy
       {
         type: "begin-capture-in-offscreen",
         streamId: "stream-id",
-        serverUrl: "http://127.0.0.1:4173",
+        serverUrl: "http://192.168.26.1:4173",
         tabTitle: "Test tab",
         tabId: 42
       },
@@ -117,6 +124,8 @@ test("capture reconnect keeps the tab stream alive until the user stops it", asy
   sockets[0].emit("message", {
     data: JSON.stringify({
       type: "hello",
+      localConnection: true,
+      localControllerUrl: "http://127.0.0.1:4173",
       state: { addresses: ["http://192.168.20.8:4173"] }
     })
   });
@@ -129,6 +138,7 @@ test("capture reconnect keeps the tab stream alive until the user stops it", asy
   assert.ok(reconnectTimer);
   reconnectTimer.callback();
   assert.equal(sockets.length, 2);
+  assert.equal(sockets[1].url, "ws://127.0.0.1:4173/");
   assert.equal(trackStopCount, 0);
 
   runtimeListener({ type: "stop-capture-in-offscreen" }, null, () => {});
@@ -136,7 +146,7 @@ test("capture reconnect keeps the tab stream alive until the user stops it", asy
 });
 
 test("capture output stays muted through locking, then arms once at Controller volume", async () => {
-  const source = await readFile(new URL("../extension/offscreen.js", import.meta.url), "utf8");
+  const source = await loadOffscreenSource();
   const sockets = [];
   const gainEvents = [];
   const sentMessages = [];
@@ -221,6 +231,7 @@ test("capture output stays muted through locking, then arms once at Controller v
     RTCPeerConnection: class {},
     WebSocket: FakeWebSocket,
     URL,
+    canonicalControllerServiceUrl,
     console,
     clearInterval() {},
     clearTimeout() {},

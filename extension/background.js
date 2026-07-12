@@ -1,14 +1,8 @@
-import { normalizeServerUrl } from "./server-url.js";
-
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === "capture-status") {
-    const updates = { captureStatus: message.status };
-    try {
-      if (message.status?.serverUrl) updates.homeCinemaUrl = normalizeServerUrl(message.status.serverUrl);
-    } catch {}
-    chrome.storage.local.set(updates).then(() => sendResponse({ ok: true }));
+    chrome.storage.local.set({ captureStatus: message.status }).then(() => sendResponse({ ok: true }));
     return true;
   }
 

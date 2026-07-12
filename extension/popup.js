@@ -1,4 +1,10 @@
-import { controllerPageUrl, normalizeServerUrl, resolveServerUrl, serverUrlFromHomeCinemaTab } from "./server-url.js";
+import {
+  canonicalControllerServiceUrl,
+  controllerPageUrl,
+  controllerProbeWebSocketUrl,
+  normalizeServerUrl,
+  resolveServerUrl
+} from "./server-url.js";
 
 const serverUrlInput = document.querySelector("#serverUrl");
 const tabTitle = document.querySelector("#tabTitle");
@@ -89,11 +95,15 @@ async function initialize() {
   ]);
   activeTab = tab;
   const nextStatus = response?.status || captureStatus;
-  const detectedTabUrl = serverUrlFromHomeCinemaTab(tab);
-  const serverUrl = resolveServerUrl({ savedUrl: homeCinemaUrl, captureStatus: nextStatus, activeTab: tab });
+  const resolvedUrl = resolveServerUrl({ savedUrl: homeCinemaUrl, captureStatus: nextStatus, activeTab: tab });
+  const serverUrl = await canonicalizeControllerService(resolvedUrl);
   serverUrlInput.value = serverUrl;
-  if (!homeCinemaUrl && detectedTabUrl) {
-    await chrome.storage.local.set({ homeCinemaUrl: detectedTabUrl });
+  let savedUrl = "";
+  try {
+    savedUrl = normalizeServerUrl(homeCinemaUrl);
+  } catch {}
+  if (serverUrl && serverUrl !== savedUrl) {
+    await chrome.storage.local.set({ homeCinemaUrl: serverUrl });
   }
   tabTitle.textContent = tab?.title || "No active tab";
   renderStatus(
@@ -101,6 +111,46 @@ async function initialize() {
       ? nextStatus
       : { ...nextStatus, detail: "Enter the Home Cinema address, or open its Controller page and reopen this extension." }
   );
+}
+
+async function canonicalizeControllerService(value) {
+  if (!value) return "";
+  const configuredUrl = normalizeServerUrl(value);
+  const hostname = new URL(configuredUrl).hostname;
+  if (["localhost", "127.0.0.1", "::1"].includes(hostname)) return configuredUrl;
+  try {
+    const hello = await probeControllerService(configuredUrl);
+    return canonicalControllerServiceUrl(configuredUrl, hello);
+  } catch {
+    return configuredUrl;
+  }
+}
+
+function probeControllerService(value, timeoutMs = 900) {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(controllerProbeWebSocketUrl(value));
+    let settled = false;
+    let timer = null;
+    const finish = (error, hello) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        socket.close();
+      } catch {}
+      if (error) reject(error);
+      else resolve(hello);
+    };
+    timer = setTimeout(() => finish(new Error("Controller service probe timed out.")), timeoutMs);
+    socket.addEventListener("message", (event) => {
+      if (typeof event.data !== "string") return;
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === "hello") finish(null, message);
+      } catch {}
+    });
+    socket.addEventListener("error", () => finish(new Error("Controller service probe failed.")));
+  });
 }
 
 function activeTabQuery() {

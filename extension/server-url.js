@@ -28,6 +28,21 @@ export function controllerPageUrl(value) {
   return url.toString();
 }
 
+export function controllerProbeWebSocketUrl(value) {
+  const url = new URL(normalizeServerUrl(value));
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.pathname = "/";
+  url.searchParams.set("probe", "controller-address");
+  url.hash = "";
+  return url.toString();
+}
+
+export function canonicalControllerServiceUrl(value, hello) {
+  const configuredUrl = normalizeServerUrl(value);
+  if (!hello?.localConnection) return configuredUrl;
+  return normalizedOrEmpty(hello.localControllerUrl) || configuredUrl;
+}
+
 export function resolveServerUrl({ savedUrl, captureStatus, activeTab }) {
   const captureUrl = normalizedOrEmpty(captureStatus?.serverUrl);
   if (["connecting", "capturing"].includes(captureStatus?.phase) && captureUrl) return captureUrl;

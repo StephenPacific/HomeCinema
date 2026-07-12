@@ -73,6 +73,19 @@ export function speakerJoinAddressCandidates({
   }));
 }
 
+export function isLocalClientAddress(remoteAddress, networkInterfaces) {
+  const remote = normalizedIpAddress(remoteAddress);
+  if (!remote) return false;
+  if (remote === "::1" || remote.startsWith("127.")) return true;
+
+  for (const entries of Object.values(networkInterfaces || {})) {
+    for (const entry of entries || []) {
+      if (normalizedIpAddress(entry?.address) === remote) return true;
+    }
+  }
+  return false;
+}
+
 function isUsableIpv4(entry) {
   if (!entry || (entry.family !== "IPv4" && entry.family !== 4) || entry.internal) return false;
   const address = String(entry.address || "");
@@ -101,4 +114,9 @@ function normalizedOrigin(value) {
   } catch {
     return "";
   }
+}
+
+function normalizedIpAddress(value) {
+  const address = String(value || "").trim().toLowerCase().split("%")[0];
+  return address.startsWith("::ffff:") ? address.slice(7) : address;
 }

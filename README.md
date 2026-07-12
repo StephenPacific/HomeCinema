@@ -44,7 +44,7 @@ Speaker pages report a room-sync engine version. Version `v4` is required for th
 
 The room target stays frozen after playback starts. Speakers monitor WebRTC playout every 500 ms while keeping audible delay correction limited to 3 ms every two seconds, applied as a 1.8-second Web Audio ramp. A single 80 ms timeline jump, or three consecutive samples beyond 25 ms, isolates only that Speaker with a 120 ms fade. While silent it can retune by 3 ms per monitor sample. Rejoining requires six consecutive samples within 8 ms, remains cancellable during a 1.2-second arming window, and then fades in over 650 ms. If a device has no delay headroom left, it remains muted instead of disrupting healthy outputs.
 
-Extension version `0.3.9` keeps the `v4` fast recovery envelope and fixes Windows Speaker address selection so a VMware current connection cannot replace the recommended WLAN QR link. It includes bounded timeline-lock retries, manual lock recovery, room and per-Speaker volume controls, the explicit **Use this computer** action, and Controller output telemetry.
+Extension version `0.3.10` keeps the `v4` fast recovery envelope and fixes both Windows address paths. A VMware current connection cannot replace the recommended WLAN Speaker QR link, and a previously saved same-machine VMware Controller service is automatically migrated to `127.0.0.1` after a verified local handshake. Remote coordination services keep their LAN address. The background capture status no longer overwrites an explicitly selected service address.
 
 ## Stems
 

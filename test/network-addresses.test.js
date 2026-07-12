@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { lanAddressCandidates, speakerJoinAddressCandidates } from "../src/networkAddresses.js";
+import {
+  isLocalClientAddress,
+  lanAddressCandidates,
+  speakerJoinAddressCandidates
+} from "../src/networkAddresses.js";
 
 const ipv4 = (address) => ({ address, family: "IPv4", internal: false });
 
@@ -84,4 +88,16 @@ test("loopback Controller pages exclude localhost from the Speaker QR list", () 
   });
 
   assert.deepEqual(candidates.map((candidate) => candidate.url), ["http://192.168.20.37:4173"]);
+});
+
+test("same-machine loopback, WLAN, and VMware clients are recognized", () => {
+  const interfaces = {
+    "Wi-Fi": [ipv4("192.168.20.37")],
+    "VMware Network Adapter VMnet8": [ipv4("192.168.26.1")]
+  };
+
+  assert.equal(isLocalClientAddress("::ffff:127.0.0.1", interfaces), true);
+  assert.equal(isLocalClientAddress("192.168.20.37", interfaces), true);
+  assert.equal(isLocalClientAddress("::ffff:192.168.26.1", interfaces), true);
+  assert.equal(isLocalClientAddress("192.168.20.52", interfaces), false);
 });
