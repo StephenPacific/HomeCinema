@@ -174,10 +174,11 @@ test("fast monitoring does not accelerate audible correction", () => {
 test("recovery envelope favors fast isolation and a slower verified return", () => {
   assert.equal(ROOM_SYNC_POLICY.monitorIntervalMs, 250);
   assert.equal(ROOM_SYNC_POLICY.silentCorrectionIntervalMs, 500);
-  assert.equal(ROOM_SYNC_POLICY.quarantineFadeSeconds, 0.12);
+  assert.equal(ROOM_SYNC_POLICY.fastFuseFadeSeconds, 0.16);
+  assert.equal(ROOM_SYNC_POLICY.quarantineFadeSeconds, 0.45);
   assert.equal(ROOM_SYNC_POLICY.recoverySamples, 6);
   assert.equal(ROOM_SYNC_POLICY.rejoinLeadMs, 1_200);
-  assert.equal(ROOM_SYNC_POLICY.rejoinFadeSeconds, 0.65);
+  assert.equal(ROOM_SYNC_POLICY.rejoinFadeSeconds, 1.2);
 });
 
 test("fixed timeline quarantines sustained drift and rejoins only after sustained recovery", () => {

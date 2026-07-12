@@ -1343,7 +1343,7 @@ export default function App() {
             ) {
               session.fastFuseReason = "RTP_STALLED";
               fastFuseReasonRef.current = session.fastFuseReason;
-              quarantineWebRtcOutput(session, "Isolated: connection interrupted", 0.08);
+              quarantineWebRtcOutput(session, "Isolated: connection interrupted", ROOM_SYNC_POLICY.fastFuseFadeSeconds);
             }
           }, DEVICE_HEALTH_POLICY.fastFuseRtpStallMs);
         } else if (connection.connectionState === "failed") {
@@ -1351,7 +1351,7 @@ export default function App() {
           session.disconnectTimer = null;
           session.fastFuseReason = "WEBRTC_FAILED";
           fastFuseReasonRef.current = session.fastFuseReason;
-          quarantineWebRtcOutput(session, "Isolated: WebRTC connection failed", 0.08);
+          quarantineWebRtcOutput(session, "Isolated: WebRTC connection failed", ROOM_SYNC_POLICY.fastFuseFadeSeconds);
           setAudioIssueState("The direct audio path could not be established on this network.");
         }
       });
@@ -1420,7 +1420,7 @@ export default function App() {
                 correctionCountRef.current += 1;
                 setCorrectionCountState(correctionCountRef.current);
                 setLastCorrectionState(`Fast Fuse: ${fuse.label}`);
-                quarantineWebRtcOutput(session, `Isolated: ${fuse.label}`, 0.08);
+                quarantineWebRtcOutput(session, `Isolated: ${fuse.label}`, ROOM_SYNC_POLICY.fastFuseFadeSeconds);
                 reportStatusSoon();
                 continue;
               }
@@ -1483,7 +1483,7 @@ export default function App() {
                 correctionCountRef.current += 1;
                 setCorrectionCountState(correctionCountRef.current);
                 setLastCorrectionState(`Fast Fuse: ${fuse.label}`);
-                quarantineWebRtcOutput(session, `Isolated: ${fuse.label}`, 0.08);
+                quarantineWebRtcOutput(session, `Isolated: ${fuse.label}`, ROOM_SYNC_POLICY.fastFuseFadeSeconds);
                 reportStatusSoon();
                 continue;
               }
@@ -1694,7 +1694,11 @@ export default function App() {
           if (liveSession?.phase === "playing" && !liveSession.timelineGuard?.quarantined) {
             liveSession.fastFuseReason = "AUDIO_ENGINE_STOPPED";
             fastFuseReasonRef.current = liveSession.fastFuseReason;
-            quarantineWebRtcOutput(liveSession, "Isolated: audio engine stopped", 0.08);
+            quarantineWebRtcOutput(
+              liveSession,
+              "Isolated: audio engine stopped",
+              ROOM_SYNC_POLICY.fastFuseFadeSeconds
+            );
           }
           unlockedRef.current = false;
           setUnlockedState(false);

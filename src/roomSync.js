@@ -23,9 +23,10 @@ export const ROOM_SYNC_POLICY = Object.freeze({
   quarantinedCorrectionStepMs: 3,
   softCorrectionRampSeconds: 1.8,
   startFadeSeconds: 0.04,
-  quarantineFadeSeconds: 0.12,
+  fastFuseFadeSeconds: 0.16,
+  quarantineFadeSeconds: 0.45,
   rejoinLeadMs: 1_200,
-  rejoinFadeSeconds: 0.65,
+  rejoinFadeSeconds: 1.2,
   violationSamples: 3,
   recoverySamples: 6
 });
