@@ -1,0 +1,2 @@
+# Unified diff context markers are required patch content.
+native/*.patch -whitespace

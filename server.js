@@ -5,6 +5,10 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createLiveAudioRelay, isLoopback } from "./lib/live-audio-server.mjs";
+import { createNativeAudioControl } from "./lib/native-audio-control.mjs";
+import { createMasterClock } from "./lib/master-clock.mjs";
+import { isLocalServerRequest } from "./lib/local-request.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
@@ -18,6 +22,15 @@ let leadMs = clamp(Number(process.env.SYNC_LEAD_MS || 3000), 550, 6000);
 
 const clients = new Set();
 let nextClientId = 1;
+const nativeControlEvents = [];
+const masterClock = createMasterClock();
+let nativeAudio;
+const liveAudio = createLiveAudioRelay({ getPort: () => port,
+  now: masterClock.now, getClock: masterClock.info,
+  broadcastControl: message => broadcast({ ...message, live: { ...message.live, ...nativeAudio?.status() } }) });
+nativeAudio = createNativeAudioControl({ projectDir: __dirname,
+  getServerUrl: () => `http://127.0.0.1:${port}`,
+  onState: () => broadcast({ type: "live", live: liveStatus() }) });
 
 let state = {
   track: null,
@@ -34,14 +47,42 @@ await loadTrackMeta();
 
 const server = http.createServer(async (req, res) => {
   try {
+    if (!isLocalServerRequest(req, port)) {
+      return sendJson(res, { error: "Open HomeCinema using its Local or Network address." }, 403);
+    }
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+    if (req.method === "GET" && url.pathname === "/live/status") return sendJson(res, liveStatus());
+    if (["/live/devices", "/live/start", "/live/stop"].includes(url.pathname)) {
+      if (!isHostControlRequest(req)) return sendJson(res, { error: "Control system audio from this Mac" }, 403);
+      try {
+        if (url.pathname === "/live/devices" && req.method === "GET") return sendJson(res, await nativeAudio.devices());
+        if (url.pathname === "/live/start" && req.method === "POST") {
+          recordNativeControl("start", req);
+          if (liveAudio.status().sourceConnected) return sendJson(res, { error: "System audio is already active" }, 409);
+          const options = await readSmallJson(req);
+          await nativeAudio.start(options);
+          return sendJson(res, liveStatus());
+        }
+        if (url.pathname === "/live/stop" && req.method === "POST") {
+          recordNativeControl("stop", req);
+          await nativeAudio.stop();
+          liveAudio.stopPublisher();
+          return sendJson(res, liveStatus());
+        }
+        return sendJson(res, { error: "Method not allowed" }, 405);
+      } catch (error) { return sendJson(res, { error: error.message || "Native audio could not start" }, 400); }
+    }
+
+    if (liveAudio.handleRequest(req, res, url)) return;
 
     if (req.method === "GET" && url.pathname === "/config") {
       return sendJson(res, {
         port,
         addresses: getLanAddresses(port),
         serverTime: Date.now(),
-        leadMs
+        leadMs,
+        isHostMachine: isHostMachine(req.socket.remoteAddress)
       });
     }
 
@@ -72,7 +113,17 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.on("upgrade", (req, socket) => {
+// A live publisher intentionally keeps its POST body open for the whole
+// listening session. Node's default total request deadline is five minutes,
+// even when PCM keeps arriving; retain the header timeout and route size caps.
+server.requestTimeout = 0;
+
+server.on("upgrade", (req, socket, head) => {
+  if (!isLocalServerRequest(req, port)) {
+    socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    return;
+  }
+  if (liveAudio.handleUpgrade(req, socket, head)) return;
   if (req.headers.upgrade?.toLowerCase() !== "websocket") {
     socket.destroy();
     return;
@@ -130,7 +181,8 @@ server.on("upgrade", (req, socket) => {
     type: "hello",
     id: client.id,
     state: publicState(),
-    peers: peerList()
+    peers: peerList(),
+    live: liveStatus()
   });
   broadcastPeers();
 });
@@ -316,6 +368,11 @@ function serveStatic(requestPath, res) {
 }
 
 function handleMessage(client, message) {
+  if (message.type === "liveTime") {
+    const reply = masterClock.reply(message);
+    if (reply) send(client, reply);
+    return;
+  }
   if (message.type === "time") {
     send(client, {
       type: "time",
@@ -335,6 +392,7 @@ function handleMessage(client, message) {
     client.unlocked = Boolean(message.unlocked);
     client.latencyMs = finiteNumber(message.latencyMs, client.latencyMs);
     client.deviceOffsetMs = finiteNumber(message.deviceOffsetMs, client.deviceOffsetMs);
+    client.audioDiagnostics = normalizeAudioDiagnostics(message.audioDiagnostics);
     client.lastSeen = Date.now();
     broadcastPeers();
     return;
@@ -543,6 +601,7 @@ function peerList() {
     unlocked: client.unlocked,
     latencyMs: client.latencyMs,
     deviceOffsetMs: client.deviceOffsetMs,
+    audioDiagnostics: client.audioDiagnostics || null,
     online: true
   }));
 }
@@ -587,8 +646,23 @@ function finiteNumber(value, fallback) {
   return Number.isFinite(number) ? number : fallback;
 }
 
-function sendJson(res, data) {
-  res.writeHead(200, {
+function normalizeAudioDiagnostics(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const result = {};
+  for (const key of ["engine", "contextState", "sessionType", "sessionState", "syncMode", "clockMethod"]) {
+    if (typeof value[key] === "string") result[key] = value[key].slice(0, 32);
+  }
+  for (const key of ["contextTime", "bufferDuration", "bufferFrames", "bufferSampleRate", "bufferPeak", "gain", "scheduledContextTime", "scheduledOffset", "mediaTime", "liveQueueMs", "liveUnderruns", "liveDroppedMs", "liveInputPeak", "timingErrorMs", "lateDrops", "clockRTT", "targetDelay"]) {
+    if (typeof value[key] === "number" && Number.isFinite(value[key])) result[key] = value[key];
+  }
+  for (const key of ["sourceActive", "mediaPaused"]) {
+    if (typeof value[key] === "boolean") result[key] = value[key];
+  }
+  return result;
+}
+
+function sendJson(res, data, status = 200) {
+  res.writeHead(status, {
     "Content-Type": "application/json",
     "Cache-Control": "no-store"
   });
@@ -629,6 +703,56 @@ function getLanAddresses(serverPort) {
   }
   return addresses;
 }
+
+function isHostMachine(address = "") {
+  if (isLoopback(address)) return true;
+  const normalized = address.replace(/^::ffff:/, "");
+  return Object.values(os.networkInterfaces()).flat().some(entry => entry?.address === normalized);
+}
+
+function liveStatus() { return { ...liveAudio.status(), ...nativeAudio.status(), controlEvents: nativeControlEvents }; }
+
+function recordNativeControl(action, req) {
+  nativeControlEvents.push({ action, at: Date.now(), origin: req?.headers.origin || "local tool",
+    agent: (req?.headers["user-agent"] || "").slice(0, 160) });
+  if (nativeControlEvents.length > 8) nativeControlEvents.shift();
+  console.log(`Native audio control: ${action}`);
+}
+
+function isHostControlRequest(req) {
+  if (!isHostMachine(req.socket.remoteAddress)) return false;
+  try {
+    const host = new URL(`http://${req.headers.host}`).hostname.replace(/^\[|\]$/g, "");
+    const allowed = ["localhost", "127.0.0.1", "::1", ...Object.values(os.networkInterfaces()).flat().map(item => item?.address)];
+    if (!allowed.includes(host)) return false;
+    return !req.headers.origin || new URL(req.headers.origin).host === req.headers.host;
+  } catch { return false; }
+}
+
+async function readSmallJson(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > 8192) throw new Error("Audio selection is too large");
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+}
+
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  recordNativeControl("server shutdown");
+  await nativeAudio.stop();
+  liveAudio.close();
+  for (const client of clients) client.socket.destroy();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 7000).unref();
+}
+process.once("SIGTERM", shutdown);
+process.once("SIGINT", shutdown);
 
 function clamp(value, min, max) {
   if (Number.isNaN(value)) return min;

@@ -1,6 +1,9 @@
 import { Copy, Pause, Play, RotateCw, Square, Upload, Volume2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createQrMatrix } from "./qr.js";
+import { localPlaybackTiming } from "./playback-timing.js";
+import { LiveAudioPlayer } from "./live-audio.js";
+import { LiveClockSync } from "./live-clock.js";
 
 const EMPTY_STATE = {
   track: null,
@@ -30,6 +33,27 @@ const zoneNames = {
 
 export default function App() {
   const isPlayerView = useMemo(() => new URLSearchParams(location.search).get("mode") === "player", []);
+  const [audioMode, setAudioMode] = useState(() => {
+    const requested = new URLSearchParams(location.search).get("source");
+    if (["live", "files"].includes(requested)) return requested;
+    const previous = localStorage.getItem("audioMode");
+    return ["live", "files"].includes(previous) ? previous : "live";
+  });
+  const [isHostMachine, setIsHostMachine] = useState(() => isLoopbackHost() ? true : null);
+  const [liveStatus, setLiveStatus] = useState({ active: false, sourceConnected: false, reason: "Waiting for the Mac" });
+  const [liveEnabled, setLiveEnabled] = useState(false);
+  const [liveAudioState, setLiveAudioState] = useState("off");
+  const [liveIssue, setLiveIssue] = useState("");
+  const [liveBufferMs, setLiveBufferMs] = useState(500);
+  const [liveTrimMs, setLiveTrimMs] = useState(() => clamp(Number(localStorage.getItem("liveTrimMs")) || 0, -200, 200));
+  const [liveStats, setLiveStats] = useState({ queueMs: 0, underruns: 0, droppedMs: 0, playing: false });
+  const [nativeDevices, setNativeDevices] = useState({ outputs: [], inputs: [] });
+  const [nativeOutputs, setNativeOutputs] = useState([]);
+  const [nativeMicrophone, setNativeMicrophone] = useState("");
+  const [nativeCalibrate, setNativeCalibrate] = useState(false);
+  const [nativeBusy, setNativeBusy] = useState(false);
+  const [nativeIssue, setNativeIssue] = useState("");
+  const [nativeNotice, setNativeNotice] = useState("");
   const [connected, setConnected] = useState(false);
   const [serverState, setServerState] = useState(EMPTY_STATE);
   const [peers, setPeers] = useState([]);
@@ -51,6 +75,7 @@ export default function App() {
   const [audioContextState, setAudioContextState] = useState("none");
   const [playbackEngineState, setPlaybackEngineState] = useState("Web Audio");
   const [audioIssueState, setAudioIssueState] = useState("");
+  const [mediaNeedsGestureState, setMediaNeedsGestureState] = useState(false);
   const [webAudioTestState, setWebAudioTestState] = useState("Not tested");
   const [driftState, setDriftState] = useState(null);
   const [correctionCountState, setCorrectionCountState] = useState(0);
@@ -79,6 +104,7 @@ export default function App() {
   const audioContextRef = useRef(null);
   const gainRef = useRef(null);
   const audioBufferRef = useRef(null);
+  const bufferPeakRef = useRef(null);
   const sourceRef = useRef(null);
   const activeSourcesRef = useRef(new Set());
   const mediaAudioRef = useRef(null);
@@ -96,17 +122,35 @@ export default function App() {
   const shuttingDownRef = useRef(false);
   const seekingRef = useRef(false);
   const handleMessageRef = useRef(null);
+  const audioModeRef = useRef(audioMode);
+  const liveContextRef = useRef(null);
+  const livePlayerRef = useRef(null);
+  const liveSocketRef = useRef(null);
+  const liveReconnectRef = useRef(null);
+  const liveEnabledRef = useRef(false);
+  const liveEpochRef = useRef(null);
+  const liveStatusRef = useRef(liveStatus);
+  const nativeActionEpochRef = useRef(0);
+  const nativeActionPendingRef = useRef(false);
+  const liveClockRef = useRef(null);
+  if (!liveClockRef.current) liveClockRef.current = new LiveClockSync();
+  const liveClockProbeTimersRef = useRef(new Set());
 
   const layers = serverState.layers || [];
   const selectedLayer = layerById(layers, selectedLayerIdState) || layers[0] || null;
   const trackLabel = layers.length > 1 ? `${layers.length} stems` : serverState.track?.name || "No track loaded";
+  const nativeCanStop = Boolean(liveStatus.processRunning || liveStatus.sourceConnected || ["starting", "calibrating"].includes(liveStatus.phase));
+  const hostCommonTimeline = isHostMachine === true && ["HCA2", 2].includes(liveStatus.protocol);
+  const showCommonTimeline = hostCommonTimeline || ["common-timeline", "waiting-for-clock"].includes(liveStats.syncMode);
+  const localTrackEnded = audioReadyState && Number.isFinite(durationState) && durationState > 0 && positionState >= durationState;
   const syncLabel = buildSyncLabel({
     layers,
     selectedLayer,
     state: serverState,
     audioReady: audioReadyState,
     audioLoading,
-    countdown: countdownState
+    countdown: countdownState,
+    localTrackEnded
   });
 
   useEffect(() => {
@@ -128,6 +172,9 @@ export default function App() {
     if (socketRef.current?.readyState !== WebSocket.OPEN) return;
     const state = stateRef.current;
     const layer = layerById(state.layers || [], selectedLayerIdRef.current) || state.layers?.[0] || null;
+    const receivingLive = audioModeRef.current === "live";
+    const currentLiveStats = livePlayerRef.current?.getStats();
+    const session = audioSessionDiagnostics();
     send({
       type: "identify",
       role: roleRef.current,
@@ -135,10 +182,39 @@ export default function App() {
       deviceKey: currentDeviceKey(),
       layerId: selectedLayerIdRef.current,
       zone: selectedZoneRef.current,
-      ready: Boolean(unlockedRef.current && (!layer || audioReadyRef.current)),
-      unlocked: unlockedRef.current,
+      ready: receivingLive ? Boolean(currentLiveStats?.playing) : Boolean(unlockedRef.current && (!layer || audioReadyRef.current)
+        && (playbackEngineRef.current !== "web-audio" || audioContextRef.current?.state === "running")),
+      unlocked: receivingLive ? liveEnabledRef.current : unlockedRef.current,
       latencyMs: Math.round(latencyRef.current || 0),
-      deviceOffsetMs: deviceOffsetRef.current
+      deviceOffsetMs: deviceOffsetRef.current,
+      audioDiagnostics: {
+        engine: receivingLive ? "live-pcm" : playbackEngineRef.current,
+        contextState: (receivingLive ? liveContextRef.current : audioContextRef.current)?.state ?? "none",
+        contextTime: (receivingLive ? liveContextRef.current : audioContextRef.current)?.currentTime ?? null,
+        bufferDuration: audioBufferRef.current?.duration ?? null,
+        bufferFrames: audioBufferRef.current?.length ?? null,
+        bufferSampleRate: audioBufferRef.current?.sampleRate ?? null,
+        bufferPeak: audioBufferRef.current ? bufferPeakRef.current : null,
+        sourceActive: receivingLive ? Boolean(currentLiveStats?.playing) : Boolean(sourceRef.current),
+        gain: receivingLive ? livePlayerRef.current?.output.gain.value ?? null : gainRef.current?.gain.value ?? null,
+        scheduledContextTime: localPlaybackRef.current?.contextStartedAt ?? null,
+        scheduledOffset: localPlaybackRef.current?.offset ?? null,
+        mediaPaused: mediaAudioRef.current?.paused ?? null,
+        mediaTime: mediaAudioRef.current?.currentTime ?? null,
+        liveQueueMs: currentLiveStats?.queueMs ?? null,
+        liveUnderruns: currentLiveStats?.underruns ?? null,
+        liveDroppedMs: currentLiveStats?.droppedMs ?? null,
+        liveInputPeak: currentLiveStats?.inputPeak ?? null,
+        sessionType: session.type,
+        sessionState: session.state,
+        syncMode: currentLiveStats?.syncMode ?? null,
+        timingErrorMs: currentLiveStats?.timingErrorMs ?? null,
+        lateDrops: currentLiveStats?.lateDrops ?? null,
+        clockRTT: currentLiveStats?.clockRTT ?? null,
+        targetDelay: currentLiveStats?.targetDelay ?? null,
+        clockMethod: currentLiveStats?.clockMethod ?? null,
+        liveTrimMs: currentLiveStats?.localTrimMs ?? null
+      }
     });
   }, [send]);
 
@@ -146,6 +222,119 @@ export default function App() {
     clearTimeout(statusTimerRef.current);
     statusTimerRef.current = setTimeout(reportStatusNow, 120);
   }, [reportStatusNow]);
+
+  const calibrateLiveClock = useCallback((samples = 10) => {
+    for (let index = 0; index < samples; index += 1) {
+      const timer = setTimeout(() => {
+        liveClockProbeTimersRef.current.delete(timer);
+        send({ type: "liveTime", clientSent: performance.now() });
+      }, index * 70);
+      liveClockProbeTimersRef.current.add(timer);
+    }
+  }, [send]);
+
+  useEffect(() => {
+    if (!liveEnabled) return;
+    calibrateLiveClock(10);
+    const timer = setInterval(() => calibrateLiveClock(5), 10000);
+    return () => clearInterval(timer);
+  }, [liveEnabled, calibrateLiveClock]);
+
+  const receiveLiveStatus = useCallback((status) => {
+    if (!status || typeof status !== "object") return;
+    // Receiver heartbeats contain relay fields only; keep native process
+    // control state until a status update explicitly supplies those fields.
+    liveStatusRef.current = { ...liveStatusRef.current, ...status };
+    setLiveStatus((previous) => ({ ...previous, ...status }));
+    if (status.sourceEpoch != null) {
+      if (liveEpochRef.current !== null && liveEpochRef.current !== status.sourceEpoch) livePlayerRef.current?.reset();
+      liveEpochRef.current = status.sourceEpoch;
+    }
+    if (status.active === false) {
+      // A connected publisher may have stalled. Never retain old sound merely
+      // because its HTTP connection is still open.
+      livePlayerRef.current?.reset();
+      if (livePlayerRef.current) setLiveStats(livePlayerRef.current.getStats());
+      if (liveEnabledRef.current && liveContextRef.current?.state === "running") setLiveAudioState("waiting");
+    }
+  }, []);
+
+  const connectLiveSocket = useCallback(() => {
+    if (!liveEnabledRef.current || audioModeRef.current !== "live") return;
+    clearTimeout(liveReconnectRef.current);
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${protocol}//${location.host}/live/audio`);
+    socket.binaryType = "arraybuffer";
+    liveSocketRef.current = socket;
+    socket.addEventListener("message", (event) => {
+      if (liveSocketRef.current !== socket || !liveEnabledRef.current) return;
+      try {
+        if (typeof event.data === "string") {
+          const message = JSON.parse(event.data);
+          if (message.type === "liveStatus") receiveLiveStatus(message.live || message.status || message);
+        } else {
+          livePlayerRef.current?.push(event.data);
+        }
+      } catch {
+        livePlayerRef.current?.reset();
+        setLiveIssue("The audio stream was interrupted. Waiting for fresh audio.");
+      }
+    });
+    socket.addEventListener("open", () => setLiveIssue(""));
+    socket.addEventListener("close", () => {
+      if (liveSocketRef.current !== socket) return;
+      livePlayerRef.current?.reset();
+      liveSocketRef.current = null;
+      if (liveEnabledRef.current && audioModeRef.current === "live") {
+        setLiveAudioState("buffering");
+        setLiveIssue("Connection interrupted. Reconnecting…");
+        liveReconnectRef.current = setTimeout(connectLiveSocket, 1000);
+      }
+    });
+    socket.addEventListener("error", () => setLiveIssue("Could not reach the Mac. Check the Wi-Fi connection."));
+  }, [receiveLiveStatus]);
+
+  useEffect(() => {
+    let active = true;
+    const refresh = async () => {
+      const epoch = nativeActionEpochRef.current;
+      try {
+        const response = await fetch("/live/status", { cache: "no-store" });
+        if (response.ok) {
+          const status = await response.json();
+          if (active && !nativeActionPendingRef.current && epoch === nativeActionEpochRef.current) receiveLiveStatus(status);
+        }
+      } catch {}
+    };
+    refresh();
+    const timer = setInterval(refresh, 3000);
+    return () => { active = false; clearInterval(timer); };
+  }, [receiveLiveStatus]);
+
+  useEffect(() => {
+    if (!liveEnabled) return;
+    const timer = setInterval(() => {
+      const stats = livePlayerRef.current?.getStats();
+      if (stats) setLiveStats(stats);
+      const state = liveContextRef.current?.state;
+      setLiveAudioState(state !== "running" ? "paused" : stats?.playing ? "playing" : liveStatusRef.current.active ? "buffering" : "waiting");
+    }, 500);
+    return () => clearInterval(timer);
+  }, [liveEnabled]);
+
+  useEffect(() => {
+    if (audioMode === "live" && isHostMachine === true) refreshNativeDevices();
+  }, [audioMode, isHostMachine]);
+
+  useEffect(() => () => {
+    liveEnabledRef.current = false;
+    clearTimeout(liveReconnectRef.current);
+    liveSocketRef.current?.close();
+    livePlayerRef.current?.close();
+    liveContextRef.current?.close().catch(() => {});
+    for (const timer of liveClockProbeTimersRef.current) clearTimeout(timer);
+    liveClockProbeTimersRef.current.clear();
+  }, []);
 
   const setRole = useCallback(
     (nextRole) => {
@@ -296,7 +485,8 @@ export default function App() {
           const playPromise = mediaAudio.play();
           if (playPromise?.catch) {
             playPromise.catch((error) => {
-              setReadyStatus("Enable speaker first");
+              setMediaNeedsGestureState(true);
+              setReadyStatus("Tap Resume audio");
               setAudioIssueState(error?.message || "Safari blocked media playback.");
             });
           }
@@ -336,16 +526,11 @@ export default function App() {
   );
 
   const expectedPosition = useCallback(() => {
-      const state = stateRef.current;
-      const audioBuffer = audioBufferRef.current;
-      const mediaAudio = mediaAudioRef.current;
-      if (!state.playing || !state.startedAt) return state.position || 0;
-      return clamp(
-        state.position +
-          Math.max(0, (Date.now() + serverOffsetRef.current - state.startedAt - deviceOffsetRef.current) / 1000),
-        0,
-        audioBuffer?.duration || mediaAudio?.duration || durationState || Number.MAX_SAFE_INTEGER
-      );
+      return localPlaybackTiming(stateRef.current, {
+        serverOffsetMs: serverOffsetRef.current,
+        deviceOffsetMs: deviceOffsetRef.current,
+        durationSeconds: audioBufferRef.current?.duration || mediaAudioRef.current?.duration || durationState
+      }).position;
   }, [durationState]);
 
   const currentLocalPosition = useCallback(() => {
@@ -365,6 +550,7 @@ export default function App() {
 
   const scheduleFromState = useCallback(
     (force = false) => {
+      if (audioModeRef.current !== "files") return;
       const state = stateRef.current;
       const audioBuffer = audioBufferRef.current;
       const mediaAudio = mediaAudioRef.current;
@@ -373,7 +559,21 @@ export default function App() {
       if (!mediaMode && !audioBuffer) return;
       if (mediaMode && !mediaAudio) return;
 
-      const expected = expectedPosition();
+      const timing = localPlaybackTiming(state, {
+        serverOffsetMs: serverOffsetRef.current,
+        deviceOffsetMs: deviceOffsetRef.current,
+        durationSeconds: audioBuffer?.duration || mediaAudio?.duration || durationState
+      });
+      if (timing.atEnd) {
+        // Do not replay a clipped tail on every server sync, or stop longer
+        // stems on other devices by changing the shared playback state.
+        stopLocalSource();
+        setPositionState(timing.position);
+        setCountdownState(null);
+        setReadyStatus("Track ended");
+        return;
+      }
+      const expected = timing.position;
       if (!force && localPlaybackRef.current) {
         const drift = currentLocalPosition() - expected;
         const absoluteDrift = Math.abs(drift);
@@ -395,12 +595,7 @@ export default function App() {
       const adjustedTargetLocalMs = state.startedAt - serverOffsetRef.current + deviceOffsetRef.current;
       const delaySeconds = Math.max(0, (adjustedTargetLocalMs - Date.now()) / 1000);
       setLastStartDelayState(Math.round(delaySeconds * 1000));
-      const offsetSeconds = clamp(
-        state.position +
-          Math.max(0, (Date.now() + serverOffsetRef.current - state.startedAt - deviceOffsetRef.current) / 1000),
-        0,
-        (audioBuffer?.duration || mediaAudio?.duration || durationState || Number.MAX_SAFE_INTEGER) - 0.02
-      );
+      const offsetSeconds = timing.rawPosition;
 
       if (localPlaybackRef.current) {
         correctionCountRef.current += 1;
@@ -409,13 +604,15 @@ export default function App() {
       }
 
       startLocalSource(delaySeconds, offsetSeconds);
+      setReadyStatus("Ready");
       updateCountdown(delaySeconds);
     },
-    [currentLocalPosition, durationState, expectedPosition, startLocalSource, updateCountdown]
+    [currentLocalPosition, durationState, startLocalSource, stopLocalSource, updateCountdown]
   );
 
   const loadAudio = useCallback(
     async (layer) => {
+      if (audioModeRef.current !== "files") return;
       if (!layer) return;
       if (!unlockedRef.current) {
         setReadyStatus("Locked");
@@ -447,6 +644,7 @@ export default function App() {
         const decoded = await decodeAudioBuffer(audioContextRef.current, bytes);
         if (selectedLayerIdRef.current !== layer.id) return;
 
+        bufferPeakRef.current = sampledAudioPeak(decoded);
         audioBufferRef.current = decoded;
         currentLayerIdRef.current = layer.id;
         currentLayerVersionRef.current = layer.version;
@@ -476,6 +674,10 @@ export default function App() {
       setLeadState(Number(stateRef.current.leadMs || 3000));
       if (!seekingRef.current) {
         setPositionState(Number(stateRef.current.currentPosition ?? stateRef.current.position ?? 0));
+      }
+      if (audioModeRef.current !== "files") {
+        stopLocalSource();
+        return;
       }
 
       const layer = ensureSelectedLayer(stateRef.current);
@@ -577,23 +779,35 @@ export default function App() {
         receiveTimeSample(message);
         return;
       }
+      if (message.type === "liveTime") {
+        if (liveClockRef.current.record(message, performance.now())) {
+          livePlayerRef.current?.setClockMapping(liveClockRef.current.mapping());
+          reportStatusSoon();
+        }
+        return;
+      }
       if (message.type === "peers") {
         setPeers(message.peers || []);
         return;
       }
       if (message.type === "testTone") {
-        playTestTone(message);
+        if (audioModeRef.current === "files") playTestTone(message);
+        return;
+      }
+      if (message.type === "live") {
+        receiveLiveStatus(message.live);
         return;
       }
       if (message.type === "track" || message.type === "sync" || message.type === "lead") {
         applyState(message.state);
+        if (message.type === "sync") reportStatusSoon();
         return;
       }
       if (["play", "pause", "stop", "seek"].includes(message.type)) {
         applyState(message.state, true);
       }
     },
-    [applyState, receiveTimeSample, reportStatusSoon]
+    [applyState, receiveTimeSample, receiveLiveStatus, reportStatusSoon]
   );
 
   handleMessageRef.current = handleMessage;
@@ -609,6 +823,7 @@ export default function App() {
       setConnected(true);
       reportStatusNow();
       calibrateClock(10);
+      calibrateLiveClock(10);
     });
     socket.addEventListener("message", (event) => {
       handleMessageRef.current?.(JSON.parse(event.data));
@@ -634,7 +849,7 @@ export default function App() {
       if (!shuttingDownRef.current) reconnectTimerRef.current = setTimeout(connect, 900);
     });
     socket.addEventListener("error", () => setConnected(false));
-  }, [calibrateClock, expectedPosition, reportStatusNow, stopLocalSource]);
+  }, [calibrateClock, calibrateLiveClock, expectedPosition, reportStatusNow, stopLocalSource]);
 
   const closeSocket = useCallback(() => {
     shuttingDownRef.current = true;
@@ -665,6 +880,12 @@ export default function App() {
       const state = stateRef.current;
       if (!state || seekingRef.current) return;
       const position = expectedPosition();
+      const duration = mediaAudioRef.current?.duration;
+      const mediaEnded = Number.isFinite(duration) && duration > 0 && position >= duration;
+      setMediaNeedsGestureState(Boolean(
+        state.playing && unlockedRef.current && playbackEngineRef.current === "media-element"
+        && mediaAudioRef.current?.paused && !mediaPlaybackTimerRef.current && !mediaEnded
+      ));
       setPositionState(position);
       const hasLocalPlayback =
         Boolean(localPlaybackRef.current) ||
@@ -690,9 +911,137 @@ export default function App() {
   async function loadConfig() {
     const response = await fetch("/config", { cache: "no-store" });
     const config = await response.json();
-    const urls = (config.addresses.length ? config.addresses : [location.origin]).map(playerJoinUrl);
+    const urls = (config.addresses.length ? config.addresses : [location.origin]).map((url) => playerJoinUrl(url, audioModeRef.current));
     setJoinUrls(urls);
+    setIsHostMachine(Boolean(config.isHostMachine || isLoopbackHost()));
     return config;
+  }
+
+  function stopLiveAudio() {
+    liveEnabledRef.current = false;
+    setLiveEnabled(false);
+    clearTimeout(liveReconnectRef.current);
+    liveSocketRef.current?.close();
+    liveSocketRef.current = null;
+    livePlayerRef.current?.close();
+    livePlayerRef.current = null;
+    liveContextRef.current?.close().catch(() => {});
+    liveContextRef.current = null;
+    setLiveAudioState("off");
+    setLiveIssue("");
+    setLiveStats({ queueMs: 0, underruns: 0, droppedMs: 0, playing: false });
+    reportStatusSoon();
+  }
+
+  function selectAudioMode(mode) {
+    audioModeRef.current = mode;
+    setAudioMode(mode);
+    localStorage.setItem("audioMode", mode);
+    setJoinUrls((urls) => urls.map((url) => playerJoinUrl(url, mode)));
+    if (mode === "live") stopLocalSource();
+    else {
+      stopLiveAudio();
+      applyState(stateRef.current, true);
+    }
+    reportStatusSoon();
+  }
+
+  async function enableLiveAudio() {
+    if (isHostMachine !== false) return;
+    setPlaybackAudioSession();
+    stopLocalSource();
+    setLiveIssue("");
+    setLiveAudioState("starting");
+    liveEnabledRef.current = true;
+    setLiveEnabled(true);
+    try {
+      if (!liveContextRef.current || liveContextRef.current.state === "closed") {
+        const AudioApi = window.AudioContext || window.webkitAudioContext;
+        if (!AudioApi) throw new Error("This browser cannot play live audio. Open this page in Safari or Chrome.");
+        liveContextRef.current = new AudioApi({ latencyHint: "playback" });
+        livePlayerRef.current = new LiveAudioPlayer(liveContextRef.current, { bufferMs: liveBufferMs, localTrimMs: liveTrimMs });
+        livePlayerRef.current.setClockMapping(liveClockRef.current.mapping());
+      } else {
+        livePlayerRef.current?.reset();
+      }
+      const context = liveContextRef.current;
+      const prime = primeAudioHardware(context, context.destination, 0.04, 0.0001);
+      const resumed = context.resume(); // Invoked synchronously by this device's click.
+      await withTimeout(resumed, 1200);
+      await prime;
+      if (!liveEnabledRef.current || audioModeRef.current !== "live") return;
+      if (context.state !== "running") throw new Error("Tap Resume live audio on this device to start its speaker.");
+      if (!liveSocketRef.current || liveSocketRef.current.readyState > WebSocket.OPEN) connectLiveSocket();
+      setLiveAudioState("buffering");
+      reportStatusSoon();
+    } catch (error) {
+      setLiveAudioState("paused");
+      setLiveIssue(error?.message || "Tap Resume live audio to start the speaker.");
+    }
+  }
+
+  async function refreshNativeDevices() {
+    if (isHostMachine !== true) return;
+    setNativeIssue("");
+    try {
+      const response = await fetch("/live/devices", { cache: "no-store" });
+      const devices = await response.json();
+      if (!response.ok) throw new Error(devices.error || "Could not list the Mac's speakers.");
+      setNativeDevices(devices);
+      const available = new Set(devices.outputs.map((output) => output.uid));
+      const defaults = devices.outputs.filter((output) => output.uid === "BuiltInSpeakerDevice"
+        || String(output.transport).toLowerCase().includes("bluetooth")).map((output) => output.uid);
+      if (!defaults.length && devices.outputs.length) defaults.push((devices.outputs.find((output) => output.isDefault) || devices.outputs[0]).uid);
+      setNativeOutputs((current) => {
+        const retained = current.filter((uid) => available.has(uid));
+        return retained.length ? retained : defaults;
+      });
+      setNativeMicrophone((current) => devices.inputs.some((input) => input.uid === current) ? current
+        : devices.recommendedMicrophoneUID || devices.inputs[0]?.uid || "");
+    } catch (error) {
+      setNativeIssue(error?.message || "Could not list the Mac's speakers.");
+    }
+  }
+
+  function adjustLiveTrim(value) {
+    const next = clamp(value, -200, 200);
+    setLiveTrimMs(next);
+    localStorage.setItem("liveTrimMs", String(next));
+    livePlayerRef.current?.setLocalTrimMs(next);
+    reportStatusSoon();
+  }
+
+  async function controlSystemAudio(action) {
+    if (isHostMachine !== true || nativeBusy) return;
+    const epoch = ++nativeActionEpochRef.current;
+    nativeActionPendingRef.current = true;
+    setNativeBusy(true);
+    setNativeIssue("");
+    setNativeNotice("");
+    try {
+      const response = await fetch(`/live/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(action === "start" ? {
+          outputs: nativeOutputs,
+          ...(nativeMicrophone ? { microphoneUID: nativeMicrophone } : {}),
+          calibrate: nativeCalibrate,
+          syncDelayMs: 700,
+          seconds: 7200
+        } : {})
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Could not ${action} system audio.`);
+      receiveLiveStatus(result.live || result.status || result);
+      if (action === "stop") setNativeNotice("Sharing stopped. Music can still play in its original Mac app.");
+    } catch (error) {
+      setNativeIssue(error?.message || "Could not change system audio playback.");
+    } finally {
+      if (epoch === nativeActionEpochRef.current) {
+        nativeActionPendingRef.current = false;
+        setNativeBusy(false);
+      }
+    }
   }
 
   function setDeviceName(nextName) {
@@ -732,6 +1081,20 @@ export default function App() {
     loadAudio(layer);
   }
 
+  async function resumeWebAudioFromGesture(durationSeconds = 0.06, gain = 0.0008) {
+    setPlaybackAudioSession();
+    const audioContext = createAudioContext();
+    if (gainRef.current) gainRef.current.gain.value = 1;
+    const primeDone = primeAudioHardware(audioContext, gainRef.current || audioContext.destination, durationSeconds, gain);
+    if (audioContext.state !== "running") await withTimeout(audioContext.resume(), 1200);
+    await primeDone;
+    if (audioContext.state !== "running") await withTimeout(audioContext.resume(), 1200);
+    await wait(100);
+    setAudioContextState(audioContext.state || "unknown");
+    if (audioContext.state !== "running") throw new Error("Audio output did not start. Tap Enable speaker again.");
+    return audioContext;
+  }
+
   async function unlockAudio() {
     if (unlockingRef.current) return;
     unlockingRef.current = true;
@@ -740,19 +1103,12 @@ export default function App() {
 
     try {
       const layer = layerById(stateRef.current.layers || [], selectedLayerIdRef.current) || stateRef.current.layers?.[0];
-      const audioContext = createAudioContext();
       let webAudioUnlocked = false;
-      if (gainRef.current) gainRef.current.gain.value = 1;
       try {
-        const primeDone = primeAudioHardware(audioContext, gainRef.current || audioContext.destination);
-        if (audioContext.state !== "running") await withTimeout(audioContext.resume(), 450);
-        await primeDone;
-        if (audioContext.state !== "running") await withTimeout(audioContext.resume(), 450);
-        await wait(60);
-        setAudioContextState(audioContext.state || "unknown");
-        webAudioUnlocked = audioContext.state === "running";
+        await resumeWebAudioFromGesture();
+        webAudioUnlocked = true;
       } catch {
-        setAudioContextState(audioContext.state || "unknown");
+        setAudioContextState(audioContextRef.current?.state || "unknown");
       }
 
       if (webAudioUnlocked) {
@@ -762,7 +1118,7 @@ export default function App() {
         await unlockMediaElement(layer);
         playbackEngineRef.current = "media-element";
         setPlaybackEngineState("HTML audio");
-        setAudioIssueState("Using iPad Safari fallback. AudioContext may stay suspended.");
+        setAudioIssueState("Using an alternate audio path. If music is silent, tap Resume audio on this device.");
       }
 
       unlockedRef.current = true;
@@ -809,18 +1165,7 @@ export default function App() {
     setAudioIssueState("");
 
     try {
-      const audioContext = createAudioContext();
-      if (gainRef.current) gainRef.current.gain.value = 1;
-      const primeDone = primeAudioHardware(audioContext, gainRef.current || audioContext.destination, 0.16, 0.18);
-      if (audioContext.state !== "running") await withTimeout(audioContext.resume(), 1200);
-      await primeDone;
-      if (audioContext.state !== "running") await withTimeout(audioContext.resume(), 1200);
-      await wait(100);
-      setAudioContextState(audioContext.state || "unknown");
-
-      if (audioContext.state !== "running") {
-        throw new Error("AudioContext stayed suspended");
-      }
+      await resumeWebAudioFromGesture(0.16, 0.18);
 
       const layer = layerById(stateRef.current.layers || [], selectedLayerIdRef.current) || stateRef.current.layers?.[0];
       stopLocalSource();
@@ -844,6 +1189,47 @@ export default function App() {
       setAudioContextState(audioContextRef.current?.state || "none");
       setAudioIssueState(error?.message || "Web Audio test failed");
       if (playbackEngineRef.current !== "web-audio") setReadyStatus(audioReadyRef.current ? "Ready" : "No audio");
+    }
+  }
+
+  function resumeMediaAudioFromGesture() {
+    const state = stateRef.current;
+    const mediaAudio = mediaAudioRef.current;
+    if (!state.playing || playbackEngineRef.current !== "media-element" || !mediaAudio) return;
+    const layer = layerById(state.layers || [], selectedLayerIdRef.current) || state.layers?.[0];
+    if (!layer) return;
+    prepareMediaElement(layer);
+    const timing = localPlaybackTiming(state, {
+      serverOffsetMs: serverOffsetRef.current,
+      deviceOffsetMs: deviceOffsetRef.current,
+      durationSeconds: mediaAudio.duration || durationState
+    });
+    if (timing.atEnd) return;
+    try {
+      mediaAudio.muted = false;
+      try { mediaAudio.currentTime = timing.rawPosition; } catch {}
+      // Call play synchronously from this local click, before any awaits. A
+      // remote transport command does not carry this browser's user gesture.
+      const playPromise = mediaAudio.play();
+      Promise.resolve(playPromise).then(() => {
+        if (!stateRef.current.playing) {
+          mediaAudio.pause();
+          return;
+        }
+        setMediaNeedsGestureState(false);
+        setReadyStatus("Ready");
+        setAudioIssueState("");
+        localPlaybackRef.current = { mode: "media-element", startedAtMs: Date.now(), offset: timing.rawPosition };
+        reportStatusSoon();
+      }).catch((error) => {
+        setMediaNeedsGestureState(true);
+        setReadyStatus("Tap Resume audio");
+        setAudioIssueState(error?.message || "Audio did not start. Tap Resume audio again.");
+      });
+    } catch (error) {
+      setMediaNeedsGestureState(true);
+      setReadyStatus("Tap Resume audio");
+      setAudioIssueState(error?.message || "Audio did not start. Tap Resume audio again.");
     }
   }
 
@@ -889,6 +1275,15 @@ export default function App() {
   function togglePlay() {
     const state = stateRef.current;
     if (!state?.layers?.length) return;
+    const timing = localPlaybackTiming(state, {
+      serverOffsetMs: serverOffsetRef.current,
+      deviceOffsetMs: deviceOffsetRef.current,
+      durationSeconds: audioBufferRef.current?.duration || mediaAudioRef.current?.duration || durationState
+    });
+    if (timing.atEnd) {
+      send({ type: "play", position: 0 });
+      return;
+    }
     if (state.playing || sourceRef.current) {
       pausePlayback();
     } else {
@@ -997,6 +1392,77 @@ export default function App() {
             </div>
           </div>
 
+          <div className="segmented" role="group" aria-label="Audio source">
+            <button className={audioMode === "live" ? "active" : ""} type="button" onClick={() => selectAudioMode("live")}>
+              System audio
+            </button>
+            <button className={audioMode === "files" ? "active" : ""} type="button" onClick={() => selectAudioMode("files")}>
+              Music files
+            </button>
+          </div>
+
+          {audioMode === "live" ? (
+            <section aria-label="Live system audio">
+              <div className="player">
+                <div className={`disc ${liveStats.playing ? "playing" : ""}`} aria-hidden="true"><div className="disc-core" /></div>
+                <div className="track">
+                  <p className="track-name">Mac system audio</p>
+                  <p className="track-meta">{isHostMachine === true ? "Play music in any Mac app" : liveAudioState === "playing" ? "Playing live from your Mac" : liveAudioState === "paused"
+                    ? "Tap Resume live audio on this device" : liveAudioState === "waiting" ? "Waiting for Mac audio"
+                      : liveEnabled ? "Buffering — waiting for fresh audio" : "Listen to your Mac on this device"}</p>
+                  <p>{liveStatus.active ? "The Mac is sending audio." : liveStatus.reason || "Waiting for the Mac to send audio."}</p>
+                </div>
+              </div>
+              {isHostMachine === true ? (
+                <div>
+                  <p>This Mac plays through the speakers selected below. Open this page on your iPad to listen over Wi-Fi.</p>
+                  <h2>Mac speakers</h2>
+                  {nativeDevices.outputs.map((output) => (
+                    <label key={output.uid} className="field-label" style={{ display: "block" }}>
+                      <input type="checkbox" checked={nativeOutputs.includes(output.uid)} disabled={nativeBusy || liveStatus.processRunning} onChange={(event) => {
+                        setNativeOutputs((current) => event.target.checked ? [...current, output.uid] : current.filter((uid) => uid !== output.uid));
+                      }} /> {output.name}
+                    </label>
+                  ))}
+                  <button className="mini-button" type="button" onClick={refreshNativeDevices} disabled={nativeBusy}>Refresh devices</button>
+                  <label className="field-label" style={{ display: "block" }}>
+                    <input type="checkbox" checked={nativeCalibrate} disabled={nativeBusy || liveStatus.processRunning} onChange={(event) => setNativeCalibrate(event.target.checked)} />
+                    {" "}Calibrate speakers first (plays test tones)
+                  </label>
+                  {nativeCalibrate && (
+                    <label className="field-label" style={{ display: "block" }}>
+                      Microphone
+                      <select aria-label="Calibration microphone" value={nativeMicrophone} disabled={nativeBusy || liveStatus.processRunning} onChange={(event) => setNativeMicrophone(event.target.value)}>
+                        {nativeDevices.inputs.map((input) => <option key={input.uid} value={input.uid}>{input.name}</option>)}
+                      </select>
+                    </label>
+                  )}
+                  <p>{liveStatus.phase === "calibrating" ? "Calibrating speakers…" : liveStatus.active ? "Sending system audio to your devices."
+                    : liveStatus.phase === "streaming" ? "Ready — play music in any Mac app."
+                      : liveStatus.processRunning ? "Starting system audio…" : "Choose your speakers, then start system audio."}</p>
+                  <p>Pause music in the Mac app. Stopping sharing disconnects every live listener.</p>
+                  <button className="mini-button speaker-test" type="button" onClick={() => controlSystemAudio("start")} disabled={nativeBusy || !nativeOutputs.length || liveStatus.processRunning || liveStatus.sourceConnected || ["starting", "calibrating"].includes(liveStatus.phase)}>Start system audio</button>
+                  <button className="mini-button speaker-test" type="button" onClick={() => controlSystemAudio("stop")} disabled={nativeBusy || !nativeCanStop}>Stop sharing to all devices</button>
+                  {nativeNotice && !liveStatus.active && !liveStatus.processRunning && <p role="status">{nativeNotice}</p>}
+                  {nativeIssue && <LiveError error={nativeIssue} />}
+                  {liveStatus.error && <LiveError error={liveStatus.error} />}
+                </div>
+              ) : isHostMachine === null ? <p>Checking this device…</p> : (
+                <div>
+                  {(!liveEnabled || liveAudioState === "paused") && (
+                    <button className="mini-button speaker-test" type="button" onClick={enableLiveAudio}>
+                      {liveEnabled ? "Resume live audio" : "Enable live audio"}
+                    </button>
+                  )}
+                  {liveEnabled && <button className="mini-button speaker-test" type="button" onClick={stopLiveAudio}>Stop live audio</button>}
+                  <p>Play music in any app on the Mac. Keep this page open to listen.</p>
+                  {liveStats.playing && <p>If silent, turn off Silent Mode and check this device's volume.</p>}
+                </div>
+              )}
+              {liveIssue && <p className="audio-issue" role="status">{liveIssue}</p>}
+            </section>
+          ) : (
+            <>
           <div className="player">
             <div className={`disc ${serverState.playing ? "playing" : ""}`} aria-hidden="true">
               <div className="disc-core" />
@@ -1019,7 +1485,7 @@ export default function App() {
               <Square />
             </button>
             <button className="primary-button" type="button" title="Play/Pause" aria-label="Play or pause" onClick={togglePlay}>
-              {serverState.playing ? <Pause /> : <Play />}
+              {serverState.playing && !localTrackEnded ? <Pause /> : <Play />}
             </button>
             <button className="icon-button" type="button" title="Resync" aria-label="Resync" onClick={resyncAll}>
               <RotateCw />
@@ -1047,9 +1513,75 @@ export default function App() {
             />
             <span>{formatTime(durationState)}</span>
           </div>
+            </>
+          )}
         </section>
 
         <aside className="side">
+          {audioMode === "live" ? (
+            <>
+              <section className="panel">
+                <h2>Live playback</h2>
+                <Stat label="Speaker" value={isHostMachine === true ? (liveStatus.processRunning ? "Mac outputs" : "Off") : liveAudioState === "playing" ? "Playing" : liveAudioState === "paused" ? "Tap to resume" : liveAudioState === "waiting" ? "Waiting for Mac audio" : liveEnabled ? "Buffering" : "Off"} />
+                {isHostMachine !== true && <>
+                <Stat label="Buffered" value={`${liveStats.queueMs} ms`} />
+                <Stat label="Interruptions" value={liveStats.underruns} />
+                <Stat label="Skipped audio" value={`${liveStats.droppedMs} ms`} />
+                </>}
+                <Stat label="Timing" value={hostCommonTimeline || liveStats.syncMode === "common-timeline" ? "Shared timeline (estimated)"
+                  : liveStats.syncMode === "waiting-for-clock" ? "Synchronizing clocks…"
+                    : liveStats.syncMode === "legacy-buffer" ? "Legacy buffering" : "Waiting for stream"} />
+                {showCommonTimeline && (
+                  <>
+                    <Stat label="Shared target" value={(liveStats.targetDelay ?? liveStatus.presentationDelayMs) == null ? "Waiting" : `${liveStats.targetDelay ?? liveStatus.presentationDelayMs} ms`} />
+                    {isHostMachine !== true && <>
+                    <Stat label="Clock round trip" value={liveStats.clockRTT == null ? "Waiting" : `${liveStats.clockRTT.toFixed(1)} ms`} />
+                    <Stat label="Timing estimate" value={liveStats.timingErrorMs == null ? "Waiting" : `${liveStats.timingErrorMs > 0 ? "+" : ""}${liveStats.timingErrorMs.toFixed(2)} ms`} />
+                    <Stat label="Late packets" value={liveStats.lateDrops || 0} />
+                    </>}
+                    <p>This is a software timing estimate. Speaker and room delay still need listening adjustment.</p>
+                    {isHostMachine === false && (
+                      <>
+                        <Stat label="This device's adjustment" value={`${liveTrimMs > 0 ? "+" : ""}${liveTrimMs} ms`} />
+                        <div className="segmented" role="group" aria-label="This device timing adjustment">
+                          {[-10, -5].map((step) => <button key={step} type="button" onClick={() => adjustLiveTrim(liveTrimMs + step)} disabled={liveTrimMs <= -200}>{step} ms</button>)}
+                          <button type="button" onClick={() => adjustLiveTrim(0)}>Reset</button>
+                          {[5, 10].map((step) => <button key={step} type="button" onClick={() => adjustLiveTrim(liveTrimMs + step)} disabled={liveTrimMs >= 200}>+{step} ms</button>)}
+                        </div>
+                        <p>Negative plays this device earlier; positive plays it later. Small adjustments settle gradually.</p>
+                      </>
+                    )}
+                  </>
+                )}
+                {(liveStats.syncMode === "legacy-buffer" || liveStatus.protocol === "HCA1") && <>
+                <p>Legacy playback has no shared timing. Choose more buffering for unreliable Wi-Fi; it adds delay.</p>
+                <div className="segmented" role="group" aria-label="Live buffering">
+                  {[300, 500, 800].map((value) => (
+                    <button key={value} type="button" className={liveBufferMs === value ? "active" : ""} onClick={() => {
+                      setLiveBufferMs(value);
+                      livePlayerRef.current?.setBufferMs(value);
+                    }}>{value} ms</button>
+                  ))}
+                </div>
+                </>}
+              </section>
+              <section className="panel join-panel">
+                <h2>Listen on another device</h2>
+                <div className="join-qr" aria-label="Live player QR code">
+                  {joinUrls[0] ? <QrCode value={livePlayerUrl(joinUrls[0])} /> : "QR unavailable"}
+                </div>
+                <div className="addresses">
+                  {joinUrls.map((url) => (
+                    <div key={url} className="address-row">
+                      <code>{livePlayerUrl(url)}</code>
+                      <button className="copy" type="button" onClick={() => navigator.clipboard?.writeText(livePlayerUrl(url))}><Copy size={16} />Copy</button>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            </>
+          ) : (
+            <>
           <section className="panel host-panel">
             <div className="segmented" role="group" aria-label="Device role">
               <button className={roleState === "controller" ? "active" : ""} type="button" onClick={() => setRole("controller")}>
@@ -1182,6 +1714,11 @@ export default function App() {
             <button className="mini-button speaker-test" type="button" onClick={() => playTestTone({ toneAt: Date.now() + 80 })}>
               Speaker test
             </button>
+            {serverState.playing && !localTrackEnded && mediaNeedsGestureState && playbackEngineState === "HTML audio" && (
+              <button className="mini-button speaker-test" type="button" onClick={resumeMediaAudioFromGesture}>
+                Resume audio
+              </button>
+            )}
             <Stat label="Engine" value={playbackEngineState} />
             <Stat label="Audio" value={audioContextState} />
             <Stat label="Status" value={readyStatus} />
@@ -1205,20 +1742,16 @@ export default function App() {
               Force Web Audio Test
             </button>
           </section>
+            </>
+          )}
         </aside>
       </main>
 
-      {!unlockedState && (
+      {audioMode === "files" && !unlockedState && (
         <div className="gesture">
           <div className="gesture-card">
             <button
               type="button"
-              onTouchStart={() => {
-                unlockAudio();
-              }}
-              onPointerDown={() => {
-                unlockAudio();
-              }}
               onClick={unlockAudio}
             >
               <Volume2 />
@@ -1317,20 +1850,59 @@ function Stat({ label, value }) {
   );
 }
 
-function buildSyncLabel({ layers, selectedLayer, state, audioReady, audioLoading, countdown }) {
+function buildSyncLabel({ layers, selectedLayer, state, audioReady, audioLoading, countdown, localTrackEnded }) {
   if (!layers.length) return "Choose one or more stems on the host";
   if (audioLoading) return "Caching audio";
   if (!audioReady) return "Preparing audio";
+  if (localTrackEnded) return `Ended: ${selectedLayer?.name || "default stem"}`;
   if (countdown) return `Starting in ${countdown}`;
   return state.playing ? `Playing: ${selectedLayer?.name || "default stem"}` : `Paused: ${selectedLayer?.name || "default stem"}`;
 }
 
-function playerJoinUrl(url) {
+function playerJoinUrl(url, source = "live") {
   const playerUrl = new URL(url, location.href);
   playerUrl.pathname = "/";
   playerUrl.searchParams.set("mode", "player");
+  playerUrl.searchParams.set("source", source);
   playerUrl.hash = "";
   return playerUrl.toString();
+}
+
+function livePlayerUrl(url) {
+  const playerUrl = new URL(url, location.href);
+  playerUrl.searchParams.set("source", "live");
+  return playerUrl.toString();
+}
+
+function LiveError({ error }) {
+  const full = String(error);
+  const brief = full.split("\n").find((line) => line.trim())?.trim().slice(0, 240) || "System audio could not start.";
+  return (
+    <div className="audio-issue" role="status">
+      <p>{brief}</p>
+      {brief !== full && <details><summary>Details</summary><pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", maxHeight: "12rem", overflow: "auto" }}>{full}</pre></details>}
+    </div>
+  );
+}
+
+function isLoopbackHost() {
+  return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(location.hostname);
+}
+
+function setPlaybackAudioSession() {
+  // iOS otherwise treats Web Audio as ambient sound, which follows Silent Mode.
+  // Request playback only when this device's user explicitly enables audio.
+  try {
+    if (navigator.audioSession && "type" in navigator.audioSession) navigator.audioSession.type = "playback";
+  } catch {}
+}
+
+function audioSessionDiagnostics() {
+  try {
+    return { type: navigator.audioSession?.type || "unsupported", state: navigator.audioSession?.state || "unknown" };
+  } catch {
+    return { type: "unavailable", state: "unknown" };
+  }
 }
 
 function detectDeviceInfo() {
@@ -1508,4 +2080,18 @@ function decodeAudioBuffer(audioContext, bytes) {
       fail(error);
     }
   });
+}
+
+function sampledAudioPeak(buffer) {
+  // Compute once per decode and send only an aggregate level, never samples.
+  // Bound main-thread work for long uploads to roughly 65k reads per channel.
+  const stride = Math.max(1, Math.ceil(buffer.length / 65536));
+  let peak = 0;
+  for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+    const samples = buffer.getChannelData(channel);
+    for (let frame = 0; frame < samples.length; frame += stride) {
+      peak = Math.max(peak, Math.abs(samples[frame]));
+    }
+  }
+  return peak;
 }

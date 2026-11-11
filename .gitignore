@@ -6,3 +6,4 @@ dist/
 
 # Runtime media uploaded through the local app.
 media/
+releases/

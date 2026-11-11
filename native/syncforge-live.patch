@@ -1,0 +1,1249 @@
+diff --git a/SyncForgeKit/Sources/SyncForgeCore/Engine/SyncEngine.swift b/SyncForgeKit/Sources/SyncForgeCore/Engine/SyncEngine.swift
+index ec72017..473521f 100644
+--- a/SyncForgeKit/Sources/SyncForgeCore/Engine/SyncEngine.swift
++++ b/SyncForgeKit/Sources/SyncForgeCore/Engine/SyncEngine.swift
+@@ -802,8 +802,11 @@ public final class SyncEngine {
+             }
+         }
+ 
+-        // Automatic base latency: underruns mean the shared buffer is too small for these devices.
+-        if underrunSeen, store.settings.autoBaseLatency, now.timeIntervalSince(captureStartedAt) > 2,
++        // A process tap can stop delivering program frames while every source is silent.
++        // Renderers correctly output silence and still count unavailable reads then; adding
++        // buffering cannot fix an idle source. Only adapt while capture contains audible
++        // program, otherwise an idle period needlessly walks every output's latency upward.
++        if underrunSeen, capturePeak > 0.003, store.settings.autoBaseLatency, now.timeIntervalSince(captureStartedAt) > 2,
+            now.timeIntervalSince(lastBaseBump) > 2, autoBaseExtraMs < 150 {
+             autoBaseExtraMs += 10
+             lastBaseBump = now
+diff --git a/SyncForgeKit/Sources/SyncForgeCore/HAL/SourceRing.swift b/SyncForgeKit/Sources/SyncForgeCore/HAL/SourceRing.swift
+index 7ab17d5..9b9f74d 100644
+--- a/SyncForgeKit/Sources/SyncForgeCore/HAL/SourceRing.swift
++++ b/SyncForgeKit/Sources/SyncForgeCore/HAL/SourceRing.swift
+@@ -1,6 +1,31 @@
+ import Foundation
+ import SyncForgeRT
+ 
++/// An immutable copy of the capture frame ↔ monotonic-host mapping. Consumers
++/// can bridge it to another clock without querying wall time for every packet.
++public struct ProgramTimelineSnapshot: Sendable {
++    public let anchorFrame: Int64
++    public let anchorHost: UInt64
++    public let framesPerTick: Double
++    public let epoch: UInt32
++
++    public init(anchorFrame: Int64, anchorHost: UInt64, framesPerTick: Double, epoch: UInt32) {
++        self.anchorFrame = anchorFrame
++        self.anchorHost = anchorHost
++        self.framesPerTick = framesPerTick
++        self.epoch = epoch
++    }
++
++    /// Signed host-tick offset of a source frame relative to a pinned host time.
++    public func hostOffsetTicks(frame: Int64, relativeTo referenceHost: UInt64) -> Double? {
++        guard frame >= 0, anchorFrame >= 0, framesPerTick.isFinite, framesPerTick > 0 else { return nil }
++        let frameOffset = Double(frame) - Double(anchorFrame)
++        let anchorOffset = Double(Int64(bitPattern: anchorHost &- referenceHost))
++        let result = anchorOffset + frameOffset / framesPerTick
++        return result.isFinite ? result : nil
++    }
++}
++
+ /// Owns the C source ring shared by the capture IOProc and all output renderers. Capture and every
+ /// renderer hold a strong reference, so the ring outlives every IOProc that may touch it.
+ public final class SourceRing {
+@@ -20,6 +45,18 @@ public final class SourceRing {
+     deinit { sf_ring_destroy(pointer) }
+ 
+     public var capacitySeconds: Double { Double(capacityFrames) / sampleRate }
++    public var writeFrame: Int64 { sf_ring_write_frame(pointer) }
++
++    /// Non-real-time historical copy for the LAN publisher. The capture callback
++    /// never waits for the publisher; unavailable/overwritten intervals are dropped.
++    public func programStereo(startFrame: Int64, frames: Int) -> [Float]? {
++        guard frames > 0, frames <= capacityFrames / 4 else { return nil }
++        var samples = [Float](repeating: 0, count: frames * 2)
++        let ok = samples.withUnsafeMutableBufferPointer {
++            sf_ring_copy_stereo(pointer, startFrame, UInt32(frames), $0.baseAddress!)
++        }
++        return ok ? samples : nil
++    }
+ 
+     public func stats(resetPeak: Bool) -> SFCaptureStats {
+         var s = SFCaptureStats()
+@@ -32,6 +69,14 @@ public final class SourceRing {
+         return sf_ring_get_timeline(pointer, &t) && t.valid != 0 ? t : nil
+     }
+ 
++    public func programTimelineSnapshot() -> ProgramTimelineSnapshot? {
++        guard let value = timeline(), value.anchorFrame >= 0,
++              value.framesPerTick.isFinite, value.framesPerTick > 0,
++              value.sampleRate.isFinite, value.sampleRate > 0 else { return nil }
++        return ProgramTimelineSnapshot(anchorFrame: value.anchorFrame, anchorHost: value.anchorHost,
++                                       framesPerTick: value.framesPerTick, epoch: value.epoch)
++    }
++
+     public func requestReanchor() { sf_ring_request_reanchor(pointer) }
+ 
+     /// Copies program audio (mono) for the program-timeline interval starting at host time `host`.
+diff --git a/SyncForgeKit/Sources/SyncForgeRT/include/SyncForgeRT.h b/SyncForgeKit/Sources/SyncForgeRT/include/SyncForgeRT.h
+index 39eab29..3f60d61 100644
+--- a/SyncForgeKit/Sources/SyncForgeRT/include/SyncForgeRT.h
++++ b/SyncForgeKit/Sources/SyncForgeRT/include/SyncForgeRT.h
+@@ -65,6 +65,10 @@ void     sf_ring_request_reanchor(SFSourceRing *ring);
+ /// Non-real-time reader: copies `count` frames starting at absolute frame `start` as mono (L+R)/2.
+ /// Returns false if any of them is not captured yet or may have been overwritten.
+ bool     sf_ring_copy_mono(SFSourceRing *ring, int64_t start, uint32_t count, float *out);
++/// Non-real-time reader: copies historical stereo Float32 frames, interleaved L/R.
++/// Fails rather than returning samples near the overwrite boundary. Caller must discard
++/// the destination on failure; the writer may have advanced while the copy ran.
++bool     sf_ring_copy_stereo(SFSourceRing *ring, int64_t start, uint32_t count, float *out);
+ 
+ // MARK: - Capture IOProc (process tap via private aggregate device)
+ 
+diff --git a/SyncForgeKit/Sources/SyncForgeRT/sf_internal.h b/SyncForgeKit/Sources/SyncForgeRT/sf_internal.h
+index 0659405..2e8ee02 100644
+--- a/SyncForgeKit/Sources/SyncForgeRT/sf_internal.h
++++ b/SyncForgeKit/Sources/SyncForgeRT/sf_internal.h
+@@ -134,6 +134,10 @@ static inline void sf_sinc_read(const SFSinc *s, const float *data, uint32_t mas
+ // Ring internals used by the renderer.
+ const float *sf_ring_data_internal(const SFSourceRing *r);
+ uint32_t sf_ring_mask_internal(const SFSourceRing *r);
++// A separate atomic packed-stereo snapshot for non-RT export. The renderer's
++// raw sample path is unchanged. Atomic pair loads remain race-free if the
++// capture writer wraps while an export thread has been descheduled.
++const _Atomic uint64_t *sf_ring_export_data_internal(const SFSourceRing *r);
+ 
+ static inline void sf_zero_output(AudioBufferList *out) {
+     if (!out) return;
+diff --git a/SyncForgeKit/Sources/SyncForgeRT/sf_renderer.c b/SyncForgeKit/Sources/SyncForgeRT/sf_renderer.c
+index d77e254..444c162 100644
+--- a/SyncForgeKit/Sources/SyncForgeRT/sf_renderer.c
++++ b/SyncForgeKit/Sources/SyncForgeRT/sf_renderer.c
+@@ -57,6 +57,11 @@ struct SFRenderer {
+     float    fadeGain;
+     float    fadeStep;
+     float    limGain;
++    // Short output tail when a readable program block is followed by starvation.
++    // The ring stays unread while unavailable; never replay stale samples to fill a gap.
++    float    lastProgramL, lastProgramR;
++    float    starvationStartL, starvationStartR;
++    uint32_t starvationFadeRemaining, starvationFadeFrames;
+ 
+     int32_t  nbq;
+     double   bq[SF_MAX_BIQUADS][2][2];
+@@ -182,9 +187,19 @@ static inline void biquad_block(const SFBiquadCoeffs *c, double *s, float *x, ui
+     for (uint32_t j = 0; j < n; j++) {
+         double in = (double)x[j];
+         double y = b0 * in + s1;
+-        s1 = b1 * in - a1 * y + s2;
+-        s2 = b2 * in - a2 * y;
+-        x[j] = (float)y;
++        double next1 = b1 * in - a1 * y + s2;
++        double next2 = b2 * in - a2 * y;
++        float out = (float)y;
++        if (!isfinite(out) || !isfinite(next1) || !isfinite(next2)) {
++            // Recover on the next valid sample/parameter update instead of retaining NaN
++            // in the recursive state indefinitely. Invalid audio never reaches the device.
++            s1 = s2 = 0.0;
++            x[j] = 0.0f;
++        } else {
++            s1 = next1;
++            s2 = next2;
++            x[j] = out;
++        }
+     }
+     // Flush denormals.
+     if (fabs(s1) < 1e-30) s1 = 0.0;
+@@ -291,6 +306,7 @@ void sf_renderer_render(SFRenderer *r, AudioBufferList *out, uint32_t n, uint64_
+ 
+     float *L = r->bufL, *R = r->bufR, *T = r->bufT;
+     bool haveProgram = false;
++    bool previousHadProgram = r->lastHadProgram;
+ 
+     if (r->hasTimeline) {
+         const SFTimeline *tl = &r->tl;
+@@ -462,6 +478,28 @@ void sf_renderer_render(SFRenderer *r, AudioBufferList *out, uint32_t n, uint64_
+         R[j] *= g;
+     }
+ 
++    if (previousHadProgram && !haveProgram) {
++        // A hard cut at an arbitrary waveform phase produces a click; repeated short
++        // underruns can turn those clicks into a buzz. Ramp the last output sample to
++        // zero over 5 ms, then remain exactly silent for an arbitrarily long gap.
++        r->starvationStartL = r->lastProgramL;
++        r->starvationStartR = r->lastProgramR;
++        uint32_t frames = (uint32_t)(0.005 * r->devRate);
++        r->starvationFadeFrames = frames > 0 ? frames : 1;
++        r->starvationFadeRemaining = r->starvationFadeFrames;
++        // Samples were lost, so old recursive filter history is no longer a valid
++        // continuation. The existing 10 ms recovery fade hides this reset.
++        memset(r->bq, 0, sizeof r->bq);
++    }
++    for (uint32_t j = 0; j < n && r->starvationFadeRemaining > 0; j++) {
++        float g = (float)(r->starvationFadeRemaining - 1) / (float)r->starvationFadeFrames;
++        L[j] += r->starvationStartL * g;
++        R[j] += r->starvationStartR * g;
++        r->starvationFadeRemaining--;
++    }
++    r->lastProgramL = isfinite(L[n - 1]) ? L[n - 1] : 0.0f;
++    r->lastProgramR = isfinite(R[n - 1]) ? R[n - 1] : 0.0f;
++
+     // Test signal (calibration / sync clicks): same timeline mapping and same filter chain as the
+     // program, independent of the volume setting.
+     if (r->t.active && r->t.samples && r->t.length > 0) {
+@@ -509,6 +547,11 @@ void sf_renderer_render(SFRenderer *r, AudioBufferList *out, uint32_t n, uint64_
+     float rel = (float)exp(-1.0 / ((p->limiterReleaseSeconds > 0.001f ? p->limiterReleaseSeconds : 0.15f) * r->devRate));
+     for (uint32_t j = 0; j < n; j++) {
+         float l = L[j], rr = R[j];
++        if (!isfinite(l) || !isfinite(rr)) {
++            l = rr = 0.0f;
++            r->limGain = 1.0f;
++            clippedCount++;
++        }
+         if (p->limiterEnabled) {
+             float pk = fabsf(l) > fabsf(rr) ? fabsf(l) : fabsf(rr);
+             if (pk * r->limGain > ceil) r->limGain = ceil / pk;
+diff --git a/SyncForgeKit/Sources/SyncForgeRT/sf_ring.c b/SyncForgeKit/Sources/SyncForgeRT/sf_ring.c
+index 04fdad6..c183f77 100644
+--- a/SyncForgeKit/Sources/SyncForgeRT/sf_ring.c
++++ b/SyncForgeKit/Sources/SyncForgeRT/sf_ring.c
+@@ -4,6 +4,7 @@
+ 
+ struct SFSourceRing {
+     float   *data;            // interleaved stereo
++    _Atomic uint64_t *exportData; // packed Float32 L/R, non-RT export snapshot
+     uint32_t capacity;        // frames, power of two
+     uint32_t mask;
+     double   sampleRate;
+@@ -38,7 +39,9 @@ SFSourceRing *sf_ring_create(uint32_t minCapacityFrames, double sampleRate, doub
+     r->capacity = next_pow2(minCapacityFrames < 4096 ? 4096 : minCapacityFrames);
+     r->mask = r->capacity - 1;
+     r->data = calloc((size_t)r->capacity * 2u, sizeof(float));
+-    if (!r->data) { free(r); return NULL; }
++    r->exportData = calloc((size_t)r->capacity, sizeof(*r->exportData));
++    if (!r->data || !r->exportData) { free(r->data); free(r->exportData); free(r); return NULL; }
++    for (uint32_t i = 0; i < r->capacity; i++) atomic_init(&r->exportData[i], 0);
+     r->sampleRate = sampleRate;
+     r->tps = ticksPerSecond;
+     r->wtl.sampleRate = sampleRate;
+@@ -49,6 +52,7 @@ SFSourceRing *sf_ring_create(uint32_t minCapacityFrames, double sampleRate, doub
+ void sf_ring_destroy(SFSourceRing *r) {
+     if (!r) return;
+     free(r->data);
++    free(r->exportData);
+     free(r);
+ }
+ 
+@@ -58,6 +62,7 @@ int64_t sf_ring_write_frame(SFSourceRing *r) { return atomic_load_explicit(&r->w
+ 
+ const float *sf_ring_data_internal(const SFSourceRing *r) { return r->data; }
+ uint32_t sf_ring_mask_internal(const SFSourceRing *r) { return r->mask; }
++const _Atomic uint64_t *sf_ring_export_data_internal(const SFSourceRing *r) { return r->exportData; }
+ 
+ bool sf_ring_get_timeline(SFSourceRing *r, SFTimeline *out) {
+     for (int attempt = 0; attempt < 3; attempt++) {
+@@ -83,6 +88,7 @@ static void write_silence(SFSourceRing *r, int64_t from, int64_t count) {
+         uint32_t idx = (uint32_t)((uint64_t)(from + i) & r->mask);
+         r->data[2u * idx] = 0.0f;
+         r->data[2u * idx + 1u] = 0.0f;
++        atomic_store_explicit(&r->exportData[idx], 0, memory_order_relaxed);
+     }
+ }
+ 
+@@ -130,8 +136,17 @@ void sf_ring_write(SFSourceRing *r, const float *left, const float *right, uint3
+         uint32_t idx = (uint32_t)((uint64_t)(wf + i) & r->mask);
+         float l = left ? left[(size_t)i * stride] : 0.0f;
+         float rr = right ? right[(size_t)i * stride] : l;
++        // A malformed driver sample must not poison every downstream IIR filter.
++        // Keep finite PCM (including ordinary overs) untouched; invalid samples are silence.
++        if (!isfinite(l)) l = 0.0f;
++        if (!isfinite(rr)) rr = 0.0f;
+         d[2u * idx] = l;
+         d[2u * idx + 1u] = rr;
++        uint32_t leftBits, rightBits;
++        memcpy(&leftBits, &l, sizeof leftBits);
++        memcpy(&rightBits, &rr, sizeof rightBits);
++        uint64_t pair = (uint64_t)leftBits | ((uint64_t)rightBits << 32);
++        atomic_store_explicit(&r->exportData[idx], pair, memory_order_relaxed);
+         float a = fabsf(l) > fabsf(rr) ? fabsf(l) : fabsf(rr);
+         if (a > peak) peak = a;
+     }
+diff --git a/SyncForgeKit/Sources/sfctl/main.swift b/SyncForgeKit/Sources/sfctl/main.swift
+index 2249702..86d0447 100644
+--- a/SyncForgeKit/Sources/sfctl/main.swift
++++ b/SyncForgeKit/Sources/sfctl/main.swift
+@@ -2,6 +2,15 @@ import Darwin
+ import Foundation
+ import SyncForgeCore
+ 
++// stdout is a binary-only transport in stream mode. Diagnostics must not be
++// interleaved with PCM, including errors, calibration summaries and termination.
++let binaryOutput = CommandLine.arguments.dropFirst().first == "stream"
++func cliPrint(_ items: Any..., separator: String = " ", terminator: String = "\n") {
++    let message = items.map { String(describing: $0) }.joined(separator: separator) + terminator
++    if binaryOutput { try? FileHandle.standardError.write(contentsOf: Data(message.utf8)) }
++    else { Swift.print(message, terminator: "") }
++}
++
+ // sfctl — headless control and validation for the SyncForge engine.
+ //
+ // It drives exactly the same engine as the app, with an in-memory profile store, so it never
+@@ -18,6 +27,13 @@ usage: sfctl <command> [options]
+                                             Measure acoustic latency with the microphone, apply it and verify.
+   soak --out UID[:DELAY_MS] ... [--seconds N]
+                                             Long-running stability test with periodic resource reports.
++  stream --out UID ... [--calibrate] [--mic UID] [--base-ms N] [--seconds N]
++         [--sync-delay-ms N --master-offset-ms N --stream-id U32]
++                                            Publish HCA2 timestamped PCM for a shared presentation clock.
++                                            Omit sync delay or use 0 for legacy HCA1.
++                                            Defaults: 1800 s and 100 ms capture read lag.
++                                            HCA1 native base: 120 ms. HCA2: target minus estimated path,
++                                            with at least 120 ms of native buffering.
+ 
+ Everything that plays sound mutes normal system playback while it runs (it comes back when sfctl exits).
+ """
+@@ -32,11 +48,18 @@ struct Arguments {
+     var verify = true
+     var dump: String?
+     var matchLevels = false
++    var calibrateFirst = false
++    var baseMs: Double?
++    var json = false
++    var syncDelayMs: Double?
++    var masterOffsetMs: Double?
++    var streamId: UInt32?
+ 
+     init(_ argv: [String]) throws {
+         var it = argv.dropFirst().makeIterator()
+         guard let cmd = it.next() else { throw CLIError.usage }
+         command = cmd
++        if command == "stream" { seconds = 1800; baseMs = 120 }
+         while let a = it.next() {
+             switch a {
+             case "--out":
+@@ -55,21 +78,39 @@ struct Arguments {
+             case "--no-verify": verify = false
+             case "--dump": dump = it.next()
+             case "--match-levels": matchLevels = true
++            case "--calibrate": calibrateFirst = true
++            case "--base-ms": baseMs = Double(it.next() ?? "")
++            case "--json": json = true
++            case "--sync-delay-ms":
++                guard let text = it.next(), let value = Double(text), value.isFinite,
++                      value == 0 || (value >= 450 && value <= 1000) else { throw CLIError.invalid("--sync-delay-ms must be 0 (legacy) or within [450, 1000]") }
++                syncDelayMs = value > 0 ? value : nil
++            case "--master-offset-ms":
++                guard let text = it.next(), let value = Double(text), value.isFinite, abs(value) <= 86_400_000 else { throw CLIError.invalid("--master-offset-ms must be a finite clock offset within one day") }
++                masterOffsetMs = value
++            case "--stream-id":
++                guard let text = it.next(), let value = UInt32(text), value != 0 else { throw CLIError.invalid("--stream-id must be a nonzero unsigned 32-bit integer") }
++                streamId = value
+             default: throw CLIError.unknown(a)
+             }
+         }
++        guard seconds.isFinite, seconds > 0, seconds <= 86400 else { throw CLIError.invalid("--seconds must be within (0, 86400]") }
++        if let baseMs, (!baseMs.isFinite || baseMs < 40 || baseMs > 2000) { throw CLIError.invalid("--base-ms must be within [40, 2000]") }
++        if syncDelayMs != nil && masterOffsetMs == nil { throw CLIError.invalid("HCA2 requires --master-offset-ms from the local publisher clock handshake") }
+     }
+ }
+ 
+-enum CLIError: Error, CustomStringConvertible {
+-    case usage, unknown(String), noDevice(String)
++enum CLIError: Error, CustomStringConvertible, LocalizedError {
++    case usage, unknown(String), noDevice(String), invalid(String)
+     var description: String {
+         switch self {
+         case .usage: return usageText
+         case .unknown(let a): return "unknown option \(a)\n\n\(usageText)"
+         case .noDevice(let u): return "no output device with UID \(u) (see `sfctl devices`)"
++        case .invalid(let message): return message
+         }
+     }
++    var errorDescription: String? { description }
+ }
+ 
+ func pad(_ s: String, _ n: Int) -> String { s.count >= n ? s : s + String(repeating: " ", count: n - s.count) }
+@@ -89,33 +130,57 @@ final class CLI {
+         case "run": return await play(soak: false)
+         case "soak": return await play(soak: true)
+         case "calibrate": return await calibrate()
++        case "stream": return await stream()
++        case "stream-selftest":
++            do { try streamProtocolSelfTest(); cliPrint("PASS: HCA2 wire header, frame clock, native presentation planning and HCA1 compatibility"); return 0 }
++            catch { cliPrint("Stream self-test failed: \(error)"); return 1 }
+         default:
+-            print(usageText)
++            cliPrint(usageText)
+             return 2
+         }
+     }
+ 
+     func listDevices() -> Int32 {
+         let dm = AudioDeviceManager()
+-        print("OUTPUTS")
++        if args.json {
++            let object: [String: Any] = [
++                "outputs": dm.outputDevices.map { device -> [String: Any] in
++                    ["uid": device.uid, "name": device.name, "transport": device.transport.rawValue, "transportName": device.transport.displayName,
++                     "isDefault": device.uid == dm.defaultOutputUID]
++                },
++                "inputs": dm.inputDevices.map { device -> [String: Any] in
++                    ["uid": device.uid, "name": device.name, "transport": device.transport.rawValue, "transportName": device.transport.displayName,
++                     "isDefault": device.uid == dm.defaultInputUID]
++                },
++                "recommendedMicrophoneUID": dm.recommendedMicrophone?.uid as Any? ?? NSNull()
++            ]
++            do {
++                let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
++                try FileHandle.standardOutput.write(contentsOf: data)
++                try FileHandle.standardOutput.write(contentsOf: Data([10]))
++                return 0
++            } catch { cliPrint("Could not encode audio devices: \(error.localizedDescription)"); return 1 }
++        }
++        cliPrint("OUTPUTS")
+         for d in dm.outputDevices {
+             let def = d.uid == dm.defaultOutputUID ? " (default)" : ""
+-            print("  \(pad(d.name + def, 34)) \(pad(d.transport.displayName, 12)) \(pad(f(d.nominalSampleRate / 1000, 1) + " kHz", 9)) ch \(d.outputChannels)  reported \(f(d.reportedOutputLatencyMs)) ms")
+-            print("      uid: \(d.uid)")
++            cliPrint("  \(pad(d.name + def, 34)) \(pad(d.transport.displayName, 12)) \(pad(f(d.nominalSampleRate / 1000, 1) + " kHz", 9)) ch \(d.outputChannels)  reported \(f(d.reportedOutputLatencyMs)) ms")
++            cliPrint("      uid: \(d.uid)")
+         }
+-        print("INPUTS")
++        cliPrint("INPUTS")
+         for d in dm.inputDevices {
+             let def = d.uid == dm.defaultInputUID ? " (default)" : ""
+             let warn = d.transport.isBluetooth ? "  ⚠︎ Bluetooth (avoid for calibration)" : ""
+-            print("  \(pad(d.name + def, 34)) \(pad(d.transport.displayName, 12)) \(pad(f(d.nominalSampleRate / 1000, 1) + " kHz", 9)) reported \(f(d.reportedInputLatency * 1000)) ms\(warn)")
+-            print("      uid: \(d.uid)")
++            cliPrint("  \(pad(d.name + def, 34)) \(pad(d.transport.displayName, 12)) \(pad(f(d.nominalSampleRate / 1000, 1) + " kHz", 9)) reported \(f(d.reportedInputLatency * 1000)) ms\(warn)")
++            cliPrint("      uid: \(d.uid)")
+         }
+-        if let m = dm.recommendedMicrophone { print("Recommended calibration microphone: \(m.name)") }
++        if let m = dm.recommendedMicrophone { cliPrint("Recommended calibration microphone: \(m.name)") }
+         return 0
+     }
+ 
+     func makeEngine() throws {
+         let store = ProfileStore(fileURL: nil)
++        if let base = args.baseMs { store.settings.baseLatencyMs = base }
+         let dm = AudioDeviceManager()
+         engine = SyncEngine(devices: dm, store: store)
+         for (uid, delay) in args.outputs {
+@@ -143,15 +208,15 @@ final class CLI {
+             let delay = o.timing.map { f($0.appliedDelayMs) } ?? "-"
+             line += " | \(o.name): \(o.status.label) +\(delay)ms pk \(f(Double(peakDb), 0)) err \(f(m.servoErrorSeconds * 1e6, 1))us \(f(m.correctionPPM, 0))ppm ur \(m.underruns) rs \(m.resyncs)"
+         }
+-        print(line)
++        cliPrint(line)
+     }
+ 
+     func play(soak: Bool) async -> Int32 {
+-        do { try makeEngine() } catch { print(error); return 1 }
+-        guard !args.outputs.isEmpty else { print(usageText); return 2 }
++        do { try makeEngine() } catch { cliPrint(error); return 1 }
++        guard !args.outputs.isEmpty else { cliPrint(usageText); return 2 }
+         engine.setEnabled(true)
+-        if case .failed(let m) = engine.captureStatus { print("capture failed: \(m)"); return 1 }
+-        print("Playing system audio on \(args.outputs.count) output(s) for \(f(args.seconds, 0)) s (base latency \(f(engine.effectiveBaseLatencyMs)) ms). Ctrl-C to stop.")
++        if case .failed(let m) = engine.captureStatus { cliPrint("capture failed: \(m)"); return 1 }
++        cliPrint("Playing system audio on \(args.outputs.count) output(s) for \(f(args.seconds, 0)) s (base latency \(f(engine.effectiveBaseLatencyMs)) ms). Ctrl-C to stop.")
+         let start = Date()
+         var usage0 = rusage()
+         getrusage(RUSAGE_SELF, &usage0)
+@@ -171,12 +236,12 @@ final class CLI {
+             }
+         }
+         if let minErr, let maxErr {
+-            print("Sampled servo error range during run: \(f(minErr * 1e6, 1)) … \(f(maxErr * 1e6, 1)) µs")
++            cliPrint("Sampled servo error range during run: \(f(minErr * 1e6, 1)) … \(f(maxErr * 1e6, 1)) µs")
+         } else {
+-            print("No locked output measurements were collected; this run cannot establish synchronization.")
++            cliPrint("No locked output measurements were collected; this run cannot establish synchronization.")
+         }
+         printResources(since: start, usage0: usage0)
+-        for e in engine.events where e.level != .info { print("event: \(e.message)") }
++        for e in engine.events where e.level != .info { cliPrint("event: \(e.message)") }
+         engine.shutdown()
+         return minErr == nil ? 1 : 0
+     }
+@@ -193,58 +258,58 @@ final class CLI {
+             $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count) }
+         }
+         let rss = kr == KERN_SUCCESS ? Double(info.resident_size) / 1_048_576 : -1
+-        print("resources: CPU \(f(cpu / max(wall, 0.001) * 100, 2)) % of one core, resident memory \(f(rss)) MB")
++        cliPrint("resources: CPU \(f(cpu / max(wall, 0.001) * 100, 2)) % of one core, resident memory \(f(rss)) MB")
+     }
+ 
+     func calibrate() async -> Int32 {
+-        do { try makeEngine() } catch { print(error); return 1 }
+-        guard !args.outputs.isEmpty else { print(usageText); return 2 }
++        do { try makeEngine() } catch { cliPrint(error); return 1 }
++        guard !args.outputs.isEmpty else { cliPrint(usageText); return 2 }
+         engine.setEnabled(true)
+-        if case .failed(let m) = engine.captureStatus { print("capture failed: \(m)"); return 1 }
++        if case .failed(let m) = engine.captureStatus { cliPrint("capture failed: \(m)"); return 1 }
+         if let l = args.level { calibration.options.levelDb = l }
+         calibration.options.verify = args.verify
+         calibration.options.matchLevels = args.matchLevels
+         if let d = args.dump { calibration.options.debugDumpDirectory = URL(fileURLWithPath: d) }
+         try? await Task.sleep(nanoseconds: 800_000_000)
+-        print("Calibrating… (test sweeps will play on each output in turn)")
++        cliPrint("Calibrating… (test sweeps will play on each output in turn)")
+         do {
+             let report = try await calibration.run(outputs: args.outputs.map(\.uid), microphoneUID: args.mic)
+-            print("\nMicrophone: \(report.microphoneName)")
++            cliPrint("\nMicrophone: \(report.microphoneName)")
+             for m in report.measurements {
+-                print("Device: \(m.name)")
++                cliPrint("Device: \(m.name)")
+                 if let l = m.latencyMs {
+-                    print("  Measured arrival: \(f(l, 2)) ms  (runs \(m.samplesMs.map { f($0, 2) }.joined(separator: ", ")))")
+-                    print("  Spread: \(f(m.spreadMs, 2)) ms, peak/noise \(f(m.peakToNoiseDb, 0)) dB, confidence \(m.confidence.rawValue)")
+-                    print("  Compensation: +\(f(m.compensationMs ?? 0, 1)) ms")
+-                    if let lv = m.relativeLevelDb { print("  Level at mic: \(f(lv, 1)) dB relative to the loudest output") }
++                    cliPrint("  Measured arrival: \(f(l, 2)) ms  (runs \(m.samplesMs.map { f($0, 2) }.joined(separator: ", ")))")
++                    cliPrint("  Spread: \(f(m.spreadMs, 2)) ms, peak/noise \(f(m.peakToNoiseDb, 0)) dB, confidence \(m.confidence.rawValue)")
++                    cliPrint("  Compensation: +\(f(m.compensationMs ?? 0, 1)) ms")
++                    if let lv = m.relativeLevelDb { cliPrint("  Level at mic: \(f(lv, 1)) dB relative to the loudest output") }
+                     if !m.correction.isEmpty {
+-                        print("  Tone correction: " + m.correction.map { "\($0.type.displayName) \(f($0.frequency, 0)) Hz \(f($0.gainDb, 1)) dB Q\(f($0.q, 2))" }.joined(separator: ", "))
++                        cliPrint("  Tone correction: " + m.correction.map { "\($0.type.displayName) \(f($0.frequency, 0)) Hz \(f($0.gainDb, 1)) dB Q\(f($0.q, 2))" }.joined(separator: ", "))
+                     }
+                 } else {
+-                    print("  FAILED: \(m.failure ?? "unknown")")
++                    cliPrint("  FAILED: \(m.failure ?? "unknown")")
+                 }
+                 if let reported = engine.devices.outputDevice(uid: m.uid)?.reportedOutputLatencyMs {
+-                    print("  (driver-reported latency: \(f(reported)) ms)")
++                    cliPrint("  (driver-reported latency: \(f(reported)) ms)")
+                 }
+             }
+-            if let b = report.differenceBeforeMs { print("Estimated difference before calibration: \(f(b, 1)) ms") }
++            if let b = report.differenceBeforeMs { cliPrint("Estimated difference before calibration: \(f(b, 1)) ms") }
+             if !report.roomCorrection.isEmpty {
+-                print("Room resonances: " + report.roomCorrection.map { "\(f($0.frequency, 0)) Hz \(f($0.gainDb, 1)) dB" }.joined(separator: ", "))
++                cliPrint("Room resonances: " + report.roomCorrection.map { "\(f($0.frequency, 0)) Hz \(f($0.gainDb, 1)) dB" }.joined(separator: ", "))
+             }
+             if let v = report.verification {
+-                print("Verification (re-measured with compensation applied):")
++                cliPrint("Verification (re-measured with compensation applied):")
+                 for (uid, a) in v.arrivalMs.sorted(by: { $0.key < $1.key }) {
+-                    print("  \(engine.devices.outputDevice(uid: uid)?.name ?? uid): arrival \(f(a, 2)) ms after capture")
++                    cliPrint("  \(engine.devices.outputDevice(uid: uid)?.name ?? uid): arrival \(f(a, 2)) ms after capture")
+                 }
+-                print("Estimated remaining difference: \(f(v.remainingDifferenceMs, 2)) ms (repeatability \(f(v.repeatabilityMs, 2)) ms)")
++                cliPrint("Estimated remaining difference: \(f(v.remainingDifferenceMs, 2)) ms (repeatability \(f(v.repeatabilityMs, 2)) ms)")
+             }
+         } catch {
+-            print("Calibration failed: \(error.localizedDescription)")
++            cliPrint("Calibration failed: \(error.localizedDescription)")
+             engine.shutdown()
+             return 1
+         }
+         if args.hold > 0 {
+-            print("Playing system audio with the measured compensation for \(f(args.hold, 0)) s…")
++            cliPrint("Playing system audio with the measured compensation for \(f(args.hold, 0)) s…")
+             let start = Date()
+             while Date().timeIntervalSince(start) < args.hold {
+                 try? await Task.sleep(nanoseconds: 1_000_000_000)
+@@ -254,12 +319,387 @@ final class CLI {
+         engine.shutdown()
+         return 0
+     }
++
++    func stream() async -> Int32 {
++        // Bridge wall time to monotonic host time once, before any optional
++        // calibration. A later wall-clock adjustment cannot move packet PTS.
++        let clockPin = args.syncDelayMs.map { _ in MasterClockPin.capture(masterOffsetMs: args.masterOffsetMs!) }
++        do { try makeEngine() } catch { cliPrint(error); return 1 }
++        defer { engine.shutdown() }
++        guard !args.outputs.isEmpty else { cliPrint("stream needs at least one --out device"); return 2 }
++        do { try configureCommonPresentationTarget() }
++        catch { cliPrint(error); return 2 }
++        engine.setEnabled(true)
++        if case .failed(let message) = engine.captureStatus { cliPrint("capture failed: \(message)"); return 1 }
++        if args.calibrateFirst {
++            calibration.options.levelDb = args.level ?? -24
++            calibration.options.verify = args.verify
++            calibration.options.matchLevels = args.matchLevels
++            // This path calibrates timing only. Existing program EQ is not
++            // silently redesigned while investigating glitches/noise.
++            calibration.options.autoEQ = false
++            try? await Task.sleep(nanoseconds: 800_000_000)
++            cliPrint("Calibrating native outputs before live publication…")
++            do {
++                let report = try await calibration.run(outputs: args.outputs.map(\.uid), microphoneUID: args.mic)
++                for measurement in report.measurements {
++                    cliPrint("\(measurement.name): latency \(f(measurement.latencyMs ?? -1, 2)) ms, compensation \(f(measurement.compensationMs ?? 0, 2)) ms, confidence \(measurement.confidence.rawValue)")
++                }
++                if let verification = report.verification {
++                    cliPrint("Calibration residual estimate: \(f(verification.remainingDifferenceMs, 2)) ms; repeatability \(f(verification.repeatabilityMs, 2)) ms")
++                }
++            } catch { cliPrint("Calibration failed: \(error.localizedDescription)"); return 1 }
++            do { try configureCommonPresentationTarget() }
++            catch { cliPrint(error); return 2 }
++        }
++        guard let ring = engine.sourceRing else { cliPrint("No captured source ring available"); return 1 }
++        guard ring.sampleRate >= 8000, ring.sampleRate <= 192000 else { cliPrint("Unsupported live sample rate: \(ring.sampleRate)"); return 1 }
++        cliPrint("Publishing captured system audio as stereo Float32 PCM; native base \(f(engine.effectiveBaseLatencyMs)) ms. Do not monitor this stream in a Mac browser: that would feed back into capture.")
++        let initialStreamId = args.streamId ?? UInt32.random(in: 1...UInt32.max)
++        let presentationDelay: (@MainActor () throws -> Double)?
++        if args.syncDelayMs != nil {
++            presentationDelay = { @MainActor in try self.effectivePresentationDelayMs() }
++        } else { presentationDelay = nil }
++        let seconds = args.seconds
++        let exporter = Task.detached(priority: .userInitiated) {
++            try await exportProgramPCM(ring: ring, seconds: seconds, clockPin: clockPin,
++                                       initialStreamId: initialStreamId, presentationDelay: presentationDelay)
++        }
++        // Main actor remains free to run device monitoring and the engine's
++        // adaptive buffer control, even if stdout experiences backpressure.
++        let monitor = Task { @MainActor in
++            let started = Date()
++            while !Task.isCancelled {
++                try? await Task.sleep(nanoseconds: 5_000_000_000)
++                if Task.isCancelled { break }
++                printStatus(elapsed: Date().timeIntervalSince(started))
++                if engine.sourceRing !== ring {
++                    cliPrint("Capture format/ring changed; restart live publication for the new format")
++                    exporter.cancel()
++                    break
++                }
++                if case .failed(let message) = engine.captureStatus {
++                    cliPrint("Capture stopped: \(message)")
++                    exporter.cancel()
++                    break
++                }
++            }
++        }
++        defer { monitor.cancel() }
++        do { try await exporter.value; return 0 }
++        catch { cliPrint("Live export stopped: \(error.localizedDescription)"); return 1 }
++    }
++
++    /// Driver values are an estimate, not calibrated sound arrival. Calibration
++    /// records include microphone latency; use their relative compensation only.
++    func estimatedGroupPathMs() throws -> Double {
++        let timings = engine.currentTimings()
++        let paths = try args.outputs.map { selected -> Double in
++            let name = engine.store.profile(uid: selected.uid)?.name ?? selected.uid
++            guard let device = engine.devices.outputDevice(uid: selected.uid) else {
++                throw CLIError.invalid("Selected native output disconnected: \(name). Reconnect it and restart system audio.")
++            }
++            guard device.isAlive else {
++                throw CLIError.invalid("Selected native output is unavailable: \(name). Reconnect it and restart system audio.")
++            }
++            guard let timing = timings[selected.uid] else {
++                throw CLIError.invalid("Selected native output has no active timing: \(name). Refresh outputs and restart system audio.")
++            }
++            guard !timing.clamped else {
++                throw CLIError.invalid("Selected native output delay exceeds the supported range: \(name). Review its compensation before restarting.")
++            }
++            let path = device.reportedOutputLatencyMs + timing.appliedDelayMs
++            guard path.isFinite, path >= 0 else { throw CLIError.invalid("A selected output reported invalid latency") }
++            return path
++        }
++        guard let group = paths.max() else { throw CLIError.invalid("No native timing paths are selected") }
++        return group
++    }
++
++    func configureCommonPresentationTarget() throws {
++        guard let desired = args.syncDelayMs else { return }
++        let group = try estimatedGroupPathMs()
++        let plan = try CommonPresentationPlan(requestedMs: desired, groupPathMs: group)
++        engine.updateSettings { $0.baseLatencyMs = plan.nativeBaseMs }
++        cliPrint("Common presentation: group path estimate \(f(group, 2)) ms + native base \(f(plan.nativeBaseMs, 2)) ms = \(f(plan.effectiveDelayMs, 2)) ms. Confidence: driver estimate plus configured relative compensation; no new acoustic validation.")
++    }
++
++    func effectivePresentationDelayMs() throws -> Double {
++        let delay = engine.effectiveBaseLatencyMs + (try estimatedGroupPathMs())
++        guard delay.isFinite, delay > 0, delay <= 1200 else {
++            throw CLIError.invalid("Effective presentation delay is outside the receiver's supported range; restart with a new target")
++        }
++        return delay
++    }
++}
++
++struct CommonPresentationPlan {
++    let nativeBaseMs: Double
++    let effectiveDelayMs: Double
++    init(requestedMs: Double, groupPathMs: Double) throws {
++        guard requestedMs.isFinite, groupPathMs.isFinite, groupPathMs >= 0,
++              requestedMs >= groupPathMs + 120 else {
++            throw CLIError.invalid("Common presentation target is too small: allow at least the estimated native group path plus 120 ms of safe buffering")
++        }
++        nativeBaseMs = requestedMs - groupPathMs
++        effectiveDelayMs = nativeBaseMs + groupPathMs
++    }
++}
++
++struct MasterClockPin: Sendable {
++    let host: UInt64
++    let masterMs: Double
++    let ticksPerSecond: Double
++
++    static func capture(masterOffsetMs: Double) -> MasterClockPin {
++        let before = HostTime.now()
++        let unixMs = Date().timeIntervalSince1970 * 1000
++        let after = HostTime.now()
++        return MasterClockPin(host: before &+ ((after &- before) / 2),
++                              masterMs: unixMs + masterOffsetMs, ticksPerSecond: HostTime.ticksPerSecond)
++    }
++
++    func timestamp(frame: Int64, timeline: ProgramTimelineSnapshot) -> Double? {
++        guard ticksPerSecond.isFinite, ticksPerSecond > 0,
++              let ticks = timeline.hostOffsetTicks(frame: frame, relativeTo: host) else { return nil }
++        let value = masterMs + ticks * 1000 / ticksPerSecond
++        return value.isFinite ? value : nil
++    }
++}
++
++struct PacketPresentation {
++    let streamId: UInt32
++    let sourceFrame: UInt64
++    let captureMasterMs: Double
++    let presentationDelayMs: Double
++}
++
++func appendLE(_ value: UInt32, to data: inout Data) {
++    var le = value.littleEndian
++    withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
++}
++func appendLE(_ value: UInt64, to data: inout Data) {
++    var le = value.littleEndian
++    withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
++}
++
++func makeProgramPacket(sampleRate: UInt32, sequence: UInt32, samples: [Float], presentation: PacketPresentation?) -> Data {
++    var packet = Data((presentation == nil ? "HCA1" : "HCA2").utf8)
++    for value in [sampleRate, 2, UInt32(samples.count / 2), sequence] { appendLE(value, to: &packet) }
++    if let timing = presentation {
++        appendLE(timing.streamId, to: &packet)
++        appendLE(timing.sourceFrame, to: &packet)
++        appendLE(timing.captureMasterMs.bitPattern, to: &packet)
++        appendLE(timing.presentationDelayMs.bitPattern, to: &packet)
++    }
++    var payload = Data(count: samples.count * MemoryLayout<UInt32>.size)
++    payload.withUnsafeMutableBytes { raw in
++        let output = raw.bindMemory(to: UInt32.self)
++        for i in samples.indices { output[i] = samples[i].bitPattern.littleEndian }
++    }
++    packet.append(payload)
++    return packet
++}
++
++/// Select a complete recent chunk without crossing the first observed frame of
++/// this capture epoch. A reanchor must accumulate fresh lag + chunk history;
++/// old ring samples cannot acquire timestamps from the new mapping.
++func liveExportCursor(writtenFrame: Int64, minimumFrame: Int64, lagFrames: Int64, chunkFrames: Int) -> Int64? {
++    guard writtenFrame >= 0, minimumFrame >= 0, lagFrames >= 0,
++          writtenFrame >= lagFrames, chunkFrames > 0 else { return nil }
++    let chunk = Int64(chunkFrames)
++    let remainder = minimumFrame % chunk
++    let adjustment = remainder == 0 ? 0 : chunk - remainder
++    guard minimumFrame <= Int64.max - adjustment else { return nil }
++    let floor = minimumFrame + adjustment
++    let latest = writtenFrame - lagFrames
++    guard latest >= floor, latest - floor >= chunk else { return nil }
++    let newestCompleteStart = latest - latest % chunk - chunk
++    return newestCompleteStart >= floor ? newestCompleteStart : nil
++}
++
++/// Offline only: exercises the exact packet encoder and source-frame clock math.
++/// It never creates an engine, opens devices or plays calibration/test audio.
++func streamProtocolSelfTest() throws {
++    func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
++        if !condition() { throw CLIError.invalid(message) }
++    }
++    func u64(_ data: Data, _ offset: Int, _ count: Int = 8) -> UInt64 {
++        (0..<count).reduce(0) { $0 | (UInt64(data[offset + $1]) << (8 * $1)) }
++    }
++    let reportedError = CLIError.invalid("Selected native output disconnected: Offline test device")
++    try require(reportedError.localizedDescription == reportedError.description,
++                "Localized CLI errors must preserve the actionable failure message")
++    let plan = try CommonPresentationPlan(requestedMs: 700, groupPathMs: 338.5)
++    try require(abs(plan.nativeBaseMs - 361.5) < 0.000001 && plan.effectiveDelayMs == 700,
++                "The common target must include the native group path")
++    var rejected = false
++    do { _ = try CommonPresentationPlan(requestedMs: 450, groupPathMs: 400) }
++    catch { rejected = true }
++    try require(rejected, "A too-small target must fail instead of silently clamping native buffering")
++    let pin = MasterClockPin(host: 1_000_000_000, masterMs: 1_700_000_000_000, ticksPerSecond: 1_000_000_000)
++    let timeline = ProgramTimelineSnapshot(anchorFrame: 48000, anchorHost: 1_100_000_000,
++                                           framesPerTick: 48000 / 1_000_000_000, epoch: 3)
++    guard let first = pin.timestamp(frame: 48000, timeline: timeline),
++          let next = pin.timestamp(frame: 48960, timeline: timeline) else { throw CLIError.invalid("Valid source clock mapping was rejected") }
++    try require(abs(first - 1_700_000_000_100) < 0.001 && abs(next - first - 20) < 0.001,
++                "Capture timestamps must follow source frames at a monotonic rate")
++    let negativeOffset = ProgramTimelineSnapshot(anchorFrame: 100, anchorHost: 900_000_000,
++                                                 framesPerTick: 0.000048, epoch: 4)
++    try require(abs((pin.timestamp(frame: 100, timeline: negativeOffset) ?? 0) - 1_699_999_999_900) < 0.001,
++                "Host offsets before the pin must use signed tick arithmetic")
++    let invalid = ProgramTimelineSnapshot(anchorFrame: 0, anchorHost: 0, framesPerTick: .nan, epoch: 5)
++    try require(pin.timestamp(frame: 1, timeline: invalid) == nil, "Invalid timeline data must not produce timestamps")
++    let samples: [Float] = [0.25, -0.25, 0.5, -0.5]
++    let frame: UInt64 = 0x1_0000_0002
++    let packet = makeProgramPacket(sampleRate: 48000, sequence: 9, samples: samples,
++        presentation: PacketPresentation(streamId: 17, sourceFrame: frame,
++                                         captureMasterMs: first, presentationDelayMs: 700))
++    try require(packet.count == 64 && String(data: packet.prefix(4), encoding: .utf8) == "HCA2", "HCA2 header must be exactly 48 bytes")
++    try require(u64(packet, 4, 4) == 48000 && u64(packet, 8, 4) == 2 && u64(packet, 12, 4) == 2,
++                "HCA2 format fields have incorrect offsets")
++    try require(u64(packet, 16, 4) == 9 && u64(packet, 20, 4) == 17 && u64(packet, 24) == frame,
++                "HCA2 sequence, stream ID or 64-bit source frame changed")
++    try require(Double(bitPattern: u64(packet, 32)) == first && Double(bitPattern: u64(packet, 40)) == 700,
++                "HCA2 clock/delay must be little-endian Float64")
++    try require(Float(bitPattern: UInt32(u64(packet, 48, 4))) == samples[0], "PCM payload must begin immediately after the HCA2 header")
++    let legacy = makeProgramPacket(sampleRate: 48000, sequence: 9, samples: samples, presentation: nil)
++    try require(legacy.count == 36 && String(data: legacy.prefix(4), encoding: .utf8) == "HCA1"
++                && Float(bitPattern: UInt32(u64(legacy, 20, 4))) == samples[0], "Legacy HCA1 framing must remain unchanged")
++    // The new epoch starts at source frame 10000 while older frames remain in
++    // the ring. Its first aligned frame is 10560. With a 4800-frame read lag,
++    // capture must reach 16320 before even one 960-frame chunk can be emitted.
++    try require(liveExportCursor(writtenFrame: 10512, minimumFrame: 10000, lagFrames: 4800, chunkFrames: 960) == nil,
++                "A reanchor must not publish old-epoch samples under new timestamps")
++    try require(liveExportCursor(writtenFrame: 16319, minimumFrame: 10000, lagFrames: 4800, chunkFrames: 960) == nil,
++                "A new epoch needs its full read lag and a complete aligned chunk")
++    try require(liveExportCursor(writtenFrame: 16320, minimumFrame: 10000, lagFrames: 4800, chunkFrames: 960) == 10560,
++                "The epoch cursor floor must round upward, never into old history")
++    let recent = liveExportCursor(writtenFrame: 24000, minimumFrame: 10000, lagFrames: 4800, chunkFrames: 960)
++    try require(recent == 18240 && recent! >= 10000 && recent! % 960 == 0,
++                "Backpressure recovery must choose a complete recent chunk within the epoch")
++    try require(liveExportCursor(writtenFrame: Int64.max, minimumFrame: Int64.max, lagFrames: 0, chunkFrames: 960) == nil,
++                "An overflowing epoch floor must fail safely")
++}
++
++/// HCA1 retains the legacy 20-byte header. HCA2 adds stream id, absolute
++/// source frame, capture master time and effective presentation delay (48 B).
++func exportProgramPCM(ring: SourceRing, seconds: Double, clockPin: MasterClockPin?, initialStreamId: UInt32,
++                      presentationDelay: (@MainActor () throws -> Double)?) async throws {
++    let frames = max(1, Int((ring.sampleRate * 0.020).rounded()))
++    let lag = Int64((ring.sampleRate * 0.100).rounded())
++    let maxBacklog = Int64((ring.sampleRate * 0.350).rounded())
++    var cursor: Int64?
++    var sequence: UInt32 = 0
++    var sent: UInt64 = 0, dropped: UInt64 = 0
++    let started = HostTime.now()
++    var lastReport = started
++    var streamId = initialStreamId
++    var ringEpoch: UInt32?
++    var epochMinimumFrame: Int64 = 0
++    var previousCaptureMs: Double?
++    var previousDelayMs: Double?
++    func nextStreamId(_ value: UInt32) -> UInt32 { let next = value &+ 1; return next == 0 ? 1 : next }
++    while HostTime.delta(HostTime.now(), started) < seconds {
++        try Task.checkCancellation()
++        let beforeTimeline = ring.programTimelineSnapshot()
++        if clockPin != nil {
++            guard let beforeTimeline else { try await Task.sleep(nanoseconds: 5_000_000); continue }
++            if let previousEpoch = ringEpoch, previousEpoch != beforeTimeline.epoch {
++                streamId = nextStreamId(streamId)
++                sequence = 0
++                cursor = nil
++                previousCaptureMs = nil
++                previousDelayMs = nil
++                dropped &+= 1
++                cliPrint("Capture timeline reanchored; starting a new presentation stream epoch")
++            }
++            if ringEpoch == nil || ringEpoch != beforeTimeline.epoch {
++                epochMinimumFrame = beforeTimeline.anchorFrame
++            }
++            ringEpoch = beforeTimeline.epoch
++        }
++        let written = ring.writeFrame
++        let latest = written - lag
++        if cursor == nil {
++            if clockPin != nil {
++                guard let start = liveExportCursor(writtenFrame: written, minimumFrame: epochMinimumFrame,
++                                                   lagFrames: lag, chunkFrames: frames) else {
++                    try await Task.sleep(nanoseconds: 5_000_000); continue
++                }
++                cursor = start
++            } else {
++                guard latest >= Int64(frames) else { try await Task.sleep(nanoseconds: 5_000_000); continue }
++                cursor = latest - (latest % Int64(frames))
++            }
++        }
++        if latest - cursor! > maxBacklog || cursor! > written {
++            // A blocked publisher must return to live audio, not replay seconds
++            // of accumulated history after the socket becomes writable again.
++            let next: Int64
++            if clockPin != nil {
++                guard let recent = liveExportCursor(writtenFrame: written, minimumFrame: epochMinimumFrame,
++                                                    lagFrames: lag, chunkFrames: frames) else {
++                    cursor = nil
++                    try await Task.sleep(nanoseconds: 5_000_000); continue
++                }
++                next = recent
++            } else { next = max(0, latest - latest % Int64(frames)) }
++            let skipped = max(1, (next - cursor!) / Int64(frames))
++            sequence &+= UInt32(truncatingIfNeeded: skipped)
++            dropped &+= UInt64(skipped)
++            cursor = next
++        }
++        if clockPin != nil && cursor! < epochMinimumFrame { cursor = nil; continue }
++        guard cursor! + Int64(frames) <= latest else { try await Task.sleep(nanoseconds: 5_000_000); continue }
++        guard let samples = ring.programStereo(startFrame: cursor!, frames: frames) else {
++            cursor = nil
++            sequence &+= 1
++            dropped &+= 1
++            try await Task.sleep(nanoseconds: 5_000_000)
++            continue
++        }
++        var presentation: PacketPresentation?
++        if let clockPin, let presentationDelay {
++            let effectiveDelay = try await presentationDelay()
++            guard let afterTimeline = ring.programTimelineSnapshot(),
++                  afterTimeline.epoch == beforeTimeline?.epoch,
++                  let captureMs = clockPin.timestamp(frame: cursor!, timeline: afterTimeline) else {
++                cursor = nil
++                sequence &+= 1
++                dropped &+= 1
++                continue
++            }
++            let delayChanged = previousDelayMs.map { abs($0 - effectiveDelay) > 0.001 } ?? false
++            let timestampWentBack = previousCaptureMs.map { captureMs <= $0 } ?? false
++            if delayChanged || timestampWentBack {
++                streamId = nextStreamId(streamId)
++                sequence = 0
++                cliPrint("Presentation timing changed; new stream epoch, effective delay \(f(effectiveDelay, 2)) ms")
++            }
++            previousCaptureMs = captureMs
++            previousDelayMs = effectiveDelay
++            presentation = PacketPresentation(streamId: streamId, sourceFrame: UInt64(cursor!),
++                                              captureMasterMs: captureMs, presentationDelayMs: effectiveDelay)
++        }
++        let packet = makeProgramPacket(sampleRate: UInt32(ring.sampleRate.rounded()), sequence: sequence,
++                                       samples: samples, presentation: presentation)
++        try FileHandle.standardOutput.write(contentsOf: packet)
++        cursor! += Int64(frames)
++        sequence &+= 1
++        sent &+= 1
++        if HostTime.delta(HostTime.now(), lastReport) >= 10 {
++            cliPrint("live export: \(sent) packets, \(dropped) skipped chunks after capture/backpressure gaps")
++            lastReport = HostTime.now()
++        }
++    }
+ }
+ 
+ setvbuf(stdout, nil, _IOLBF, 0)
++if binaryOutput { signal(SIGPIPE, SIG_IGN) }
+ let parsed: Arguments
+ do { parsed = try Arguments(CommandLine.arguments) } catch {
+-    print(error)
++    cliPrint(error)
+     exit(2)
+ }
+ 
+@@ -268,7 +708,7 @@ let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+ signal(SIGINT, SIG_IGN)
+ sigint.setEventHandler {
+     MainActor.assumeIsolated { cli.engine?.shutdown() }
+-    print("\nStopped — normal audio restored.")
++    cliPrint("\nStopped — normal audio restored.")
+     exit(130)
+ }
+ sigint.resume()
+diff --git a/SyncForgeKit/Sources/SyncForgeRT/sf_export.c b/SyncForgeKit/Sources/SyncForgeRT/sf_export.c
+new file mode 100644
+index 0000000..f95dcf1
+--- /dev/null
++++ b/SyncForgeKit/Sources/SyncForgeRT/sf_export.c
+@@ -0,0 +1,32 @@
++// Non-real-time export of captured program audio. No networking or allocation is
++// introduced into the capture or renderer callbacks.
++#include "sf_internal.h"
++
++bool sf_ring_copy_stereo(SFSourceRing *ring, int64_t start, uint32_t count, float *out) {
++    if (!ring || !out || count == 0) return false;
++    int64_t capacity = (int64_t)sf_ring_capacity(ring);
++    // Retain at least half the ring as overwrite headroom. Export copies are
++    // short (~20 ms) and normally read ~100 ms behind the capture writer.
++    int64_t guard = capacity / 2;
++    int64_t before = sf_ring_write_frame(ring);
++    if (start < 0 || (int64_t)count > capacity / 4 || start > INT64_MAX - count
++        || start + (int64_t)count > before || start < before - capacity + guard) return false;
++    const _Atomic uint64_t *data = sf_ring_export_data_internal(ring);
++    uint32_t mask = sf_ring_mask_internal(ring);
++    for (uint32_t i = 0; i < count; i++) {
++        uint32_t index = (uint32_t)((uint64_t)(start + i) & mask);
++        uint64_t pair = atomic_load_explicit(&data[index], memory_order_relaxed);
++        uint32_t leftBits = (uint32_t)pair, rightBits = (uint32_t)(pair >> 32);
++        float left, right;
++        memcpy(&left, &leftBits, sizeof left);
++        memcpy(&right, &rightBits, sizeof right);
++        out[2u * i] = isfinite(left) ? fminf(1.0f, fmaxf(-1.0f, left)) : 0.0f;
++        out[2u * i + 1u] = isfinite(right) ? fminf(1.0f, fmaxf(-1.0f, right)) : 0.0f;
++    }
++    int64_t after = sf_ring_write_frame(ring);
++    if (after < before || start < after - capacity + guard) {
++        memset(out, 0, (size_t)count * 2u * sizeof(float));
++        return false;
++    }
++    return true;
++}
+diff --git a/scripts/check-rt-stability.sh b/scripts/check-rt-stability.sh
+new file mode 100755
+index 0000000..191d398
+--- /dev/null
++++ b/scripts/check-rt-stability.sh
+@@ -0,0 +1,20 @@
++#!/bin/bash
++# Standalone offline C kernel checks. Works with macOS Command Line Tools;
++# does not require XCTest/full Xcode and never opens audio devices.
++set -euo pipefail
++cd "$(dirname "$0")/.."
++test_dir=$(mktemp -d "${TMPDIR:-/tmp}/syncforge-rt-stability.XXXXXX")
++trap 'rm -rf "$test_dir"' EXIT
++flags=(-std=c11 -O2)
++case "${1:-}" in
++  "") ;;
++  --sanitize) flags+=(-g -fsanitize=address,undefined -fno-omit-frame-pointer) ;;
++  *) echo "usage: scripts/check-rt-stability.sh [--sanitize]" >&2; exit 2 ;;
++esac
++clang "${flags[@]}" -I SyncForgeKit/Sources/SyncForgeRT/include \
++  scripts/rt-stability-check.c \
++  SyncForgeKit/Sources/SyncForgeRT/sf_ring.c \
++  SyncForgeKit/Sources/SyncForgeRT/sf_renderer.c \
++  SyncForgeKit/Sources/SyncForgeRT/sf_sinc.c \
++  -o "$test_dir/check"
++"$test_dir/check"
+diff --git a/scripts/rt-stability-check.c b/scripts/rt-stability-check.c
+new file mode 100644
+index 0000000..d6b9ee2
+--- /dev/null
++++ b/scripts/rt-stability-check.c
+@@ -0,0 +1,128 @@
++// Offline regressions of the real C kernel. Does not open HAL devices or microphones.
++#include <stdio.h>
++#include <stdlib.h>
++#include <math.h>
++#include <string.h>
++#include "SyncForgeRT.h"
++
++#define N 512
++static const double rate=48000.0, tps=1e9;
++static void render(SFRenderer *renderer, double host, float out[N*2]) {
++    memset(out,0,N*2*sizeof(float));
++    AudioBufferList abl={.mNumberBuffers=1,.mBuffers={{.mNumberChannels=2,.mDataByteSize=N*2*sizeof(float),.mData=out}}};
++    sf_renderer_render(renderer,&abl,N,(uint64_t)llround(host),1.0);
++}
++static void setup(SFSourceRing **ring, SFRenderer **renderer, int dsp) {
++    *ring=sf_ring_create(262144,rate,tps); *renderer=sf_renderer_create(*ring,rate,8192,tps);
++    SFRendererParams p;sf_params_init(&p);p.delaySeconds=.05;p.fadeInSeconds=.001;p.limiterEnabled=0;
++    if(dsp){p.dspEnabled=1;p.numBiquads=1;sf_params_set_biquad(&p,0,1,0,0,0,0);}
++    sf_renderer_set_params(*renderer,&p);
++}
++static int nonfinite(void){
++    SFSourceRing *ring;SFRenderer *renderer;setup(&ring,&renderer,1);
++    float in[N],out[N*2];double host=1e12;int invalid=0;double last=0;
++    for(int c=0;c<250;c++){
++        for(int i=0;i<N;i++)in[i]=.5f;
++        if(c==150){in[30]=NAN;in[31]=INFINITY;in[32]=-INFINITY;}
++        sf_ring_write(ring,in,in,1,N,(uint64_t)llround(host),1);
++        render(renderer,host+.012*tps,out);
++        for(int i=0;i<N*2;i++)if(!isfinite(out[i]))invalid++;
++        last=out[N*2-2];host+=(double)N/rate*tps;
++    }
++    printf("non-finite capture: invalid output samples=%d, recovered tail=%.6f\n",invalid,last);
++    sf_renderer_destroy(renderer);sf_ring_destroy(ring);
++    return invalid==0&&fabs(last-.5)<1e-4;
++}
++static int starvation(void){
++    SFSourceRing *ring;SFRenderer *renderer;setup(&ring,&renderer,0);
++    float in[N],out[N*2];for(int i=0;i<N;i++)in[i]=.5f;
++    double host=1e12;float previous=0;double step=0;int detected=0,tailZero=0;SFRendererStats before={0},stats={0};
++    for(int c=0;c<200;c++){
++        sf_ring_write(ring,in,in,1,N,(uint64_t)llround(host),1);
++        render(renderer,host+.012*tps,out);previous=out[N*2-2];host+=(double)N/rate*tps;
++    }
++    sf_renderer_get_stats(renderer,&before,false);
++    for(int c=0;c<40;c++){
++        render(renderer,host+.012*tps,out);host+=(double)N/rate*tps;
++        sf_renderer_get_stats(renderer,&stats,false);
++        if(!detected&&stats.underruns>before.underruns){
++            for(int i=0;i<N;i++){double d=fabs(out[2*i]-previous);if(d>step)step=d;previous=out[2*i];}
++            detected=1;
++        }else previous=out[N*2-2];
++        if(c==39)tailZero=fabs(out[N*2-2])<1e-8;
++    }
++    printf("capture starvation: max edge step=%.6f, underruns=%llu, long-gap silence=%s\n",step,(unsigned long long)(stats.underruns-before.underruns),tailZero?"yes":"no");
++    sf_renderer_destroy(renderer);sf_ring_destroy(ring);
++    return detected&&step<.005&&tailZero&&stats.underruns>before.underruns;
++}
++
++static double tone(double t) {
++    return .22*sin(2*M_PI*440*t)+.18*sin(2*M_PI*1234.5*t+.4);
++}
++
++static int normal_audio(double outputRate, double sourcePPM, double outputPPM, double seconds) {
++    const double sourceActual=rate*(1+sourcePPM*1e-6);
++    const double outputActual=outputRate*(1+outputPPM*1e-6);
++    const double sourcePeriod=(double)N/sourceActual*tps;
++    const double outputPeriod=(double)N/outputActual*tps;
++    const double lead=.012,delay=.1;
++    SFSourceRing *ring=sf_ring_create(262144,rate,tps);
++    SFRenderer *renderer=sf_renderer_create(ring,outputRate,8192,tps);
++    SFRendererParams p;sf_params_init(&p);p.delaySeconds=delay;p.fadeInSeconds=.001;p.limiterEnabled=0;
++    sf_renderer_set_params(renderer,&p);
++    float in[N],out[N*2];
++    const double start=1e12,end=start+seconds*tps;
++    double captureNext=start,outputNext=start+lead*tps,sig=0,error=0;
++    while(1){
++        double captureDue=captureNext+sourcePeriod+.001*tps;
++        double outputDue=outputNext-lead*tps;
++        double due=captureDue<outputDue?captureDue:outputDue;
++        if(due>end)break;
++        if(captureDue<=outputDue){
++            for(int i=0;i<N;i++)in[i]=(float)tone((captureNext+(double)i/sourceActual*tps)/tps);
++            sf_ring_write(ring,in,in,1,N,(uint64_t)llround(captureNext),rate/sourceActual);
++            captureNext+=sourcePeriod;
++        }else{
++            memset(out,0,sizeof out);
++            AudioBufferList abl={.mNumberBuffers=1,.mBuffers={{.mNumberChannels=2,.mDataByteSize=sizeof out,.mData=out}}};
++            sf_renderer_render(renderer,&abl,N,(uint64_t)llround(outputNext),outputRate/outputActual);
++            if(outputNext>start+2*tps){
++                for(int i=0;i<N;i++){
++                    double ideal=tone((outputNext+(double)i/outputActual*tps)/tps-delay);
++                    double e=out[2*i]-ideal;sig+=ideal*ideal;error+=e*e;
++                }
++            }
++            outputNext+=outputPeriod;
++        }
++    }
++    SFRendererStats stats={0};sf_renderer_get_stats(renderer,&stats,false);
++    double snr=10*log10(sig/fmax(error,1e-30));
++    printf("normal %.1f kHz (source %+.0f ppm/output %+.0f ppm, %.0f s): SNR=%.2f dB, underruns=%llu, resyncs=%llu, error=%.3f us\n",outputRate/1000,sourcePPM,outputPPM,seconds,snr,(unsigned long long)stats.underruns,(unsigned long long)stats.resyncs,stats.servoErrorSeconds*1e6);
++    int ok=snr>60&&stats.underruns==0&&stats.resyncs==0&&fabs(stats.servoErrorSeconds)<20e-6;
++    sf_renderer_destroy(renderer);sf_ring_destroy(ring);return ok;
++}
++
++static int poisoned_filter(void) {
++    SFSourceRing *ring;SFRenderer *renderer;setup(&ring,&renderer,1);
++    float in[N],out[N*2];for(int i=0;i<N;i++)in[i]=.5f;
++    double host=1e12,last=0;int invalid=0;
++    for(int c=0;c<220;c++){
++        if(c==150||c==151){
++            SFRendererParams p;sf_params_init(&p);p.delaySeconds=.05;p.fadeInSeconds=.001;p.limiterEnabled=0;p.dspEnabled=1;p.numBiquads=1;
++            sf_params_set_biquad(&p,0,c==150?NAN:1,0,0,0,0);sf_renderer_set_params(renderer,&p);
++        }
++        sf_ring_write(ring,in,in,1,N,(uint64_t)llround(host),1);render(renderer,host+.012*tps,out);
++        for(int i=0;i<N*2;i++)if(!isfinite(out[i]))invalid++;
++        last=out[N*2-2];host+=(double)N/rate*tps;
++    }
++    printf("invalid filter followed by valid coefficients: invalid output samples=%d, recovered tail=%.6f\n",invalid,last);
++    sf_renderer_destroy(renderer);sf_ring_destroy(ring);return invalid==0&&fabs(last-.5)<1e-4;
++}
++
++int main(void){
++    int ok=nonfinite();ok=starvation()&&ok;ok=poisoned_filter()&&ok;
++    ok=normal_audio(48000,0,0,4)&&ok;
++    ok=normal_audio(44100,0,0,4)&&ok;
++    ok=normal_audio(44100,150,-300,60)&&ok;
++    return ok?0:1;
++}
+diff --git a/scripts/test-live-export.sh b/scripts/test-live-export.sh
+new file mode 100644
+index 0000000..9a12e6b
+--- /dev/null
++++ b/scripts/test-live-export.sh
+@@ -0,0 +1,9 @@
++#!/bin/bash
++set -euo pipefail
++cd "$(dirname "$0")/.."
++task_test_dir="$(mktemp -d "${TMPDIR:-/tmp}/syncforge-export-test.XXXXXX")"
++trap 'rm -rf "$task_test_dir"' EXIT
++clang -std=c11 -O2 -I SyncForgeKit/Sources/SyncForgeRT/include \
++  scripts/tests/live-export.c SyncForgeKit/Sources/SyncForgeRT/sf_ring.c \
++  SyncForgeKit/Sources/SyncForgeRT/sf_export.c -framework CoreAudio -o "$task_test_dir/test-export"
++"$task_test_dir/test-export"
+diff --git a/scripts/test-stream-timeline.sh b/scripts/test-stream-timeline.sh
+new file mode 100644
+index 0000000..a75086a
+--- /dev/null
++++ b/scripts/test-stream-timeline.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++cd "$(dirname "$0")/.."
++# This subcommand exercises pure packet/clock math only. It opens no devices.
++SyncForgeKit/.build/release/sfctl stream-selftest
+diff --git a/scripts/tests/live-export.c b/scripts/tests/live-export.c
+new file mode 100644
+index 0000000..dc6a9f5
+--- /dev/null
++++ b/scripts/tests/live-export.c
+@@ -0,0 +1,72 @@
++#include <assert.h>
++#include <math.h>
++#include <stdio.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include "SyncForgeRT.h"
++
++typedef struct { SFSourceRing *ring; _Atomic bool done; } ConcurrentCapture;
++static void *capture_writer(void *opaque) {
++    ConcurrentCapture *capture = opaque;
++    float left[1024], right[1024];
++    for (int chunk = 0; chunk < 3000; chunk++) {
++        float value = (chunk & 1) ? 0.25f : 0.5f;
++        for (int i = 0; i < 1024; i++) { left[i] = value; right[i] = -value; }
++        sf_ring_write(capture->ring, left, right, 1, 1024,
++            1000000000 + (uint64_t)llround(chunk * 1024.0 / 48000 * 1e9), 1);
++    }
++    atomic_store(&capture->done, true);
++    return NULL;
++}
++
++static void concurrent_export(void) {
++    ConcurrentCapture capture = { .ring = sf_ring_create(16384, 48000, 1000000000) };
++    atomic_init(&capture.done, false);
++    assert(capture.ring);
++    pthread_t writer;
++    assert(pthread_create(&writer, NULL, capture_writer, &capture) == 0);
++    unsigned accepted = 0;
++    float out[256];
++    while (!atomic_load(&capture.done)) {
++        int64_t written = sf_ring_write_frame(capture.ring);
++        if (written >= 512 && sf_ring_copy_stereo(capture.ring, written - 512, 128, out)) {
++            for (int i = 0; i < 128; i++) assert(out[2 * i] == -out[2 * i + 1]);
++            accepted++;
++        }
++    }
++    assert(pthread_join(writer, NULL) == 0);
++    assert(accepted > 0);
++    sf_ring_destroy(capture.ring);
++}
++
++int main(void) {
++    SFSourceRing *ring = sf_ring_create(16384, 48000, 1000000000);
++    assert(ring);
++    float left[1024], right[1024], out[2048];
++    for (int i = 0; i < 1024; i++) { left[i] = i / 2048.0f; right[i] = -left[i]; }
++    sf_ring_write(ring, left, right, 1, 1024, 1000000000, 1);
++    assert(sf_ring_copy_stereo(ring, 42, 256, out));
++    for (int i = 0; i < 256; i++) {
++        assert(out[2 * i] == left[i + 42]);
++        assert(out[2 * i + 1] == right[i + 42]);
++    }
++    assert(!sf_ring_copy_stereo(ring, -1, 1, out));
++    assert(!sf_ring_copy_stereo(ring, 1000, 100, out));
++    assert(!sf_ring_copy_stereo(ring, 0, 0, out));
++    assert(!sf_ring_copy_stereo(ring, INT64_MAX, 2, out));
++    for (int chunk = 1; chunk < 32; chunk++) {
++        uint64_t host = 1000000000 + (uint64_t)llround(chunk * 1024.0 / 48000 * 1e9);
++        sf_ring_write(ring, left, right, 1, 1024, host, 1);
++    }
++    assert(!sf_ring_copy_stereo(ring, 0, 256, out));
++    assert(sf_ring_copy_stereo(ring, 31 * 1024 + 42, 256, out));
++    for (int i = 0; i < 256; i++) assert(out[2 * i] == left[i + 42]);
++    left[10] = NAN; right[20] = INFINITY; left[30] = 2; right[40] = -2;
++    sf_ring_write(ring, left, right, 1, 1024, 1000000000 + (uint64_t)llround(32 * 1024.0 / 48000 * 1e9), 1);
++    assert(sf_ring_copy_stereo(ring, 32 * 1024, 256, out));
++    assert(out[20] == 0 && out[41] == 0 && out[60] == 1 && out[81] == -1);
++    sf_ring_destroy(ring);
++    concurrent_export();
++    puts("PASS: stereo channel preservation, history/wrap bounds, invalid ranges, non-finite samples and concurrent stereo-pair consistency");
++    return 0;
++}

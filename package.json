@@ -8,10 +8,16 @@
     "build": "vite build",
     "start": "npm run build && node server.js",
     "serve": "node server.js",
-    "dev": "npm run build && node server.js"
+    "dev": "npm run build && node server.js",
+    "release:package": "node scripts/package-release.mjs",
+    "native:build": "node scripts/native-audio.mjs build",
+    "native:devices": "node scripts/native-audio.mjs devices",
+    "native:play": "node scripts/native-audio.mjs play",
+    "native:calibrate": "node scripts/native-audio.mjs calibrate",
+    "native:live": "node scripts/native-audio.mjs live"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.12.0"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^6.0.2",
